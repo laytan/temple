@@ -13,6 +13,9 @@ Compiled :: struct($T: typeid) {
 	approx_bytes: int,
 }
 
+/*
+Writes a string to the writer with special characters that can be used in XSS escaped.
+*/
 write_escaped_string :: proc(w: io.Writer, str: string) {
 	for i in 0 ..< len(str) {
 		b := str[i]

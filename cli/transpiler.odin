@@ -36,21 +36,6 @@ write_indent :: proc(t: ^Transpiler) {
 	}
 }
 
-// compiled :: proc($path: string, $T: typeid) -> Compiled(T) {
-// 	when path == "templates/home.temple.html" {
-// 		return {
-// 			with = proc(w: io.Writer, this: T) {
-// 				io.write_string(w, "<h1>Hello, ")
-// 				write_escaped_string(w, this.name)
-// 				io.write_string(w, "!</h1>\n")
-// 			},
-// 			approx_bytes = 43,
-// 		}
-// 	} else {
-// 		#panic("undefined template \"" + path + "\" did you run the temple transpiler?")
-// 	}
-// }
-
 transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := context.allocator) {
 	t: Transpiler
 	t.indent = "\t"
@@ -105,6 +90,8 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 		transpile_text(t, d)
 	case ^Node_Output:
 		transpile_output(t, d)
+	case ^Node_If:
+		transpile_if(t, d)
 	}
 }
 
@@ -124,4 +111,27 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	ws(t.w, "write_escaped_string(w, ")
 	ws(t.w, strings.trim_space(node.expression.value))
 	ws(t.w, `)`)
+}
+
+transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
+	ws(t.w, "if ")
+	ws(t.w, strings.trim_space(node.start.expression.value))
+
+	ws(t.w, " {")
+	indent(t)
+	write_newline(t)
+
+	// NOTE: if we add else, we need to take the max() between the approx bytes of the two branches.
+
+	for n, i in node.if_true {
+		transpile_node(t, n)
+
+		if i != len(node.if_true) - 1 {
+			write_newline(t)
+		}
+	}
+
+	dedent(t)
+	write_newline(t)
+	ws(t.w, "}")
 }

@@ -42,6 +42,8 @@ You can then use the templates like this:
 <!-- templates/home.temple.html -->
 
 Hello, {{ this.name }}!
+
+{% if this.name == "Laytan" %}Cool Name!{% end %}
 ```
 
 ```odin
@@ -63,5 +65,7 @@ main :: proc() {
 
     // Output:
     // Hello, Laytan!
+    //
+    // Cool Name!
 }
 ```

@@ -34,6 +34,8 @@ main :: proc() {
 	transpile_calls(os.args[2], calls[:])
 }
 
+// TODO: colors don't work
+
 warn :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) {
 	if p, ok := pos.?; ok {
 		fmt.eprintf("%s(%i:%i) \033[39mWARN:\033[0m ", p.file, p.line, p.column)
@@ -41,7 +43,7 @@ warn :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) {
 		fmt.eprint("\033[39mWARN:\033[0m ")
 	}
 
-	fmt.eprintf(msg, args)
+	fmt.eprintf(msg, ..args)
 	fmt.eprint("\n")
 }
 
@@ -52,7 +54,7 @@ error :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) -> ! {
 		fmt.eprint("\033[91mERROR:\033[0m ")
 	}
 
-	fmt.eprintf(msg, args)
+	fmt.eprintf(msg, ..args)
 	fmt.eprint("\n")
 	os.exit(1)
 }
@@ -111,7 +113,7 @@ collect_compile_calls :: proc(
 
 			// TODO: multithreading
 			// TODO: return early if not imported
-			// TODO; resolve any way it can be called (like alias `c :: temple.compile`, or different import name `import t "temple"`)
+			// TODO; resolve any way it can be called (like alias `c :: temple.compiled`, or different import name `import t "temple"`)
 
 			v := ast.Visitor {
 				data = s,
@@ -137,7 +139,7 @@ collect_compile_calls :: proc(
 						if len(n.args) != 2 {
 							error(
 								n.pos,
-								"calls to `temple.compile` expect 2 arguments, got %i",
+								"calls to `temple.compiled` expect 2 arguments, got %i",
 								len(n.args),
 							)
 						}
@@ -146,7 +148,7 @@ collect_compile_calls :: proc(
 						if !pok || path.tok.kind != .String {
 							error(
 								n.pos,
-								"the path/first argument of `temple.compile` only accepts string literals",
+								"the path/first argument of `temple.compiled` only accepts string literals",
 							)
 						}
 

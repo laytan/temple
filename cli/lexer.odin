@@ -25,20 +25,26 @@ Token_Type :: enum {
 	Text,
 	Output_Open,
 	Output_Close,
+	Process_Open,
+	Process_Close,
+	If,
+	End,
 }
 
 Lexer :: struct {
-	source:  []byte,
+	source:     []byte,
 	// The character before `ch` in the source.
-	prev_ch: byte,
+	prev_ch:    byte,
+	// The token that was last returned.
+	prev_token: Token,
 	// The current character to check.
-	ch:      byte,
+	ch:         byte,
 	// The index into the source that `ch` is at.
-	cursor:  int,
+	cursor:     int,
 	// The amount of newline characters we have come across, aka the current line.
-	line:    int,
+	line:       int,
 	// The offset that the current line begins on.
-	bol:     int,
+	bol:        int,
 }
 
 lexer_init_bytes :: proc(l: ^Lexer, source: []byte) {
@@ -64,24 +70,47 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 		t.type = .EOF
 
 	case l.ch == '{' && lexer_peek(l) == '{':
-		t.type = .Output_Open
+		t.type  = .Output_Open
 		t.value = lexer_consume(l, "{{")
 
 	case l.ch == '}' && lexer_peek(l) == '}':
-		t.type = .Output_Close
+		t.type  = .Output_Close
 		t.value = lexer_consume(l, "}}")
 
-	case:
-		t.type = .Text
+	case l.ch == '{' && lexer_peek(l) == '%':
+		t.type  = .Process_Open
+		t.value = lexer_consume(l, "{%")
+		lexer_skip_spaces(l)
 
-		start := l.cursor
-		if end, has_end := lexer_consume_until(l, "{{", "}}"); has_end {
-			t.value = string(l.source[start:end])
-		} else {
-			t.value = string(l.source[start:])
+	case l.ch == '%' && lexer_peek(l) == '}':
+		t.type  = .Process_Close
+		t.value = lexer_consume(l, "%}")
+
+	case l.prev_token.type == .Process_Open:
+		switch {
+		case l.ch == 'i' && lexer_peek(l) == 'f' && lexer_peek(l, 2) == ' ':
+			t.type  = .If
+			t.value = lexer_consume(l, "if")
+			lexer_skip_spaces(l)
+
+		case l.ch == 'e' && lexer_peek(l) == 'n' && lexer_peek(l, 2) == 'd':
+			t.type  = .End
+			t.value = lexer_consume(l, "end")
+			lexer_skip_spaces(l)
+
+		case:
+			t.type  = .Illegal
+			start  := l.cursor
+			t.value = lexer_consume_until(l, "%}")
 		}
+
+	case:
+		t.type  = .Text
+		start  := l.cursor
+		t.value = lexer_consume_until(l, "{{", "}}", "{%", "%}")
 	}
 
+	l.prev_token = t
 	return
 }
 
@@ -125,7 +154,8 @@ lexer_consume :: proc(l: ^Lexer, value: string) -> string {
 }
 
 @(private)
-lexer_consume_until :: proc(l: ^Lexer, terminators: ..string) -> (end: int, has_end: bool) {
+lexer_consume_until :: proc(l: ^Lexer, terminators: ..string) -> string {
+	start := l.cursor
 	for l.ch != EOF {
 		lexer_read(l)
 
@@ -138,13 +168,11 @@ lexer_consume_until :: proc(l: ^Lexer, terminators: ..string) -> (end: int, has_
 			}
 
 			// The terminator matched, return.
-			end = l.cursor
-			has_end = true
-			return
+			return string(l.source[start:l.cursor])
 		}
 	}
 
-	return
+	return string(l.source[start:])
 }
 
 @(private)
@@ -153,4 +181,11 @@ lexer_peek :: proc(l: ^Lexer, offset: int = 1) -> byte {
 		return EOF
 	}
 	return l.source[l.cursor + offset]
+}
+
+lexer_skip_spaces :: proc(l: ^Lexer) {
+	for l.ch != EOF {
+		if l.ch != ' ' do return
+		lexer_read(l)
+	}
 }
