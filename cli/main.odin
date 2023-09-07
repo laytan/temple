@@ -3,7 +3,6 @@ package temple_cli
 import "core:bufio"
 import "core:fmt"
 import "core:io"
-import "core:log"
 import "core:mem"
 import "core:odin/ast"
 import "core:odin/parser"
@@ -14,7 +13,6 @@ import "core:strings"
 import "core:time"
 
 Compile_Call :: struct {
-	// TODO: allow this to be an inline template.
 	pos:  tokenizer.Pos,
 	type: Call_Type,
 }
@@ -34,11 +32,8 @@ Call_Path :: struct {
 }
 
 main :: proc() {
-	context.logger = log.create_console_logger(.Debug when ODIN_DEBUG else .Info)
-
 	if len(os.args) < 3 {
-		log.error("You need to pass a path and the path to temple")
-		return
+		error(nil, "You need to pass a path and the path to temple")
 	}
 
 	calls := collect_compile_calls(os.args[1])
@@ -139,7 +134,7 @@ collect_compile_calls :: proc(
 						if !ok do return nil
 
 						ident, iok := selector.expr.derived_expr.(^ast.Ident)
-						if !ok do return nil
+						if !iok do return nil
 
 						if ident.name != "temple" {
 							return nil

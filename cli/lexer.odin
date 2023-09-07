@@ -1,10 +1,5 @@
 package temple_cli
 
-import "core:bufio"
-import "core:bytes"
-import "core:fmt"
-import "core:io"
-
 EOF :: 0
 
 Token :: struct {

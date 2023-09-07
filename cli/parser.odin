@@ -233,6 +233,7 @@ parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = 
 
 parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_If, ok: bool) {
 	assert(process_type.type == .If)
+	process, process_type := process, process_type
 
 	t = new(Node_If, p.allocator)
 	t.derived = t
@@ -283,7 +284,7 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 		return
 	}
 
-	process, process_type := parse_if_part(p, &t._if, process, process_type) or_return
+	process, process_type = parse_if_part(p, &t._if, process, process_type) or_return
 	for process_type.type == .ElseIf {
 		part := new(Node_If_Part, p.allocator)
 		part.body.allocator = p.allocator

@@ -1,10 +1,8 @@
 package temple_cli
 
-import "core:bytes"
 import "core:fmt"
 import "core:io"
 import "core:mem"
-import "core:reflect"
 import "core:strings"
 
 ws :: io.write_string
@@ -71,7 +69,7 @@ transpile :: proc(w: io.Writer, identifier: string, templ: Template, embed_parse
 	indent(&t)
 	write_newline(&t)
 
-	for node, i in templ.content {
+	for node in templ.content {
 		transpile_node(&t, node)
 		write_newline(&t)
 	}
@@ -277,7 +275,7 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	}
 
 	if templ, ok := t.embed_parser(node, t.embed_data); ok {
-		for node, i in templ.content {
+		for node in templ.content {
 			transpile_node(t, node)
 			write_newline(t)
 		}
