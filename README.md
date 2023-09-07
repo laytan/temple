@@ -2,7 +2,7 @@
 
 An experimental in development templating engine for Odin
 
-## Goals:
+## Features:
 
 * Similar syntax as other mustache based templating engines
 * No runtime overhead, templates are transpiled into regular Odin
@@ -14,14 +14,21 @@ An experimental in development templating engine for Odin
 * Odin's expressive looping syntax, eg: `{% for name in this.names %} {{ name }} {% end %}`
 * Conditionals, eg: `{% if expression %} yeah! {% elseif expression %} No but Yeah! {% else %} No :( {% end %}`
 * Approximate the size of a templates output, so user can resize a buffer before templating into it
-* Some simple way to include other templates, syntax not determined
+* Embedding other templates
 * No/minimal runtime errors
     * Error when template does not exists
     * Error when temple is called incorrectly
     * Error when you use something in the template that you don't provide when using
     * etc.
+
+## Goals:
+
+* More robust and complete parsing of code for `compiled` and `compiled_inline` calls
 * Catch common errors in the CLI, instead of having Odin catch it, this is because if Odin catches it, the source of the error is lost, in the CLI we have context
-* Make the CLI be fast enough to not burden the development cycle, ideally almost instant
+* Make the CLI be as fast as possible to not burden the development cycle, ideally almost instant for hundreds of templates
+* Layouts, similar to [{% extends %} in Twig](https://twig.symfony.com/doc/2.x/tags/extends.html)
+* Some kind of source mapping between the transpiler output and the templates, maybe just simple comments at the end of a line saying where it was generated from
+* Better errors when inside of an embed, give more context of the embed tree and bubble the error all the way back up 
 
 ## Usage:
 
@@ -49,6 +56,8 @@ Hello, {{ this.name }}!
 
 <!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->
 The count is {{ int(this.count) }} 
+
+{% for i in 1..=5 %}{{ i }}{% end %}
 ```
 
 ```odin
@@ -80,3 +89,54 @@ main :: proc() {
     // The count is 10
 }
 ```
+
+### Output
+
+```odin
+// Output is denoted by an opening {{ and closing }}
+t := temple.compiled_inline(`{{ "Hello" }}`, struct{})
+// Reference passed in values with `this`, which is of the type you pass as a second argument.
+t := temple.compiled_inline(`{{ this.name }}`, struct{ name: string })
+// Any Odin expression will work, as long as it results in a single string or single value with a cast (next example).
+t := temple.compiled_inline(`{{ this.name or_else this.last_name }}`, struct{ name: Maybe(string), last_name: string })
+// If the value you want to print is not a string, put a cast around it like `int()`, `f32()` or any other types that have a writer in the `io.write_*` namespace.
+t := temple.compiled_inline(`{{ int(this.count) }}`, struct{ count: int })
+```
+
+### If
+
+```odin
+// If statements start with a {% if condition %}, can then contain one or more {% elseif condition %}, then an optional {% else %}, and then an {% end %}.
+t := temple.compiled_inline(`{% if this.name == "Laytan" %}Cool Name!{% end %}`, struct{ name: string })
+t := temple.compiled_inline(`
+{% if this.count == 0 %}
+    There are no items in your basket.
+{% elseif this.count == 1 %}
+    There is one item in your basket.
+{% elseif this.count > 100 %}
+    There are too many items in your basket.
+{% else %}
+    There are {{ int(this.count) }} items in your basket.
+{% end %}
+`, struct{count: int})
+```
+
+### For
+
+```odin
+// For loops are started with a {% for expression %} and ended with an {% end %}.
+// They can contain any valid Odin loop that works on the `this` of the template.
+t := temple.compiled_inline(`{% for i in 0..<5 %} {{ int(i) }} {% end %}`, struct{})
+t := temple.compiled_inline(`{% for book in books %} {{ book.title }} {% end %}`, struct{ books: []struct{ title: string } })
+```
+
+### Embed
+
+```odin
+// Embed can be used to embed other templates into the current one, paths are relative to the current template (or the file that called `compiled_inline` with inline templates).
+
+// The embedded template will have the same `this` as the current template by default.
+t := temple.compiled_inline(`{% embed "header.temple.twig" %}`, struct{})
+
+// Changing the `this` inside the embedded template can be done with the `with` keyword.
+t := temple.compiled_inline(`{% embed "header.temple.twig" with this.header %}` struct{ header: struct{ title: string } })

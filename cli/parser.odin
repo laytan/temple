@@ -29,6 +29,7 @@ Any_Node :: union {
 	^Node_Output,
 	^Node_If,
 	^Node_For,
+	^Node_Embed,
 }
 
 Node_Text :: struct {
@@ -49,6 +50,20 @@ Node_If :: struct {
 	elseifs:    [dynamic]^Node_If_Part,
 	_else:      Maybe(^Node_If_Part),
 	end:        Node_End,
+}
+
+Node_Embed :: struct {
+	using node: Node,
+	open:       Token,
+	embed:      Token,
+	path:       Token,
+	with:       Maybe(^Node_Embed_With),
+	close:      Token,
+}
+
+Node_Embed_With :: struct {
+	with: Token,
+	expr: Token,
 }
 
 Node_If_Part :: struct {
@@ -135,7 +150,7 @@ parse :: proc(p: ^Parser) -> Template {
 		case .EOF:
 			break parse_loop
 
-		case .Output_Close, .Illegal, .Process_Close, .If, .End, .For, .Else, .ElseIf:
+		case .Output_Close, .Illegal, .Process_Close, .If, .End, .For, .Else, .ElseIf, .Embed_With, .Embed_Path, .Embed:
 			fallthrough
 
 		case:
@@ -199,13 +214,15 @@ parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = 
 		return parse_if(p, process, process_type)
 	case .For:
 		return parse_for(p, process, process_type)
-	case .End, .Process_Close, .Process_Open, .EOF, .Text, .Illegal, .Output_Open, .Output_Close, .Else, .ElseIf:
+	case .Embed:
+		return parse_embed(p, process, process_type)
+	case .End, .Process_Close, .Process_Open, .EOF, .Text, .Illegal, .Output_Open, .Output_Close, .Else, .ElseIf, .Embed_Path, .Embed_With:
 		fallthrough
 	case:
 		error(
 			p,
 			process_type.pos,
-			"invalid process type token, expected \"if\", or \"for\", got: %q",
+			"invalid process type token, expected \"if\", \"for\" or \"embed\", got: %q",
 			process_type.value,
 		) or_return
 	}
@@ -383,13 +400,60 @@ parse_body :: proc(
 		case .EOF:
 			error(p, tok.pos, "unexpected EOF while inside a body") or_return
 
-		case .Output_Close, .Process_Close, .Illegal, .If, .End, .For, .Else, .ElseIf:
+		case .Output_Close, .Process_Close, .Illegal, .If, .End, .For, .Else, .ElseIf, .Embed_With, .Embed_Path, .Embed:
 			fallthrough
 
 		case:
 			error(p, tok.pos, "invalid token inside a body: got %q", tok.value) or_return
 		}
 	}
+}
+
+parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Embed, ok: bool) {
+	assert(process_type.type == .Embed)
+
+	t = new(Node_Embed, p.allocator)
+	t.derived = t
+
+	t.open  = process
+	t.embed = process_type
+	
+	t.path = lexer_next(&p.lexer)
+	if t.path.type != .Embed_Path {
+		error(p, t.path.pos, "invalid token after \"embed\", expected a double quoted string pointing at a template file, got: %q", t.path.value) or_return
+	}
+	
+	if len(t.path.value) <= 2 {
+		error(p, t.path.pos, "invalid embed path, expected at least 3 characters, got: %q", t.path.value) or_return
+	}
+
+	next := lexer_next(&p.lexer)
+	#partial switch next.type {
+	case .Embed_With:
+		with := new(Node_Embed_With, p.allocator)
+
+		with.with = next
+		with.expr = lexer_next(&p.lexer)
+		if with.expr.type != .Text {
+			error(p, with.expr.pos, "invalid token after \"with\", expected an expression, got: %q", with.expr.value) or_return
+		}
+
+		t.with = with
+
+		t.close = lexer_next(&p.lexer)
+		if t.close.type != .Process_Close {
+			error(p, t.close.pos, "invalid token after with expression, expected \"%%}\", got: %q", t.close.value) or_return
+		}
+
+	case .Process_Close:
+		t.close = next
+
+	case:
+		error(p, next.pos, "invalid token after embed path, expected \"with\" or \"%%}\", got: %q", next.value) or_return
+	}
+
+	ok = true
+	return
 }
 
 /*

@@ -31,6 +31,9 @@ Token_Type :: enum {
 	For,
 	Else,
 	ElseIf,
+	Embed,
+	Embed_Path,
+	Embed_With,
 	End,
 }
 
@@ -114,15 +117,30 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 				lexer_skip_spaces(l)
 			}
 
+		case l.ch == 'e' && lexer_peek(l) == 'm' && lexer_peek(l, 2) == 'b' && lexer_peek(l, 3) == 'e' && lexer_peek(l, 4) == 'd' && lexer_peek(l, 5) == ' ':
+			t.type = .Embed
+			t.value = lexer_consume(l, "embed")
+			lexer_skip_spaces(l)
+
 		case:
 			t.type  = .Illegal
-			start  := l.cursor
 			t.value = lexer_consume_until(l, "%}")
 		}
+	
+	case l.prev_token.type == .Embed && l.ch == '"':
+		t.type = .Embed_Path
+		start := l.cursor
+		_ = lexer_consume_until(l, "\"")
+		t.value = string(l.source[start:l.cursor+1])
+		lexer_read(l)
+		lexer_skip_spaces(l)
+	
+	case l.prev_token.type == .Embed_Path && l.ch == 'w' && lexer_peek(l) == 'i' && lexer_peek(l, 2) == 't' && lexer_peek(l, 3) == 'h' && lexer_peek(l, 4) == ' ':
+		t.type = .Embed_With
+		t.value = lexer_consume(l, "with")
 
 	case:
 		t.type  = .Text
-		start  := l.cursor
 		t.value = lexer_consume_until(l, "{{", "}}", "{%", "%}")
 	}
 

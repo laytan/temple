@@ -21,7 +21,12 @@ Transpiler :: struct {
 	indent:       string,
 	indented:     int,
 	approx_bytes: int,
+
+	embed_parser: Embed_Parser,
+	embed_data:   rawptr,
 }
+
+Embed_Parser :: #type proc(embed: ^Node_Embed, user_data: rawptr) -> (Template, bool)
 
 indent :: proc(t: ^Transpiler) {
 	t.indented += 1
@@ -42,8 +47,10 @@ write_indent :: proc(t: ^Transpiler) {
 	}
 }
 
-transpile :: proc(w: io.Writer, identifier: string, templ: Template, allocator := context.allocator) {
+transpile :: proc(w: io.Writer, identifier: string, templ: Template, embed_parser: Embed_Parser, embed_data: rawptr, allocator := context.allocator) {
 	t: Transpiler
+	t.embed_parser = embed_parser
+	t.embed_data = embed_data
 	t.indent = "\t"
 	t.w = w
 
@@ -99,6 +106,8 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 		transpile_if(t, d)
 	case ^Node_For:
 		transpile_for(t, d)
+	case ^Node_Embed:
+		transpile_embed(t, d)
 	}
 }
 
@@ -240,6 +249,30 @@ transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
 		transpile_node(t, n)
 
 		if i != len(node.body) - 1 {
+			write_newline(t)
+		}
+	}
+
+	dedent(t)
+	write_newline(t)
+	ws(t.w, "}")
+}
+
+transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
+	ws(t.w, "{ // ")
+	ws(t.w, strings.trim(node.path.value, " \""))
+	indent(t)
+	write_newline(t)
+
+	if with, ok := node.with.?; ok {
+		ws(t.w, "this := ")
+		ws(t.w, strings.trim_space(with.expr.value))
+		write_newline(t)
+	}
+
+	if templ, ok := t.embed_parser(node, t.embed_data); ok {
+		for node, i in templ.content {
+			transpile_node(t, node)
 			write_newline(t)
 		}
 	}

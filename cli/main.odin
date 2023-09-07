@@ -302,8 +302,8 @@ write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) -> (ok: bool) {
 		warn(pos, "skipping template because of the error: %s", err.msg)
 		return
 	}
-
-	transpile(w, identifier, templ)
+	
+	transpile(w, identifier, templ, embed_parser, &file)
 
 	ok = true
 	return
@@ -319,4 +319,40 @@ write_generated_file_footer :: proc(w: io.Writer, has_calls: bool) {
 		io.write_string(w, `	#panic("undefined template \"" + path + "\" did you run the temple transpiler?")
 }`)
 	}
+}
+
+embed_parser :: proc(node: ^Node_Embed, parent_path_: rawptr) -> (Template, bool) {
+	parent_path := (cast(^string)parent_path_)^
+	relpath := node.path.value[1:len(node.path.value)-1]
+	fullpath := filepath.join({filepath.dir(parent_path), relpath})
+
+	data, ok := os.read_entire_file_from_filename(fullpath)
+	if !ok {
+		pos := tokenizer.Pos{
+			offset = node.path.pos.offset,
+			line   = node.path.pos.line + 1,
+			column = node.path.pos.col + 1,
+			file   = parent_path,
+		}
+		warn(pos, "unable to read embedded template file at %q, skipping", fullpath)
+		return {}, false
+	}
+
+	// TODO: better error handling.
+
+	parser: Parser
+	parser_init(&parser, data)
+	templ := parse(&parser)
+	if err, has_err := templ.err.?; has_err {
+		pos := tokenizer.Pos{
+			offset = err.pos.offset,
+			line   = err.pos.line + 1,
+			column = err.pos.col + 1,
+			file   = fullpath,
+		}
+		warn(pos, "skipping template because of the error: %s", err.msg)
+		return {}, false
+	}
+
+	return templ, templ.err == nil
 }
