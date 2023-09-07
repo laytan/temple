@@ -47,7 +47,8 @@ The syntax is most similar/works best with syntax highlighting for the Twig temp
 That is a suggestion and you can call template files however you like.
 
 You can then use the templates like this:
-```html
+
+```twig
 <!-- templates/home.temple.twig -->
 
 Hello, {{ this.name }}!
