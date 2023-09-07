@@ -47,13 +47,11 @@ main :: proc() {
 	transpile_calls(os.args[2], calls[:])
 }
 
-// TODO: colors don't work
-
 warn :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) {
 	if p, ok := pos.?; ok {
-		fmt.eprintf("%s(%i:%i) \033[39mWARN:\033[0m ", p.file, p.line, p.column)
+		fmt.eprintf("%s(%i:%i) \x1b[0;33mTemple Warning:\x1b[0m ", p.file, p.line, p.column)
 	} else {
-		fmt.eprint("\033[39mWARN:\033[0m ")
+		fmt.eprint("\x1b[0;33mTemple Warning:\x1b[0m ")
 	}
 
 	fmt.eprintf(msg, ..args)
@@ -62,9 +60,9 @@ warn :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) {
 
 error :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) -> ! {
 	if p, ok := pos.?; ok {
-		fmt.eprintf("%s(%i:%i) \033[91mERROR:\033[0m ", p.file, p.line, p.column)
+		fmt.eprintf("%s(%i:%i) \x1b[0;31mTemple Error:\x1b[0m ", p.file, p.line, p.column)
 	} else {
-		fmt.eprint("\033[91mERROR:\033[0m ")
+		fmt.eprint("\x1b[0;31mTemple Error:\x1b[0m ")
 	}
 
 	fmt.eprintf(msg, ..args)
@@ -211,8 +209,6 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
 	}
 	defer os.close(handle)
 
-	// TODO: if error, put back the default file, just the proc with the panic.
-
 	s := os.stream_from_handle(handle)
 
 	bw: bufio.Writer
@@ -222,15 +218,18 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
 
 	w := bufio.writer_to_writer(&bw)
 
-	has_calls := len(calls) > 0
+	good_calls := len(calls)
 
-	write_generated_file_header(w, has_calls)
+	write_generated_file_header(w, good_calls > 0)
 
 	for c in calls {
-		write_transpiled_call(w, c)
+		if !write_transpiled_call(w, c) {
+			good_calls -= 1
+		}
+
 	}
 
-	write_generated_file_footer(w, has_calls)
+	write_generated_file_footer(w, good_calls > 0)
 }
 
 write_generated_file_header :: proc(w: io.Writer, has_calls: bool) {
@@ -265,16 +264,19 @@ compiled :: proc($path: string, $T: typeid) -> Compiled(T) {
 	)
 }
 
-write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) {
+// NOTE: we should not use `error` in this scope, because that would close the file in a bad state.
+write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) -> (ok: bool) {
 	// Anything allocated is not needed anymore when we return.
 	context.allocator = context.temp_allocator
 
 	data: []byte
 	identifier: string
+	file: string
 
 	switch t in call.type {
 	case Call_Path:
 		identifier = t.relpath
+		file = t.fullpath
 		d, ok := os.read_entire_file_from_filename(t.fullpath)
 		if !ok {
 			warn(nil, "unable to read template file at %q, skipping", t.fullpath)
@@ -284,17 +286,27 @@ write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) {
 	case Call_Inline:
 		identifier = t.template
 		data = transmute([]byte)t.template
+		file = call.pos.file
 	}
 
 	parser: Parser
 	parser_init(&parser, data)
-	templ, pok := parse(&parser)
-	if !pok {
-		warn(call.pos, "there were errors parsing the template, skipping")
+	templ := parse(&parser)
+	if err, has_err := templ.err.?; has_err {
+		pos := tokenizer.Pos{
+			offset = err.pos.offset,
+			line   = err.pos.line + 1,
+			column = err.pos.col + 1,
+			file   = file,
+		}
+		warn(pos, "skipping template because of the error: %s", err.msg)
 		return
 	}
 
 	transpile(w, identifier, templ)
+
+	ok = true
+	return
 }
 
 write_generated_file_footer :: proc(w: io.Writer, has_calls: bool) {
