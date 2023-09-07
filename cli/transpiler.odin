@@ -9,6 +9,11 @@ import "core:strings"
 
 ws :: io.write_string
 
+// Identifiers used in the transpiled output.
+ARG_W   :: "__temple_w"
+RET_N   :: "__temple_n"
+RET_ERR :: "__temple_err"
+
 Transpiler :: struct {
 	allocator:    mem.Allocator,
 	w:            io.Writer,
@@ -53,7 +58,7 @@ transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := cont
 
 	indent(&t)
 	write_newline(&t)
-	ws(t.w, "with = proc(w: io.Writer, this: T) -> (n: int, err: io.Error) {")
+	fmt.wprintf(t.w, "with = proc(%s: io.Writer, this: T) -> (%s: int, %s: io.Error) {{", ARG_W, RET_N, RET_ERR)
 
 	indent(&t)
 	write_newline(&t)
@@ -99,42 +104,46 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
 	t.approx_bytes += len(node.text.value)
 
-	ws(t.w, "n += io.write_string(w, ")
+	fmt.wprintf(t.w, "%s += io.write_string(%s, ", RET_N, ARG_W)
 	io.write_quoted_string(t.w, node.text.value)
 	ws(t.w, ") or_return")
 }
 
 transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	t.approx_bytes += 10
-
-	ws(t.w, "n += ")
+	
+	ws(t.w, RET_N)
+	ws(t.w, " += ")
 
 	v := strings.trim_space(node.expression.value)
 	// Users can force a specific write call by wrapping the expression in a "cast".
 	switch {
 	case strings.has_prefix(v, "byte("):
-		ws(t.w, "io.write_byte(w, ")
+		ws(t.w, "io.write_byte(")
 	case strings.has_prefix(v, "rune("):
-		ws(t.w, "io.write_rune(w, ")
+		ws(t.w, "io.write_rune(")
 	case strings.has_prefix(v, "int("):
-		ws(t.w, "io.write_int(w, ")
+		ws(t.w, "io.write_int(")
 	case strings.has_prefix(v, "uint("):
-		ws(t.w, "io.write_uint(w, ")
+		ws(t.w, "io.write_uint(")
 	case strings.has_prefix(v, "i128("):
-		ws(t.w, "io.write_i128(w, ")
+		ws(t.w, "io.write_i128(")
 	case strings.has_prefix(v, "u128("):
-		ws(t.w, "io.write_u128(w, ")
+		ws(t.w, "io.write_u128(")
 	case strings.has_prefix(v, "u64("):
-		ws(t.w, "io.write_u64(w, ")
+		ws(t.w, "io.write_u64(")
 	case strings.has_prefix(v, "i64("):
-		ws(t.w, "io.write_i64(w, ")
+		ws(t.w, "io.write_i64(")
 	case strings.has_prefix(v, "f32("):
-		ws(t.w, "io.write_f32(w, ")
+		ws(t.w, "io.write_f32(")
 	case strings.has_prefix(v, "f64("):
-		ws(t.w, "io.write_f64(w, ")
+		ws(t.w, "io.write_f64(")
 	case:
-		ws(t.w, "write_escaped_string(w, ")
+		ws(t.w, "write_escaped_string(")
 	}
+
+	ws(t.w, ARG_W)
+	ws(t.w, ", ")
 
 	ws(t.w, v)
 	ws(t.w, ") or_return")
