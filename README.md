@@ -57,7 +57,7 @@ Hello, {{ this.name }}!
 <!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->
 The count is {{ int(this.count) }} 
 
-{% for i in 1..=5 %}{{ i }}{% end %}
+{% for i in 1..=5 %}{{ int(i) }}{% end %}
 ```
 
 ```odin
@@ -82,11 +82,48 @@ main :: proc() {
 	home.with(w, {"Laytan", 10})
 
     // Output:
-    // Hello, Laytan!
+    // <!-- templates/home.temple.twig -->
     //
-    // Cool Name!
+    // Hello, Laytan!!
     //
+    //
+    // <!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->
     // The count is 10
+    // 12345
+}
+```
+
+Generated code for the previous example looks like the following:
+
+```odin
+package temple
+
+import __temple_io "core:io"
+
+compiled :: proc($path: string, $T: typeid) -> Compiled(T) {
+	when path == "templates/home.temple.twig" {
+		return {
+			with = proc(__temple_w: __temple_io.Writer, this: T) -> (__temple_n: int, __temple_err: __temple_io.Error) {
+				__temple_n += __temple_io.write_string(__temple_w, "<!-- templates/home.temple.twig -->\n\nHello, ") or_return /* 1:1 in template */
+				__temple_n += __temple_write_escaped_string(__temple_w, this.name) or_return /* 3:8 in template */
+				__temple_n += __temple_io.write_string(__temple_w, "!\n") or_return /* 3:23 in template */
+				if this.name == "Laytan" { /* 5:1 in template */
+					__temple_n += __temple_io.write_string(__temple_w, "Cool Name!") or_return /* 5:31 in template */
+				}
+				__temple_n += __temple_io.write_string(__temple_w, "\n\n<!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->\nThe count is ") or_return /* 5:50 in template */
+				__temple_n += __temple_io.write_int(__temple_w, int(this.count)) or_return /* 8:14 in template */
+				__temple_n += __temple_io.write_string(__temple_w, " \n") or_return /* 8:35 in template */
+				for i in 1..=5 { /* 10:1 in template */
+					__temple_n += __temple_io.write_int(__temple_w, int(i)) or_return /* 10:21 in template */
+				}
+				__temple_n += __temple_io.write_string(__temple_w, "\n") or_return /* 10:42 in template */
+				return
+			}, 
+			approx_bytes = 218,
+		}
+	} else {
+		#panic("undefined template \"" + path + "\" did you run the temple transpiler?")
+	}
 }
 ```
 
