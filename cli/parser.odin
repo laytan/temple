@@ -14,11 +14,12 @@ default_error_handler :: proc(pos: Pos, msg: string, args: ..any) {
 }
 
 Parser :: struct {
-	lexer:       Lexer,
-	allocator:   mem.Allocator,
-	template:    Template,
-	err_handler: Err_Handler,
-	err_count:   int,
+	lexer:         Lexer,
+	allocator:     mem.Allocator,
+	template:      Template,
+	err_handler:   Err_Handler,
+	err_count:     int,
+	last_txt_node: Maybe(^Node_Text),
 }
 
 Template :: struct {
@@ -172,13 +173,16 @@ parse_text :: proc(p: ^Parser, text_token: Token) -> ^Node_Text {
 	t.derived = t
 
 	t.text = text_token
-
+	
+	p.last_txt_node = t
 	return t
 }
 
 // TODO: if the only thing on a line is process tokens, remove the line completely.
 
 parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = nil) -> Node {
+	parser_maybe_remove_whitespace(p, process)
+
 	process_type, ok := process_type_.?
 	if !ok {
 		process_type = lexer_next(&p.lexer)
@@ -213,6 +217,8 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> ^Node_If {
 	t.elseifs.allocator  = p.allocator
 
 	parse_if_part :: proc(p: ^Parser, if_part: ^Node_If_Part, process: Token, process_type: Token) -> (end_open: Token, end_type: Token) {
+		parser_maybe_remove_whitespace(p, process)
+
 		if_part.start.open = process
 		if_part.start.type = process_type
 
@@ -357,6 +363,8 @@ parse_body :: proc(
 			append(container, parse_text(p, tok))
 
 		case .Process_Open:
+			parser_maybe_remove_whitespace(p, tok)
+
 			process_type := lexer_next(&p.lexer)
 			if is_end(process_type) {
 				end_open = tok
@@ -377,4 +385,41 @@ parse_body :: proc(
 			error(p, tok.pos, "invalid token inside a body: got %q", tok.value)
 		}
 	}
+}
+
+/*
+Removes whitespace occupied by the space before the given process token,
+from the previous text node if it directly borders it, and it is on a previous line.
+
+This makes lines that only contain process nodes not end up in the output as blank lines,
+but just removes them for more concise and accurate output.
+*/
+parser_maybe_remove_whitespace :: proc(p: ^Parser, token: Token) {
+	assert(token.type == .Process_Open)
+
+	last_txt, ok := p.last_txt_node.?
+	if !ok do return
+
+	// If the last text node doesn't border this token, keep the whitespace.
+	last_offset := last_txt.text.pos.offset + len(last_txt.text.value)
+	if last_offset != token.pos.offset {
+		return
+	}
+
+	// If they are on the same line, keep the whitespace.
+	if last_txt.text.pos.line == token.pos.line {
+		return
+	}
+
+	new_end: int
+	#reverse for c, i in transmute([]byte)last_txt.text.value {
+		new_end = i
+		switch c {
+		case ' ', '\t':
+			continue
+		}
+		break
+	}
+
+	last_txt.text.value = last_txt.text.value[0:new_end]
 }
