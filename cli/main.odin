@@ -217,7 +217,7 @@ write_generated_file_header :: proc(w: io.Writer, has_calls: bool) {
 
 package temple
 
-import "core:io"
+import __temple_io "core:io"
 
 /*
 Returns the compiled template for the template file at the given path.

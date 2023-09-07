@@ -2,7 +2,7 @@
 
 package temple
 
-import "core:io"
+import __temple_io "core:io"
 
 /*
 Returns the compiled template for the template file at the given path.

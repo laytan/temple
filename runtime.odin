@@ -19,7 +19,7 @@ Compiled :: struct($T: typeid) {
 /*
 Writes a string to the writer with special characters that can be used in XSS escaped.
 */
-write_escaped_string :: proc(w: io.Writer, str: string) -> (n: int, err: io.Error) {
+__temple_write_escaped_string :: proc(w: io.Writer, str: string) -> (n: int, err: io.Error) {
 	for i in 0 ..< len(str) {
 		b := str[i]
 		switch b {

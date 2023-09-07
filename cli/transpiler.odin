@@ -10,6 +10,7 @@ import "core:strings"
 ws :: io.write_string
 
 // Identifiers used in the transpiled output.
+PKG_IO  :: "__temple_io"
 ARG_W   :: "__temple_w"
 RET_N   :: "__temple_n"
 RET_ERR :: "__temple_err"
@@ -58,7 +59,7 @@ transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := cont
 
 	indent(&t)
 	write_newline(&t)
-	fmt.wprintf(t.w, "with = proc(%s: io.Writer, this: T) -> (%s: int, %s: io.Error) {{", ARG_W, RET_N, RET_ERR)
+	fmt.wprintf(t.w, "with = proc(%s: %s.Writer, this: T) -> (%s: int, %s: %s.Error) {{", ARG_W, PKG_IO, RET_N, RET_ERR, PKG_IO)
 
 	indent(&t)
 	write_newline(&t)
@@ -104,7 +105,7 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
 	t.approx_bytes += len(node.text.value)
 
-	fmt.wprintf(t.w, "%s += io.write_string(%s, ", RET_N, ARG_W)
+	fmt.wprintf(t.w, "%s += %s.write_string(%s, ", RET_N, PKG_IO, ARG_W)
 	io.write_quoted_string(t.w, node.text.value)
 	ws(t.w, ") or_return")
 }
@@ -119,27 +120,27 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	// Users can force a specific write call by wrapping the expression in a "cast".
 	switch {
 	case strings.has_prefix(v, "byte("):
-		ws(t.w, "io.write_byte(")
+		fmt.wprintf(t.w, "%s.write_byte(", PKG_IO)
 	case strings.has_prefix(v, "rune("):
-		ws(t.w, "io.write_rune(")
+		fmt.wprintf(t.w, "%s.write_rune(", PKG_IO)
 	case strings.has_prefix(v, "int("):
-		ws(t.w, "io.write_int(")
+		fmt.wprintf(t.w, "%s.write_int(", PKG_IO)
 	case strings.has_prefix(v, "uint("):
-		ws(t.w, "io.write_uint(")
+		fmt.wprintf(t.w, "%s.write_uint(", PKG_IO)
 	case strings.has_prefix(v, "i128("):
-		ws(t.w, "io.write_i128(")
+		fmt.wprintf(t.w, "%s.write_i128(", PKG_IO)
 	case strings.has_prefix(v, "u128("):
-		ws(t.w, "io.write_u128(")
+		fmt.wprintf(t.w, "%s.write_u128(", PKG_IO)
 	case strings.has_prefix(v, "u64("):
-		ws(t.w, "io.write_u64(")
+		fmt.wprintf(t.w, "%s.write_u64(", PKG_IO)
 	case strings.has_prefix(v, "i64("):
-		ws(t.w, "io.write_i64(")
+		fmt.wprintf(t.w, "%s.write_i64(", PKG_IO)
 	case strings.has_prefix(v, "f32("):
-		ws(t.w, "io.write_f32(")
+		fmt.wprintf(t.w, "%s.write_f32(", PKG_IO)
 	case strings.has_prefix(v, "f64("):
-		ws(t.w, "io.write_f64(")
+		fmt.wprintf(t.w, "%s.write_f64(", PKG_IO)
 	case:
-		ws(t.w, "write_escaped_string(")
+		ws(t.w, "__temple_write_escaped_string(")
 	}
 
 	ws(t.w, ARG_W)
