@@ -53,18 +53,17 @@ transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := cont
 
 	indent(&t)
 	write_newline(&t)
-	ws(t.w, "with = proc(w: io.Writer, this: T) {")
+	ws(t.w, "with = proc(w: io.Writer, this: T) -> (n: int, err: io.Error) {")
 
 	indent(&t)
 	write_newline(&t)
 
 	for node, i in templ.content {
 		transpile_node(&t, node)
-
-		if i != len(templ.content) - 1 {
-			write_newline(&t)
-		}
+		write_newline(&t)
 	}
+
+	ws(t.w, "return")
 
 	dedent(&t)
 	write_newline(&t)
@@ -98,19 +97,45 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
 	t.approx_bytes += len(node.text.value)
 
-	ws(t.w, `io.write_string(w, `)
+	ws(t.w, "n += io.write_string(w, ")
 	io.write_quoted_string(t.w, node.text.value)
-	ws(t.w, `)`)
+	ws(t.w, ") or_return")
 }
 
 transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	t.approx_bytes += 10
 
-	// TODO: detect what type it is and use the right function.
+	ws(t.w, "n += ")
 
-	ws(t.w, "write_escaped_string(w, ")
-	ws(t.w, strings.trim_space(node.expression.value))
-	ws(t.w, `)`)
+	v := strings.trim_space(node.expression.value)
+	// Users can force a specific write call by wrapping the expression in a "cast".
+	switch {
+	case strings.has_prefix(v, "byte("):
+		ws(t.w, "io.write_byte(w, ")
+	case strings.has_prefix(v, "rune("):
+		ws(t.w, "io.write_rune(w, ")
+	case strings.has_prefix(v, "int("):
+		ws(t.w, "io.write_int(w, ")
+	case strings.has_prefix(v, "uint("):
+		ws(t.w, "io.write_uint(w, ")
+	case strings.has_prefix(v, "i128("):
+		ws(t.w, "io.write_i128(w, ")
+	case strings.has_prefix(v, "u128("):
+		ws(t.w, "io.write_u128(w, ")
+	case strings.has_prefix(v, "u64("):
+		ws(t.w, "io.write_u64(w, ")
+	case strings.has_prefix(v, "i64("):
+		ws(t.w, "io.write_i64(w, ")
+	case strings.has_prefix(v, "f32("):
+		ws(t.w, "io.write_f32(w, ")
+	case strings.has_prefix(v, "f64("):
+		ws(t.w, "io.write_f64(w, ")
+	case:
+		ws(t.w, "write_escaped_string(w, ")
+	}
+
+	ws(t.w, v)
+	ws(t.w, ") or_return")
 }
 
 transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
