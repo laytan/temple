@@ -151,36 +151,60 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 
 transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 	ws(t.w, "if ")
-	ws(t.w, strings.trim_space(node.start.expression.value))
+	ws(t.w, strings.trim_space(node._if.start.expr.?.value))
 
 	ws(t.w, " {")
 	indent(t)
 	write_newline(t)
 
 	approx_start := t.approx_bytes
+	max_approx_bytes: int
 
-	for n, i in node.if_true {
+	for n, i in node._if.body {
 		transpile_node(t, n)
 
-		if i != len(node.if_true) - 1 {
+		if i != len(node._if.body) - 1 {
 			write_newline(t)
 		}
 	}
+
+	max_approx_bytes = t.approx_bytes - approx_start
+	t.approx_bytes = approx_start
 
 	dedent(t)
 	write_newline(t)
 	ws(t.w, "}")
 
-	if els, ok := node.if_false.?; ok {
+	for elsef in node.elseifs {
+		ws(t.w, " else if ")
+		ws(t.w, strings.trim_space(elsef.start.expr.?.value))
+		ws(t.w, " {")
+		indent(t)
+		write_newline(t)
+
+		for n, i in elsef.body {
+			transpile_node(t, n)
+
+			if i != len(elsef.body) - 1 {
+				write_newline(t)
+			}
+		}
+
+		dedent(t)
+		write_newline(t)
+		ws(t.w, "}")
+		
+		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
+		approx_elseif := t.approx_bytes - approx_start
+		t.approx_bytes = approx_start
+		max_approx_bytes = max(max_approx_bytes, approx_elseif)
+	}
+
+	if els, ok := node._else.?; ok {
 		ws(t.w, " else {")
 
 		indent(t)
 		write_newline(t)
-		
-		// How many bytes is the if true case approximately?
-		approx_if := t.approx_bytes - approx_start
-		// Reset before writing else body.
-		t.approx_bytes = approx_start
 
 		for n, i in els.body {
 			transpile_node(t, n)
@@ -190,18 +214,17 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 			}
 		}
 		
-		// How many bytes is the else case approximately?
+		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
 		approx_else := t.approx_bytes - approx_start
-		// Reset before adding.
 		t.approx_bytes = approx_start
-		
-		// Add the approximate byte count of the biggest branch.
-		t.approx_bytes += max(approx_if, approx_else)
+		max_approx_bytes = max(max_approx_bytes, approx_else)
 
 		dedent(t)
 		write_newline(t)
 		ws(t.w, "}")
 	}
+
+	t.approx_bytes += max_approx_bytes
 }
 
 transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {

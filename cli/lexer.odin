@@ -30,6 +30,7 @@ Token_Type :: enum {
 	If,
 	For,
 	Else,
+	ElseIf,
 	End,
 }
 
@@ -104,9 +105,14 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 			t.value = lexer_consume(l, "for")
 
 		case l.ch == 'e' && lexer_peek(l) == 'l' && lexer_peek(l, 2) == 's' && lexer_peek(l, 3) == 'e':
-			t.type  = .Else
-			t.value = lexer_consume(l, "else")
-			lexer_skip_spaces(l)
+			if lexer_peek(l, 4) == 'i' && lexer_peek(l, 5) == 'f' {
+				t.type = .ElseIf
+				t.value = lexer_consume(l, "elseif")
+			} else {
+				t.type  = .Else
+				t.value = lexer_consume(l, "else")
+				lexer_skip_spaces(l)
+			}
 
 		case:
 			t.type  = .Illegal
