@@ -20,6 +20,7 @@ An experimental in development templating engine for Odin
     * Error when temple is called incorrectly
     * Error when you use something in the template that you don't provide when using
     * etc.
+* No dependence on having template files after compiling, a single binary contains everything
 
 ## Goals:
 
@@ -27,7 +28,6 @@ An experimental in development templating engine for Odin
 * Catch common errors in the CLI, instead of having Odin catch it, this is because if Odin catches it, the source of the error is lost, in the CLI we have context
 * Make the CLI be as fast as possible to not burden the development cycle, ideally almost instant for hundreds of templates
 * Layouts, similar to [{% extends %} in Twig](https://twig.symfony.com/doc/2.x/tags/extends.html)
-* Some kind of source mapping between the transpiler output and the templates, maybe just simple comments at the end of a line saying where it was generated from
 * Better errors when inside of an embed, give more context of the embed tree and bubble the error all the way back up 
 
 ## Usage:

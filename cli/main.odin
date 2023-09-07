@@ -91,6 +91,8 @@ collect_compile_calls :: proc(
 	// only the returning calls are allocated on the allocator that is given.
 	context.allocator = context.temp_allocator
 
+	fmt.printf("looking for compile calls in %q\n", root)
+
 	// TODO: does not support symbolic links, communicate it to users.
 
 	filepath.walk(
@@ -230,6 +232,8 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
 	}
 
 	write_generated_file_footer(w, good_calls > 0)
+
+	fmt.printf("found %i compile calls of which %i where successfully compiled\n", len(calls), good_calls)
 }
 
 write_generated_file_header :: proc(w: io.Writer, has_calls: bool) {

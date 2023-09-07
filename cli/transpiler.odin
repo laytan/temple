@@ -117,11 +117,12 @@ transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
 	fmt.wprintf(t.w, "%s += %s.write_string(%s, ", RET_N, PKG_IO, ARG_W)
 	io.write_quoted_string(t.w, node.text.value)
 	ws(t.w, ") or_return")
+	transpile_loc(t, node.text.pos)
 }
 
 transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	t.approx_bytes += 10
-	
+
 	ws(t.w, RET_N)
 	ws(t.w, " += ")
 
@@ -157,6 +158,7 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 
 	ws(t.w, v)
 	ws(t.w, ") or_return")
+	transpile_loc(t, node.open.pos)
 }
 
 transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
@@ -164,6 +166,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 	ws(t.w, strings.trim_space(node._if.start.expr.?.value))
 
 	ws(t.w, " {")
+	transpile_loc(t, node._if.start.open.pos)
 	indent(t)
 	write_newline(t)
 
@@ -189,6 +192,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 		ws(t.w, " else if ")
 		ws(t.w, strings.trim_space(elsef.start.expr.?.value))
 		ws(t.w, " {")
+		transpile_loc(t, elsef.start.open.pos)
 		indent(t)
 		write_newline(t)
 
@@ -212,6 +216,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 
 	if els, ok := node._else.?; ok {
 		ws(t.w, " else {")
+		transpile_loc(t, els.start.open.pos)
 
 		indent(t)
 		write_newline(t)
@@ -242,6 +247,7 @@ transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
 	ws(t.w, strings.trim_space(node.start.expression.value))
 
 	ws(t.w, " {")
+	transpile_loc(t, node.start.open.pos)
 	indent(t)
 	write_newline(t)
 
@@ -259,8 +265,8 @@ transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
 }
 
 transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
-	ws(t.w, "{ // ")
-	ws(t.w, strings.trim(node.path.value, " \""))
+	ws(t.w, "{")
+	transpile_loc(t, node.open.pos, fmt.tprintf("embedding %s ", node.path.value))
 	indent(t)
 	write_newline(t)
 
@@ -280,4 +286,8 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	dedent(t)
 	write_newline(t)
 	ws(t.w, "}")
+}
+
+transpile_loc :: proc(t: ^Transpiler, pos: Pos, extra := "") {
+	fmt.wprintf(t.w, " /* %i:%i in template %s*/", pos.line + 1, pos.col + 1, extra)
 }
