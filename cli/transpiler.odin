@@ -91,6 +91,8 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 		transpile_output(t, d)
 	case ^Node_If:
 		transpile_if(t, d)
+	case ^Node_For:
+		transpile_for(t, d)
 	}
 }
 
@@ -152,6 +154,27 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 		transpile_node(t, n)
 
 		if i != len(node.if_true) - 1 {
+			write_newline(t)
+		}
+	}
+
+	dedent(t)
+	write_newline(t)
+	ws(t.w, "}")
+}
+
+transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
+	ws(t.w, "for ")
+	ws(t.w, strings.trim_space(node.start.expression.value))
+
+	ws(t.w, " {")
+	indent(t)
+	write_newline(t)
+
+	for n, i in node.body {
+		transpile_node(t, n)
+
+		if i != len(node.body) - 1 {
 			write_newline(t)
 		}
 	}

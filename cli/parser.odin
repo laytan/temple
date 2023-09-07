@@ -33,6 +33,7 @@ Any_Node :: union {
 	^Node_Text,
 	^Node_Output,
 	^Node_If,
+	^Node_For,
 }
 
 Node_Text :: struct {
@@ -49,18 +50,32 @@ Node_Output :: struct {
 
 Node_If :: struct {
 	using node: Node,
-	start: struct {
+	start:      struct {
 		open:       Token,
 		_if:        Token,
 		expression: Token,
 		close:      Token,
 	},
-	if_true: [dynamic]Node,
-	end: struct {
-		open:  Token,
-		end:   Token,
-		close: Token,
+	if_true:    [dynamic]Node,
+	end:        Node_End,
+}
+
+Node_For :: struct {
+	using node: Node,
+	start:      struct {
+		open:       Token,
+		_for:       Token,
+		expression: Token,
+		close:      Token,
 	},
+	body:       [dynamic]Node,
+	end:        Node_End,
+}
+
+Node_End :: struct {
+	open:  Token,
+	end:   Token,
+	close: Token,
 }
 
 parser_init_bytes :: proc(p: ^Parser, source: []byte, allocator := context.allocator) {
@@ -80,7 +95,7 @@ parser_init :: proc {
 	parser_init_str,
 }
 
-@(private="file")
+@(private = "file")
 error :: proc(p: ^Parser, pos: Pos, msg: string, args: ..any) {
 	p.err_count += 1
 	if p.err_handler != nil {
@@ -105,7 +120,7 @@ parse :: proc(p: ^Parser) -> (Template, bool) {
 		case .EOF:
 			break parse_loop
 
-		case .Output_Close, .Illegal, .Process_Close, .If, .End:
+		case .Output_Close, .Illegal, .Process_Close, .If, .End, .For:
 			fallthrough
 
 		case:
@@ -166,10 +181,17 @@ parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = 
 	switch process_type.type {
 	case .If:
 		return parse_if(p, process, process_type)
+	case .For:
+		return parse_for(p, process, process_type)
 	case .End, .Process_Close, .Process_Open, .EOF, .Text, .Illegal, .Output_Open, .Output_Close:
 		fallthrough
 	case:
-		error(p, process_type.pos, "invalid process type token, expected \"if\", got: %q", process_type.value)
+		error(
+			p,
+			process_type.pos,
+			"invalid process type token, expected \"if\", or \"for\", got: %q",
+			process_type.value,
+		)
 
 		// NOTE: do we want to return an empty/nil node?
 		return {}
@@ -209,48 +231,89 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> ^Node_If {
 		return t
 	}
 
+	t.end = parse_body(p, &t.if_true)
+	return t
+}
+
+parse_for :: proc(p: ^Parser, process: Token, process_type: Token) -> ^Node_For {
+	assert(process_type.type == .For)
+
+	t := new(Node_For, p.allocator)
+	t.derived = t
+	t.body.allocator = p.allocator
+
+	t.start.open = process
+	t.start._for = process_type
+
+	t.start.expression = lexer_next(&p.lexer)
+	if t.start.expression.type != .Text {
+		error(
+			p,
+			t.start.expression.pos,
+			"invalid token following \"for\", expected a for expression to evaluate, got: %q",
+			t.start.expression.value,
+		)
+		return t
+	}
+
+	t.start.close = lexer_next(&p.lexer)
+	if t.start.close.type != .Process_Close {
+		error(
+			p,
+			t.start.close.pos,
+			"invalid token following the for expression %q, expected \"%%}\", got: %q",
+			t.start.expression.value,
+			t.start.close.value,
+		)
+		return t
+	}
+
+	t.end = parse_body(p, &t.body)
+	return t
+}
+
+parse_body :: proc(p: ^Parser, container: ^[dynamic]Node) -> (end: Node_End) {
 	parse_loop: for {
 		tok := lexer_next(&p.lexer)
 
 		switch tok.type {
 		case .Output_Open:
-			append(&t.if_true, parse_output(p, tok))
+			append(container, parse_output(p, tok))
 
 		case .Text:
-			append(&t.if_true, parse_text(p, tok))
+			append(container, parse_text(p, tok))
 
 		case .Process_Open:
 			process_type := lexer_next(&p.lexer)
 			if process_type.type == .End {
-				t.end.open = tok
-				t.end.end = process_type
+				end.open = tok
+				end.end = process_type
 				break parse_loop
 			}
 
-			append(&t.if_true, parse_process(p, tok, process_type))
+			append(container, parse_process(p, tok, process_type))
 
 		case .EOF:
-			error(p, tok.pos, "unexpected EOF while inside an if statement body")	
-			return t
+			error(p, tok.pos, "unexpected EOF while inside a body")
+			return end
 
-		case .Output_Close, .Process_Close, .Illegal, .If, .End:
+		case .Output_Close, .Process_Close, .Illegal, .If, .End, .For:
 			fallthrough
 
 		case:
-			error(p, tok.pos, "invalid token inside if statement: got %q", tok.value)
+			error(p, tok.pos, "invalid token inside body a body: got %q", tok.value)
 		}
 	}
 
-	t.end.end = lexer_next(&p.lexer)
-	if t.end.end.type != .Process_Close {
+	end.end = lexer_next(&p.lexer)
+	if end.end.type != .Process_Close {
 		error(
 			p,
-			t.end.end.pos,
+			end.end.pos,
 			"invalid token following the \"{{%% end\", expected \"%%}\", got: %q",
-			t.end.end.value,
+			end.end.value,
 		)
 		// Purposefully returning the kinda invalid token because it might have context about the err.
 	}
-
-	return t
+	return
 }

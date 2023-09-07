@@ -11,8 +11,8 @@ An experimental in development templating engine for Odin
     * `{{ this.name.? or_else "no name" }}`
     * `{{ this.welcome if this.user.new else "" }}`
 * Allow user to be explicit with a cast, and emit the correct write calls, eg: `{{ int(this.count + 5) }}`
-* Odin's expressive looping syntax, eg: `{% for name in this.names %} {{ name }} {% endfor %}`
-* Conditionals, eg: `{% if expression %} yeah! {% elseif expression %} No but Yeah! {% else %} No :( {% endif %}`
+* Odin's expressive looping syntax, eg: `{% for name in this.names %} {{ name }} {% end %}`
+* Conditionals, eg: `{% if expression %} yeah! {% elseif expression %} No but Yeah! {% else %} No :( {% end %}`
 * Approximate the size of a templates output, so user can resize a buffer before templating into it
 * Some simple way to include other templates, syntax not determined
 * No/minimal runtime errors

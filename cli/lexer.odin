@@ -28,6 +28,7 @@ Token_Type :: enum {
 	Process_Open,
 	Process_Close,
 	If,
+	For,
 	End,
 }
 
@@ -91,12 +92,15 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 		case l.ch == 'i' && lexer_peek(l) == 'f' && lexer_peek(l, 2) == ' ':
 			t.type  = .If
 			t.value = lexer_consume(l, "if")
-			lexer_skip_spaces(l)
 
 		case l.ch == 'e' && lexer_peek(l) == 'n' && lexer_peek(l, 2) == 'd':
 			t.type  = .End
 			t.value = lexer_consume(l, "end")
 			lexer_skip_spaces(l)
+
+		case l.ch == 'f' && lexer_peek(l) == 'o' && lexer_peek(l, 2) == 'r' && lexer_peek(l, 3) == ' ':
+			t.type = .For
+			t.value = lexer_consume(l, "for")
 
 		case:
 			t.type  = .Illegal
