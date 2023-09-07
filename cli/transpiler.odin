@@ -157,7 +157,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 	indent(t)
 	write_newline(t)
 
-	// NOTE: if we add else, we need to take the max() between the approx bytes of the two branches.
+	approx_start := t.approx_bytes
 
 	for n, i in node.if_true {
 		transpile_node(t, n)
@@ -170,6 +170,38 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 	dedent(t)
 	write_newline(t)
 	ws(t.w, "}")
+
+	if els, ok := node.if_false.?; ok {
+		ws(t.w, " else {")
+
+		indent(t)
+		write_newline(t)
+		
+		// How many bytes is the if true case approximately?
+		approx_if := t.approx_bytes - approx_start
+		// Reset before writing else body.
+		t.approx_bytes = approx_start
+
+		for n, i in els.body {
+			transpile_node(t, n)
+
+			if i != len(els.body) - 1 {
+				write_newline(t)
+			}
+		}
+		
+		// How many bytes is the else case approximately?
+		approx_else := t.approx_bytes - approx_start
+		// Reset before adding.
+		t.approx_bytes = approx_start
+		
+		// Add the approximate byte count of the biggest branch.
+		t.approx_bytes += max(approx_if, approx_else)
+
+		dedent(t)
+		write_newline(t)
+		ws(t.w, "}")
+	}
 }
 
 transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
