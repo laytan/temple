@@ -42,7 +42,7 @@ write_indent :: proc(t: ^Transpiler) {
 	}
 }
 
-transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := context.allocator) {
+transpile :: proc(w: io.Writer, identifier: string, templ: Template, allocator := context.allocator) {
 	t: Transpiler
 	t.indent = "\t"
 	t.w = w
@@ -50,7 +50,7 @@ transpile :: proc(w: io.Writer, path: string, templ: Template, allocator := cont
 	indent(&t)
 	write_indent(&t)
 	ws(t.w, "when path == ")
-	io.write_quoted_string(t.w, path)
+	io.write_quoted_string(t.w, identifier)
 	ws(t.w, " {")
 
 	indent(&t)

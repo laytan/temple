@@ -4,6 +4,8 @@ package temple
 
 import __temple_io "core:io"
 
+compiled_inline :: compiled
+
 /*
 Returns the compiled template for the template file at the given path.
 

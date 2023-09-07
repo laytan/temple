@@ -36,9 +36,12 @@ This currently requires the temple code to be in your project, and only used by 
     * The first argument is the path to the root of your project (where to look for templates)
     * The second argument is the path to temple itself
 
+The syntax is most similar/works best with syntax highlighting for the Twig templating engine, so I suggest ending template filenames with `.temple.twig`.
+That is a suggestion and you can call template files however you like.
+
 You can then use the templates like this:
 ```html
-<!-- templates/home.temple.html -->
+<!-- templates/home.temple.twig -->
 
 Hello, {{ this.name }}!
 
@@ -60,7 +63,10 @@ Home_This :: struct {
     count: int,
 }
 
-home := temple.compiled("templates/home.temple.html", Home_This)
+home := temple.compiled("templates/home.temple.twig", Home_This)
+
+// Or inline templates:
+// home := temple.compiled_inline(`Hello, {{ this.name }}`, Home_This)
 
 main :: proc() {
 	w := os.stream_from_handle(os.stdout)
