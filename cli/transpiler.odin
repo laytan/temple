@@ -131,7 +131,7 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 		fmt.wprintf(t.w, "%s.write_byte(", PKG_IO)
 	case strings.has_prefix(v, "rune("):
 		fmt.wprintf(t.w, "%s.write_rune(", PKG_IO)
-	case strings.has_prefix(v, "int("):
+	case strings.has_prefix(v, "int("), strings.has_prefix(v, "len("):
 		fmt.wprintf(t.w, "%s.write_int(", PKG_IO)
 	case strings.has_prefix(v, "uint("):
 		fmt.wprintf(t.w, "%s.write_uint(", PKG_IO)
@@ -205,7 +205,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 		dedent(t)
 		write_newline(t)
 		ws(t.w, "}")
-		
+
 		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
 		approx_elseif := t.approx_bytes - approx_start
 		t.approx_bytes = approx_start
@@ -226,7 +226,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 				write_newline(t)
 			}
 		}
-		
+
 		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
 		approx_else := t.approx_bytes - approx_start
 		t.approx_bytes = approx_start

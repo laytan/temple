@@ -168,7 +168,7 @@ collect_compile_calls :: proc(
 
 						switch selector.field.name {
 						case "compiled":
-							cp: Call_Path 
+							cp: Call_Path
 							defer c.type = cp
 
 							unqouted_path := strings.trim(path.tok.text, "\"`")
@@ -219,11 +219,15 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
 
 	write_generated_file_header(w, good_calls > 0)
 
-	for c in calls {
+	for c, i in calls {
 		if !write_transpiled_call(w, c) {
 			good_calls -= 1
+			continue
 		}
 
+		if i != len(calls)-1 {
+			io.write_string(w, "else")
+		}
 	}
 
 	write_generated_file_footer(w, good_calls > 0)
@@ -301,7 +305,7 @@ write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) -> (ok: bool) {
 		warn(pos, "skipping template because of the error: %s", err.msg)
 		return
 	}
-	
+
 	transpile(w, identifier, templ, embed_parser, &file)
 
 	ok = true
