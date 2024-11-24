@@ -19,24 +19,34 @@ Compiled :: struct($T: typeid) {
 /*
 Writes a string to the writer with special characters that can be used in XSS escaped.
 */
+
 __temple_write_escaped_string :: proc(w: io.Writer, str: string) -> (n: int, err: io.Error) {
-	for i in 0 ..< len(str) {
-		b := str[i]
-		switch b {
-		case '&':
-			n += io.write_string(w, "&amp;") or_return
-		case '"':
-			n += io.write_string(w, "&quot;") or_return
-		case '\'':
-			n += io.write_string(w, "&#039;") or_return
-		case '<':
-			n += io.write_string(w, "&lt;") or_return
-		case '>':
-			n += io.write_string(w, "&gt;") or_return
-		case:
-			io.write_byte(w, b) or_return
-			n += 1
-		}
-	}
+    start := 0
+    for ; start < len(str); {
+        replacement := ""
+        stop := start
+        for ; stop < len(str); stop += 1 {
+            switch str[stop] {
+            case '&':
+                replacement = "&amp;"
+                break
+            case '"':
+                replacement = "&quot;"
+                break
+            case '\'':
+                replacement = "&#039;"
+                break
+            case '<':
+                replacement = "&lt;"
+                break
+            case '>':
+                replacement = "&gt;"
+                break
+            }
+        }
+        n += io.write_string(w, str[start:stop]) or_return
+        n += io.write_string(w, replacement) or_return
+        start = stop + 1
+    }
 	return
 }
