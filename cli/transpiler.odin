@@ -127,6 +127,10 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	v := strings.trim_space(node.expression.value)
 	// Users can force a specific write call by wrapping the expression in a "cast".
 	switch {
+	case strings.has_prefix(v, "raw("):
+		fmt.wprintf(t.w, "%s.write_string(%s, %s) or_return", PKG_IO, ARG_W, strings.trim_suffix(strings.trim_prefix(v, "raw("), ")"))
+		transpile_loc(t, node.open.pos)
+		return
 	case strings.has_prefix(v, "byte("):
 		fmt.wprintf(t.w, "%s.write_byte(", PKG_IO)
 	case strings.has_prefix(v, "rune("):
