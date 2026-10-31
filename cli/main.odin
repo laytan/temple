@@ -257,7 +257,7 @@ Use 'Compiled.approx_bytes' to resize your buffered writer before calling.
 
 **This procedure and file is generated based on your templates, if there is an error here, it most likely originates from your template.**
 */
-compiled :: proc($path: string, $T: typeid) -> Compiled(T) {
+compiled :: proc "contextless" ($path: string, $T: typeid) -> Compiled(T) {
 `,
 	)
 }
