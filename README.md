@@ -291,3 +291,16 @@ t := temple.compiled_inline(`
   {%- end -%}
 </div>
 ```
+
+## Benchmarks (`benchmarks/`)
+
+Run the benchmark suite with `-o:speed` to measure runtime escaping, context-aware sanitizers, zero-allocation streaming `fmt(...)`, full page rendering, and compiler pipeline throughput:
+
+```sh
+# Optional: regenerate benchmarks/templates_gen.odin
+odin run cli -- --warn-unused benchmarks -out:benchmarks/templates_gen.odin -pkg:benchmarks -temple-import:..
+
+# Run the benchmark suite
+odin run benchmarks -o:speed
+```
+
