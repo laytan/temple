@@ -1,60 +1,77 @@
 # Temple
 
-A fast, compile-time templating engine for Odin that transpiles Twig/Mustache-inspired templates directly into zero-overhead Odin code.
+A fast, zero-overhead, compile-time HTML templating engine for [Odin](https://odin-lang.org) that transpiles Twig/Mustache-inspired templates directly into native Odin procedures.
 
-## Features:
+## Features
 
-* Similar syntax to Twig / Mustache templating engines
-* Zero runtime overhead — templates are transpiled into regular Odin procedures
-* Safe for HTML output by default (batched XSS escaping) with context-aware escaping for URLs (`{{ url(...) }}` / `{{ ... | url }}`), URL query parameters (`{{ url_param(...) }}` / `{{ ... | url_param }}`), JavaScript/JSON string literals (`{{ js(...) }}` / `{{ ... | js }}`), explicit raw opt-out (`{{ raw(...) }}` / `{{ ... | raw }}`), and word-span wrapping (`{{ magic(...) }}` / `{{ ... | magic }}`)
-* AST-powered pipe filter DSL (`|`), zero-allocation streaming `fmt(...)` formatting (`{{ this.price | fmt("$%.2f") }}`, `{{ fmt("%s (%i)", this.name, this.count) }}`), and `default(...)` fallbacks (`{{ this.name | default("Anonymous") }}`)
-* Full Odin expressions inside templates, validated at compile time by `core:odin/parser`
-    * `{{ this.name.? or_else "no name" }}`
-    * `{{ this.welcome if this.user.new else "" }}`
-* Explicit type-cast writers (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`, `len`), via call syntax (`{{ int(this.count + 5) }}`) or pipe syntax (`{{ this.items | len }}`)
-* Local variable bindings via `{% let x = expr %}`, `{% let x := expr %}`, or `{% let x: int = expr %}`
-* Conditionals (`{% if ... %}`, `{% elseif ... %}` / `{% else if ... %}`, `{% else %}`, `{% end %}`)
-* Pattern matching & enum/union switches (`{% switch ... %}`, `{% #partial switch ... %}`, `{% case ... %}`, `{% case %}`)
-* Odin's expressive looping syntax (`{% for name in this.names %} {{ name }} {% end %}`)
-* Layout inheritance (`{% extends "base.html" %}`, `{% block name %}...{% end %}`, and `{{ super() }}` / `{% super %}`)
-* Sub-template embedding (`{% embed "card.html" %}`, `{% embed "card.html" with this.card %}`, and component-style named props `{% embed "card.html"(this.title, count = len(this.items), active = true) %}`)
-* Reusable parameterized in-file macros (`{% macro badge(label: string, active := false) %}...{% end %}` and `{% call badge(this.title, true) %}`), including across layout inheritance
-* Template comments (`{# ... #}`) and whitespace trimming markers (`{{-`, `-}}`, `{%-`, `-%}`, `{#-`, `-#}`)
-* Precomputed `approx_bytes` output size estimation (including branch-aware `switch` estimation) so buffers can be pre-sized before rendering
-* Parallel multi-threaded CLI compilation with Rust/Odin-style diagnostics, full `Call_Site -> Extends -> Embed` trace stacks, CI verification mode (`--check`), orphan template detection (`--warn-unused`), and incremental file watch mode (`--watch`)
-* `"contextless"` template descriptors so `temple.compiled` and `temple.compiled_inline` work in global/file-scope declarations
-* Single self-contained binary at runtime — no template files needed after compilation
+### Zero-Overhead Native Codegen
+* **Compile-time transpilation** — Templates compile down to plain `"contextless"` Odin procedures (`proc(w: io.Writer, this: T)`). There is no runtime template parser, AST interpreter, reflection, or heap allocation during rendering.
+* **Single self-contained binary** — Template files are only needed at build time; nothing extra to ship or load at runtime.
+* **Compile-time `fmt` strength reduction** — Single-argument `fmt("%s")`, `fmt("%i")` / `fmt("%d")`, and `fmt("%.Nf")` expressions are decomposed at compile time into static string writes (coalesced with adjacent HTML) and direct stack-buffered numeric writers (`__temple_write_int`, `__temple_write_f64_prec`).
+* **Precomputed buffer sizing (`approx_bytes`)** — Static output size estimation across text, loops, `if`/`switch` branches, macros, and `embed` trees lets callers pre-allocate output buffers in a single allocation or reuse a buffer with **0 allocations/op**.
 
-## Usage:
+### Context-Aware Security by Default
+* **Automatic HTML XSS escaping** — `{{ expr }}` escapes `&`, `"`, `'`, `<`, and `>` by default using lookup-table fast paths and stack-batched slice writes (~3.8 GB/s on clean HTML, 0 allocations).
+* **URL & query parameter sanitization** — `url` validates URL schemes against an explicit safe allowlist (`http`, `https`, `mailto`, `tel`, non-SVG `data:image/*`, and relative paths) and neutralizes dangerous schemes (`javascript:`, `vbscript:`, `data:text/html`) to `#ZgotmplZ`; `url_param` performs RFC 3986 percent-encoding.
+* **JavaScript & JSON string escaping** — `js` / `json` escapes quotes, control characters, line separators (`\u2028`, `\u2029`), and `<`/`>`/`&`/`/` to prevent `</script>` and quote breakout inside `<script>` blocks.
+* **Explicit raw & word-span writers** — Opt out of escaping for trusted markup with `raw`, or wrap space-separated words in `<span class="magic-text__word">` elements with `magic`.
 
-Temple has 2 parts: the compiler (`cli/`) and the runtime (`runtime.odin`). The compiler scans your Odin project for `compiled` and `compiled_inline` calls (including package/local string constants and procedure aliases) and generates the compiled Odin procedures.
+### Expressive Template Syntax & Composition
+* **Full Odin expressions** — Any valid Odin expression (`or_else`, ternary `if`/`else`, slice ranges, selectors) works inside tags and is validated at compile time by `core:odin/parser`.
+* **Pipe filter DSL (`|`)** — Chain `default(...)` fallbacks, zero-allocation streaming `fmt(...)`, type casts (`int`, `f64`, `len`, etc.), and escapers (`{{ this.price | fmt("$%.2f") }}`, `{{ this.name | default("Anonymous") }}`).
+* **Control flow & local bindings** — Conditionals (`{% if %}`, `{% elseif %}` / `{% else if %}`, `{% else %}`), pattern-matching switches (`{% switch %}`, `{% #partial switch %}`, `{% case %}`), Odin loops (`{% for item, idx in this.items %}`), and local variable bindings (`{% let x = expr %}`).
+* **Layouts, components & macros** — Multi-level layout inheritance (`{% extends %}`, `{% block %}`, `{{ super() }}`), sub-template embedding with `with` or component-style named props (`{% embed "card.html"(this.title, active = true) %}`), and reusable typed macros (`{% macro %}` / `{% call %}`).
+* **Whitespace control & comments** — Strip leading or trailing whitespace around any tag with hyphens (`{{-`, `-}}`, `{%-`, `-%}`, `{#-`, `-#}`) and strip template comments (`{# ... #}`) at compile time.
+
+### Fast Compiler CLI & Developer Tooling
+* **Multi-threaded compiler pipeline** — Parallel worker pool with per-worker arena allocators, unified AST slab allocation, cached layout splicing, and zero-allocation codegen.
+* **Rich source diagnostics** — Rust/Odin-style error reporting with source snippets, caret underlines, and full `Call_Site -> Extends -> Embed` trace stacks.
+* **Flexible workflow modes** — External package codegen (`-out`, `-pkg`, `-temple-import`), CI verification (`--check`), orphan template detection (`--warn-unused`), and incremental file watching (`--watch`).
+
+---
+
+## Quick Start
+
+Temple consists of two parts: the compiler CLI (`cli/`) and a lightweight runtime package (`runtime.odin`). The CLI scans your Odin project for `compiled` and `compiled_inline` calls (including package/local string constants and procedure aliases) and generates the backing Odin procedures.
 
 ### Option A: Shared Collection / External Package Mode (`-out` / `-pkg`)
 
-You can install `temple` once into Odin's `shared:` collection (or as a read-only dependency) and generate template procedures directly into your own package:
+Install `temple` once into Odin's `shared:` collection (or as a dependency) and generate template procedures directly into your own package:
 
-1. Build the compiler CLI: `odin build temple/cli -o:speed -out:temple_cli`
-2. Generate templates into your package before building:
-   ```sh
-   ./temple_cli src -out:src/views/templates_gen.odin -pkg:views
-   ```
-   * `-out:<file>` (or `--out=<file>`): destination `.odin` file to generate
-   * `-pkg:<package>` (or `--pkg=<package>`): target package name (if omitted, automatically inferred from existing `.odin` files in the output directory)
-   * `-temple-import:<path>` (or `--temple-import=<path>`): import path for the `temple` runtime library (defaults to `"shared:temple"` when generating outside `package temple`)
-   * `--check`: verify that all templates compile cleanly and the generated `.odin` file on disk is up-to-date without modifying disk (exits `1` if missing or stale)
-   * `--warn-unused`: emit warnings for any `.temple.twig`, `.temple.html`, or `.twig` files in the project directory never referenced by `compiled`, `extends`, or `embed`
-   * `--watch`: poll `.odin` and template files for changes and incrementally re-run compilation during development
+```sh
+# 1. Build the compiler CLI
+odin build temple/cli -o:speed -out:temple_cli
+
+# 2. Generate templates into your package before building
+./temple_cli src -out:src/views/templates_gen.odin -pkg:views
+```
+
+| Flag | Description |
+| :--- | :--- |
+| `-out:<file>` / `--out=<file>` | Destination `.odin` file to generate |
+| `-pkg:<package>` / `--pkg=<package>` | Target package name (if omitted, automatically inferred from existing `.odin` files in the output directory) |
+| `-temple-import:<path>` / `--temple-import=<path>` | Import path for the `temple` runtime library (defaults to `"shared:temple"` when generating outside `package temple`) |
+| `--check` | Verify all templates compile cleanly and the generated `.odin` file on disk is up-to-date without modifying disk (exits `1` if missing or stale) |
+| `--warn-unused` | Emit warnings for any `.temple.twig`, `.temple.html`, or `.twig` files in the project directory never referenced by `compiled`, `extends`, or `embed` |
+| `--watch` | Poll `.odin` and template files for changes and incrementally re-run compilation during development |
+| `--version` / `-v` | Print the compiler version |
 
 ### Option B: Vendored Submodule Mode
 
-1. Clone into project: `git submodule add https://github.com/laytan/temple`
-2. Build the compiler CLI: `odin build temple/cli -o:speed -out:temple_cli`
-3. Run the CLI before building your project: `./temple_cli . temple`
-    * The first argument is the path to the root of your project (where to look for template calls)
-    * The second argument is the path to `temple` itself
-    * Run `./temple_cli --version` to print the compiler version
+```sh
+# 1. Add temple as a submodule
+git submodule add https://github.com/laytan/temple
 
-The syntax works great with Twig syntax highlighting, so ending template filenames with `.temple.twig` (or `.html`) is recommended.
+# 2. Build the compiler CLI
+odin build temple/cli -o:speed -out:temple_cli
+
+# 3. Generate temple/templates.odin (first arg: project root, second arg: temple directory)
+./temple_cli . temple
+```
+
+### Example
+
+Ending template filenames with `.temple.twig` or `.temple.html` is recommended for editor Twig/HTML syntax highlighting.
 
 ```twig
 <!-- templates/home.temple.twig -->
@@ -63,7 +80,7 @@ Hello, {{ this.name }}!
 
 {% if this.name == "Laytan" %}Cool Name!{% end %}
 
-<!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->
+<!-- Cast or pipe non-string values (int, i64, f32, f64, byte, rune, len, etc.) -->
 The count is {{ int(this.count) }}
 
 {% for i in 1..=5 %}{{ int(i) }}{% end %}
@@ -73,7 +90,6 @@ The count is {{ int(this.count) }}
 package main
 
 import "core:os"
-
 import "temple"
 
 Home_This :: struct {
@@ -92,7 +108,7 @@ main :: proc() {
 }
 ```
 
-Generated code for the previous example looks like the following:
+Running `temple_cli` generates the following zero-overhead Odin code:
 
 ```odin
 package temple
@@ -109,16 +125,16 @@ compiled :: proc "contextless" ($path: string, $T: typeid) -> Compiled(T) {
 				if this.name == "Laytan" { /* 5:1 in template */
 					__temple_n += __temple_io.write_string(__temple_w, "Cool Name!") or_return /* 5:31 in template */
 				}
-				__temple_n += __temple_io.write_string(__temple_w, "\n\n<!-- add a cast to emit writing of that type (instead of a string), works with int, i64, f32, byte, rune etc. -->\nThe count is ") or_return /* 5:50 in template */
-				__temple_n += __temple_io.write_int(__temple_w, int(this.count)) or_return /* 8:14 in template */
+				__temple_n += __temple_io.write_string(__temple_w, "\n\n<!-- Cast or pipe non-string values (int, i64, f32, f64, byte, rune, len, etc.) -->\nThe count is ") or_return /* 5:50 in template */
+				__temple_n += __temple_write_int(__temple_w, int(this.count)) or_return /* 8:14 in template */
 				__temple_n += __temple_io.write_string(__temple_w, "\n") or_return /* 8:35 in template */
 				for i in 1..=5 { /* 10:1 in template */
-					__temple_n += __temple_io.write_int(__temple_w, int(i)) or_return /* 10:21 in template */
+					__temple_n += __temple_write_int(__temple_w, int(i)) or_return /* 10:21 in template */
 				}
 				__temple_n += __temple_io.write_string(__temple_w, "\n") or_return /* 10:42 in template */
 				return
 			},
-			approx_bytes = 217,
+			approx_bytes = 197,
 		}
 	} else {
 		#panic("undefined template \"" + path + "\" did you run the temple transpiler?")
@@ -126,52 +142,44 @@ compiled :: proc "contextless" ($path: string, $T: typeid) -> Compiled(T) {
 }
 ```
 
-### Output (`{{ ... }}`, Pipe Filters `|`, `url`, `url_param`, `js`, `fmt`, `default`, `raw`, `magic`, and Type Casts)
+---
+
+## Template Syntax Reference
+
+### Output (`{{ ... }}`), Pipe Filters (`|`), and Type Writers
+
+Output tags `{{ ... }}` evaluate any Odin expression and HTML-escape strings by default. Modifiers can be applied using either pipe syntax (`{{ expr | filter }}`) or call syntax (`{{ filter(expr) }}`):
+
+| Filter / Writer | Pipe Syntax | Call Syntax | Behavior |
+| :--- | :--- | :--- | :--- |
+| **HTML (default)** | `{{ this.name }}` | `{{ this.name }}` | Escapes `&`, `"`, `'`, `<`, `>` |
+| **`raw`** | `{{ this.html \| raw }}` | `{{ raw(this.html) }}` | Writes trusted string without escaping |
+| **`url`** | `{{ this.href \| url }}` | `{{ url(this.href) }}` | Validates safe URL scheme (`http`, `https`, `mailto`, `tel`, safe `data:image/*`, relative) or writes `#ZgotmplZ`, then HTML-escapes |
+| **`url_param`** | `{{ this.q \| url_param }}` | `{{ url_param(this.q) }}` | RFC 3986 percent-encodes query parameter values (`%XX`) |
+| **`js` / `json`** | `{{ this.data \| js }}` | `{{ js(this.data) }}` | Escapes quotes, control chars, `\u2028`/`\u2029`, and `<`/`>`/`&`/`/` for JS/JSON string literals |
+| **`magic`** | `{{ this.text \| magic }}` | `{{ magic(this.text) }}` | Wraps each word in `<span class="magic-text__word">...</span>` (HTML-escaped) |
+| **`default`** | `{{ this.val \| default(fb) }}` | `{{ default(this.val, fb) }}` | Fallback when a `string` or slice `[]T` is empty, or when `Maybe(T)` is `nil` |
+| **`fmt`** | `{{ this.val \| fmt("%.2f") }}` | `{{ fmt("%s (%i)", a, b) }}` | Zero-allocation formatted output (HTML-escaped by default; chain `\| raw` for unescaped) |
+| **`len`** | `{{ this.items \| len }}` | `{{ len(this.items) }}` | Writes `len(expr)` as a base-10 integer |
+| **Type casts** | `{{ this.n \| int }}` | `{{ int(this.n) }}` | Direct numeric/character writers for `int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune` |
 
 ```odin
-// Output is denoted by an opening {{ and closing }} and is HTML-escaped by default:
-t := temple.compiled_inline(`{{ "Hello" }}`, struct{})
-
-// Reference passed-in values with `this`, which has the type passed as the second argument:
-t := temple.compiled_inline(`{{ this.name }}`, struct{ name: string })
-
-// Any valid Odin expression works:
+// Full Odin expressions (e.g. Maybe unwrap with or_else, ternary conditionals):
 t := temple.compiled_inline(`{{ this.name.? or_else this.last_name }}`, struct{ name: Maybe(string), last_name: string })
 
-// Use `url(...)` or `| url` to sanitize URL schemes (allowing http, https, mailto, tel, safe data:image/*, and relative paths; replacing unsafe schemes like javascript: with `#ZgotmplZ`) and HTML-escape the result:
-t := temple.compiled_inline(`<a href="{{ this.link | url }}">Link</a>`, struct{ link: string })
+// Context-aware URL, query param, and inline <script> escaping:
+t := temple.compiled_inline(`<a href="{{ this.link | default("/home") | url }}?q={{ this.query | url_param }}">Link</a>`, Link_Ctx)
+t := temple.compiled_inline(`<script>const msg = "{{ this.payload | js }}";</script>`, Script_Ctx)
 
-// Use `url_param(...)` or `| url_param` to RFC 3986 percent-encode query parameter values:
-t := temple.compiled_inline(`<a href="/search?q={{ this.query | url_param }}">Search</a>`, struct{ query: string })
-
-// Use `js(...)` / `| js` (or `json(...)` / `| json`) to safely escape strings inside JavaScript/JSON string literals and inline `<script>` blocks (preventing `</script>` and quote breakout):
-t := temple.compiled_inline(`<script>const msg = "{{ this.payload | js }}";</script>`, struct{ payload: string })
-
-// Use `raw(...)` or `| raw` to write trusted HTML without escaping:
-t := temple.compiled_inline(`{{ raw(this.trusted_html) }}`, struct{ trusted_html: string })
-t := temple.compiled_inline(`{{ this.trusted_html | raw }}`, struct{ trusted_html: string })
-
-// Use `magic(...)` or `| magic` to wrap each space-separated word in `<span class="magic-text__word">...</span>`:
-t := temple.compiled_inline(`{{ this.headline | magic }}`, struct{ headline: string })
-
-// Use `fmt(format, ...args)` or `| fmt(format)` for zero-allocation streaming formatted output (HTML-escaped by default, or chain `| raw`):
+// Formatted output (single-arg %s, %i, %d, %.Nf are strength-reduced at compile time; multi-arg streams with 0 allocations):
 t := temple.compiled_inline(`{{ this.price | fmt("$%.2f") }}`, struct{ price: f64 })
 t := temple.compiled_inline(`{{ fmt("%s (%i)", this.name, this.count) }}`, struct{ name: string, count: int })
 t := temple.compiled_inline(`{{ this.price | fmt("<b>$%.2f</b>") | raw }}`, struct{ price: f64 })
-
-// Use `default(val, fallback)` or `| default(fallback)` to provide a fallback when a string/slice is empty (`len(val) == 0`) or a `Maybe(T)` is `nil`:
-t := temple.compiled_inline(`{{ this.nickname | default("Anonymous") }}`, struct{ nickname: string })
-t := temple.compiled_inline(`{{ this.bio_html | default("<i>None</i>") | raw }}`, struct{ bio_html: string })
-
-// Wrap or pipe non-string values in a type cast (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`, `len`):
-t := temple.compiled_inline(`{{ int(this.count) }}`, struct{ count: int })
-t := temple.compiled_inline(`{{ this.items | len }}`, struct{ items: []string })
 ```
 
-### If / Else If / Else
+### Conditionals (`if` / `else if` / `elseif` / `else`)
 
 ```odin
-// Supports both `{% elseif ... %}` and `{% else if ... %}`:
 t := temple.compiled_inline(`
 {% if this.count == 0 %}
     There are no items in your basket.
@@ -185,10 +193,11 @@ t := temple.compiled_inline(`
 `, struct{ count: int })
 ```
 
-### Switch & Partial Switch
+### Pattern Matching (`switch` & `#partial switch`)
+
+Supports Odin value switches, type switches (`switch v in this.payload`), and enum `#partial switch`:
 
 ```odin
-// Supports Odin value switches, type switches (`switch v in this.payload`), and `#partial switch`:
 t := temple.compiled_inline(`
 {% #partial switch this.status %}
     {% case .Loading %}
@@ -201,10 +210,11 @@ t := temple.compiled_inline(`
 `, Page_Ctx)
 ```
 
-### Let Variable Bindings
+### Local Variable Bindings (`let`)
+
+Bind local variables inside templates using `=`, `:=`, or explicit `: Type =`:
 
 ```odin
-// Bind local variables inside templates using `=`, `:=`, or `: Type =`:
 t := temple.compiled_inline(`
 {% let total = this.price * this.qty %}
 {% let label: string = "Total" %}
@@ -212,15 +222,18 @@ t := temple.compiled_inline(`
 `, Order_Ctx)
 ```
 
-### For Loops
+### Loops (`for`)
+
+Any valid Odin `for` loop clause works:
 
 ```odin
-// Any valid Odin `for` loop clause works:
 t := temple.compiled_inline(`{% for i in 0..<5 %} {{ int(i) }} {% end %}`, struct{})
 t := temple.compiled_inline(`{% for book, idx in this.books %} {{ int(idx) }}: {{ book.title }} {% end %}`, Library_Ctx)
 ```
 
 ### Layout Inheritance (`extends`, `block`, `super`)
+
+Child templates can extend a parent layout (including multi-level inheritance chains), override named `{% block %}` sections, and render parent block content via `{{ super() }}` or `{% super %}`:
 
 ```twig
 {# layouts/base.html #}
@@ -246,17 +259,18 @@ t := temple.compiled_inline(`{% for book, idx in this.books %} {{ int(idx) }}: {
 {% end %}
 ```
 
-### Embed & Component Props
+### Sub-Template Embedding & Component Props (`embed`)
+
+Embed sub-templates with the current `this`, narrow context via `with`, or pass component-style named props (supporting field-punning shorthand like `this.title` -> `title = this.title`):
 
 ```odin
-// Embed another template relative to the current template file:
-t := temple.compiled_inline(`{% embed "header.temple.twig" %}`, struct{})
+// Inherit current `this`:
+t := temple.compiled_inline(`{% embed "header.temple.twig" %}`, Page_Ctx)
 
-// Narrow or replace `this` for the embedded template with `with`:
+// Pass a sub-struct as `this`:
 t := temple.compiled_inline(`{% embed "header.temple.twig" with this.header %}`, struct{ header: Header_Data })
 
-// Or pass component-style named props (constructing an inline anonymous struct for `this` via `type_of(...)`).
-// Supports field-punning shorthand (`this.title` -> `title = this.title`):
+// Pass component-style named props (synthesizes an inline typed struct for `this`):
 t := temple.compiled_inline(`
 {% embed "components/card.html"(
     this.title,
@@ -268,10 +282,9 @@ t := temple.compiled_inline(`
 
 ### Parameterized Macros (`macro` & `call`)
 
-> **Note:** Each `{% macro %}` compiles to a non-capturing local Odin procedure (`proc`), so values from `this` or outer `{% let %}` bindings cannot be captured implicitly and must be passed explicitly as macro parameters.
+> **Note:** Each `{% macro %}` compiles to a hoisted non-capturing local Odin procedure (`proc`), so values from `this` or outer `{% let %}` bindings must be passed explicitly as macro parameters.
 
 ```twig
-{# Define reusable typed Odin macros inside a template or parent layout #}
 {% macro badge(label: string, active := false) %}
   <span class="badge {% if active %}badge--active{% end %}">{{ label }}</span>
 {% end %}
@@ -284,7 +297,7 @@ t := temple.compiled_inline(`
 
 ```twig
 {# Comments are stripped completely from generated output #}
-{#- Use hyphens on opening/closing delimiters to strip adjacent whitespace/newlines -#}
+{#- Add hyphens to opening or closing delimiters to strip adjacent whitespace/newlines -#}
 <div>
   {%- if this.show -%}
     <span>{{- this.label -}}</span>
@@ -292,15 +305,26 @@ t := temple.compiled_inline(`
 </div>
 ```
 
-## Benchmarks (`benchmarks/`)
+---
 
-Run the benchmark suite with `-o:speed` to measure runtime escaping, context-aware sanitizers, zero-allocation streaming `fmt(...)`, full page rendering, and compiler pipeline throughput:
+## Performance & Benchmarks
+
+Temple's runtime and compiler pipeline are heavily optimized for zero-allocation execution and high throughput. See [`benchmarks/README.md`](benchmarks/README.md) for the full benchmark suite, methodology, and architectural breakdown.
+
+| Benchmark (`-o:speed`) | Time | Throughput | Allocs/op |
+| :--- | ---: | ---: | ---: |
+| `html_escape (clean 64KB doc)` | 16.3 µs | ~3,838 MB/s | 0 |
+| `html_escape (mixed XSS 64KB doc)` | 68.6 µs | ~911 MB/s | 0 |
+| `safe_url (valid https URL)` | 37.7 ns | ~1,038 MB/s | 0 |
+| `write_int + write_f64_prec (direct fast writers)` | 38.3 ns | ~622 MB/s | 0 |
+| `fmt("%s" / "%i") (compile-time strength reduced)` | 37.2 ns | ~1,564 MB/s | 0 |
+| `compiled_inline (card, reused buf)` | 50.7 ns | ~1,654 MB/s | 0 |
+| `compiled (50-row dashboard, 15.3 KB HTML, reused buf)` | 11.0 µs | ~1,326 MB/s | 0 |
+| `cli: lexer tokenize (dashboard.temple.html)` | 2.58 µs | ~448 MB/s | 0 |
+| `cli: pure transpile codegen (5.5 KB Odin code)` | 3.86 µs | ~1,357 MB/s | 0 |
+| `cli: full parse + inheritance + transpile` | 14.8 µs | ~121 MB/s | 32 |
 
 ```sh
-# Optional: regenerate benchmarks/templates_gen.odin
-odin run cli -- --warn-unused benchmarks -out:benchmarks/templates_gen.odin -pkg:benchmarks -temple-import:..
-
-# Run the benchmark suite
+# Run the full benchmark suite
 odin run benchmarks -o:speed
 ```
-
