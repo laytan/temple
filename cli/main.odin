@@ -2267,7 +2267,81 @@ resolve_template_inheritance :: proc(
 	if !validate_no_orphan_super_in_nodes(ctx, spliced.content[:], child_src, child_file) {
 		return {}, false
 	}
+	if !validate_macro_calls_in_template(ctx, spliced.content[:], child_src, child_file) {
+		return {}, false
+	}
 	return spliced, true
+}
+
+validate_macro_calls_in_template :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	fallback_src: []byte,
+	fallback_file: string,
+) -> bool {
+	macros := make(map[string]^Node_Macro, ctx.allocator)
+	for node in nodes {
+		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+			macros[mac.name] = mac
+		}
+	}
+	return validate_macro_calls_in_nodes(ctx, nodes, macros, fallback_src, fallback_file)
+}
+
+validate_macro_calls_in_nodes :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	macros: map[string]^Node_Macro,
+	src: []byte,
+	file: string,
+) -> bool {
+	Walk_State :: struct {
+		ctx:    ^Compile_Context,
+		macros: map[string]^Node_Macro,
+		src:    []byte,
+		file:   string,
+	}
+	state := Walk_State{ctx, macros, src, file}
+
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		s := cast(^Walk_State)user_data
+		return validate_macro_calls_in_nodes(s.ctx, body, s.macros, s.src, s.file)
+	}
+
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Call:
+			actual_file := d.origin_file if len(d.origin_file) > 0 else file
+			actual_src := d.origin_src if d.origin_src != nil else src
+			if err_pos, err_col_len, err_msg, ok := check_macro_call_node(d, macros, ctx.allocator); !ok {
+				pos := tokenizer.Pos{
+					offset = err_pos.offset,
+					line   = err_pos.line + 1,
+					column = err_pos.col + 1,
+					file   = actual_file,
+				}
+				record_diagnostic(ctx, pos, actual_src, err_col_len, "%s", err_msg)
+				return false
+			}
+		case ^Node_Block:
+			blk_file := d.origin_file if len(d.origin_file) > 0 else file
+			blk_src := d.origin_src if d.origin_src != nil else src
+			if !validate_macro_calls_in_nodes(ctx, d.body[:], macros, blk_src, blk_file) {
+				return false
+			}
+		case ^Node_Macro:
+			mac_file := d.origin_file if len(d.origin_file) > 0 else file
+			mac_src := d.origin_src if d.origin_src != nil else src
+			if !validate_macro_calls_in_nodes(ctx, d.body[:], macros, mac_src, mac_file) {
+				return false
+			}
+		case:
+			if !walk_branch_children(node, &state, visit_cb) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 validate_no_orphan_super_in_nodes :: proc(
@@ -2397,6 +2471,29 @@ splice_nodes :: proc(
 			}
 		}
 	}
+	return coalesce_adjacent_text_nodes(ctx, out[:])
+}
+
+coalesce_adjacent_text_nodes :: proc(ctx: ^Compile_Context, nodes: []Node) -> [dynamic]Node {
+	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	for node in nodes {
+		if txt, is_txt := node.derived.(^Node_Text); is_txt {
+			if len(txt.text.value) == 0 {
+				continue
+			}
+			if len(out) > 0 {
+				if prev_txt, is_prev_txt := out[len(out) - 1].derived.(^Node_Text); is_prev_txt {
+					merged := new(Node_Text, ctx.allocator)
+					merged.derived = merged
+					merged.text = prev_txt.text
+					merged.text.value = strings.concatenate({prev_txt.text.value, txt.text.value}, ctx.allocator)
+					out[len(out) - 1] = merged
+					continue
+				}
+			}
+		}
+		append(&out, node)
+	}
 	return out
 }
 
@@ -2429,7 +2526,7 @@ substitute_super_nodes :: proc(
 			}
 		}
 	}
-	return out
+	return coalesce_adjacent_text_nodes(ctx, out[:])
 }
 
 rewrite_embeds_relative_to_dir :: proc(
@@ -2527,6 +2624,12 @@ rewrite_nodes_embeds :: proc(
 			new_sup.derived = new_sup
 			apply_origin_fallback(&new_sup.origin_file, &new_sup.origin_src, origin_file, origin_src)
 			append(&out, new_sup)
+		case ^Node_Call:
+			new_call := new(Node_Call, ctx.allocator)
+			new_call^ = d^
+			new_call.derived = new_call
+			apply_origin_fallback(&new_call.origin_file, &new_call.origin_src, origin_file, origin_src)
+			append(&out, new_call)
 		case ^Node_Block:
 			append(&out, clone_block_with_resolved_embeds(ctx, d, base_dir, origin_file, origin_src))
 		case ^Node_Macro:
@@ -2625,10 +2728,7 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 	state.current_file = fullpath
 	state.current_src = loaded_src
 
-	for n in templ.content {
-		transpile_node(t, n)
-		write_newline(t)
-	}
+	transpile_template_nodes(t, templ.content[:])
 
 	return true
 }

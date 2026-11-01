@@ -38,9 +38,7 @@ spec_three_level_layout_inheritance_with_super_and_relative_embeds :: proc(t: ^t
 		"Home",
 		"</title>",
 		`<meta name="sec">`,
-		"<main>",
-		"BASE",
-		"</main>",
+		"<main>BASE</main>",
 		"<footer>foot</footer>",
 		"</html>",
 	})
@@ -460,6 +458,51 @@ spec_macro_definition_and_call_with_typed_and_default_params :: proc(t: ^testing
 }
 
 @(test)
+spec_forward_referenced_macro_calls_and_scoped_embed_macro_approx :: proc(t: ^testing.T) {
+	// 1. Calling a macro before its declaration (and macro A calling forward-declared macro B)
+	// hoists `Node_Macro` declarations and computes exact `approx_bytes` instead of falling back to 10.
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_compiling_inline(
+			s,
+			`{% call outer(this.title) %}` +
+			`{% macro outer(label: string) %}<div class="outer">{% call inner(label) %}</div>{% end %}` +
+			`{% macro inner(text: string) %}<span>{{ text }}</span>{% end %}`,
+		)
+
+		// inner = 6 (`<span>`) + 10 (`{{ text }}`) + 7 (`</span>`) = 23
+		// outer = 19 (`<div class="outer">`) + 23 (call inner) + 6 (`</div>`) = 48
+		then_approx_bytes_is(s, 48)
+	}
+
+	// 2. An embedded partial defining a macro of the same name does not overwrite the parent's `macro_approx`.
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		given_template(
+			s,
+			"/app/partial.html",
+			`{% macro item() %}ab{% end %}{% call item() %}`,
+		)
+		given_template(
+			s,
+			"/app/page.html",
+			`{% macro item() %}12345678901234567890{% end %}{% embed "partial.html" %}{% call item() %}`,
+		)
+
+		upon_compiling_template(s, "/app/page.html", relpath = "page.html")
+
+		// partial call item() = 2 bytes ("ab")
+		// parent call item() after embed = 20 bytes ("12345678901234567890")
+		// total approx_bytes = 22
+		then_approx_bytes_is(s, 22)
+	}
+}
+
+@(test)
 spec_multiline_embed_props_with_inline_comments :: proc(t: ^testing.T) {
 	s := scenario_begin(t)
 	defer scenario_end(s)
@@ -598,6 +641,41 @@ spec_rejects_invalid_macro_and_call_declarations :: proc(t: ^testing.T) {
 			col          = 29,
 			expected_err = `"super()" can only be used inside a "block" tag`,
 		},
+		{
+			template     = `{% call unknown_macro(1) %}`,
+			col          = 9,
+			expected_err = `undefined macro "unknown_macro"`,
+		},
+		{
+			template     = `{% macro badge(label: string) %}{% end %}{% call other("x") %}`,
+			col          = 50,
+			expected_err = `undefined macro "other" (available macros: badge)`,
+		},
+		{
+			template     = `{% macro badge(label: string, count: int) %}{% end %}{% call badge("x") %}`,
+			col          = 62,
+			expected_err = `macro "badge" expects 2 argument(s), got 1`,
+		},
+		{
+			template     = `{% macro badge(label: string, active := false) %}{% end %}{% call badge() %}`,
+			col          = 67,
+			expected_err = `macro "badge" expects 1 to 2 arguments, got 0`,
+		},
+		{
+			template     = `{% macro badge(label: string, active := false) %}{% end %}{% call badge("x", true, 3) %}`,
+			col          = 67,
+			expected_err = `macro "badge" expects 1 to 2 arguments, got 3`,
+		},
+		{
+			template     = `{% macro badge(label: string) %}{% end %}{% call badge(wrong = "x") %}`,
+			col          = 56,
+			expected_err = `unknown parameter "wrong" in call to macro "badge"`,
+		},
+		{
+			template     = `{% macro badge(a: string, b: int) %}{% end %}{% call badge(a = "x", 1) %}`,
+			col          = 69,
+			expected_err = `positional argument cannot follow named argument in call to macro "badge"`,
+		},
 	}
 
 	for c in cases {
@@ -611,6 +689,33 @@ spec_rejects_invalid_macro_and_call_declarations :: proc(t: ^testing.T) {
 			message_contains = c.expected_err,
 		)
 		scenario_end(s)
+	}
+
+	// Verify compile-time call target and arity validation across `{% extends %}` layout inheritance
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		given_template(
+			s,
+			"/app/layouts/base.html",
+			`{% macro badge(label: string, active := false) %}<span>{{ label }}</span>{% end %}<main>{% block content %}{% end %}</main>`,
+		)
+		given_template(
+			s,
+			"/app/views/child_bad_arity.html",
+			"{% extends \"../layouts/base.html\" %}\n{% block content %}\n  {% call badge(\"a\", true, 99) %}\n{% end %}",
+		)
+
+		upon_compiling_template(s, "/app/views/child_bad_arity.html", called_from = "/app/routes.odin", line = 10, col = 4)
+		then_diagnostic_is_reported(
+			s,
+			file             = "/app/views/child_bad_arity.html",
+			line             = 3,
+			col              = 11,
+			message_contains = `macro "badge" expects 1 to 2 arguments, got 3`,
+			caret_len        = len("badge"),
+		)
 	}
 }
 

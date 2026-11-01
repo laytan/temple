@@ -306,9 +306,7 @@ test_layout_extends_block_and_super :: proc(t: ^testing.T) {
 		code, ok := compile_single_call(&ctx, call)
 		testing.expect(t, ok, "expected multi-level layout compilation to succeed")
 		testing.expect_value(t, len(ctx.diagnostics), 0)
-		testing.expect(t, strings.contains(code, `"Base"`), "expected base title from super()")
-		testing.expect(t, strings.contains(code, `" - Section"`), "expected section title from super()")
-		testing.expect(t, strings.contains(code, `" - Page"`), "expected page title")
+		testing.expect(t, strings.contains(code, `"Base - Section - Page"`), "expected coalesced title from super()")
 		testing.expect(t, strings.contains(code, `"<main>"`), "expected section body wrapper")
 		testing.expect(t, strings.contains(code, `this.title`), "expected page content expression")
 	}
@@ -687,10 +685,10 @@ test_review_round_two_fixes :: proc(t: ^testing.T) {
 			type = Call_Path{relpath = "child.html", fullpath = child_path},
 		})
 		testing.expect(t, ok, "expected nested super() override to compile")
-		// Verify `+Extra` appears exactly once (not duplicated by second splice pass)
-		first_idx := strings.index(code, `"+Extra"`)
-		last_idx := strings.last_index(code, `"+Extra"`)
-		testing.expect(t, first_idx != -1 && first_idx == last_idx, "expected +Extra to be spliced exactly once")
+		// Verify `+Extra` appears exactly once and is coalesced with `Default`
+		first_idx := strings.index(code, `"Default+Extra"`)
+		last_idx := strings.last_index(code, `"Default+Extra"`)
+		testing.expect(t, first_idx != -1 && first_idx == last_idx, "expected Default+Extra to be spliced and coalesced exactly once")
 
 		// 2. Broken embed inside parent layout reports parent layout file and snippet, not child file
 		clear(&ctx.stack)

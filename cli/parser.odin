@@ -179,6 +179,10 @@ Node_Macro :: struct {
 	signature:   Token,
 	name:        string,
 	params_src:  string,
+	param_names: [dynamic]string,
+	min_args:    int,
+	max_args:    int,
+	has_varargs: bool,
 	origin_file: string,
 	origin_src:  []byte,
 	close:       Token,
@@ -186,14 +190,23 @@ Node_Macro :: struct {
 	end:         Node_End,
 }
 
+Call_Arg_Info :: struct {
+	name: string,
+	pos:  Pos,
+}
+
 Node_Call :: struct {
-	using node: Node,
-	open:       Token,
-	call_tok:   Token,
-	call_expr:  Token,
-	name:       string,
-	args_src:   string,
-	close:      Token,
+	using node:  Node,
+	open:        Token,
+	call_tok:    Token,
+	call_expr:   Token,
+	name_pos:    Pos,
+	name:        string,
+	args_src:    string,
+	args:        [dynamic]Call_Arg_Info,
+	origin_file: string,
+	origin_src:  []byte,
+	close:       Token,
 }
 
 Node_If_Part :: struct {
@@ -313,6 +326,7 @@ validate_extends_structure :: proc(p: ^Parser) {
 	}
 
 	if !has_extends {
+		validate_standalone_macro_calls(p)
 		return
 	}
 
@@ -1230,6 +1244,11 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		return error(p, tok.pos, "invalid macro signature: macros cannot declare a return type")
 	}
 
+	out_node.param_names = make([dynamic]string, p.allocator)
+	out_node.min_args = 0
+	out_node.max_args = 0
+	out_node.has_varargs = false
+
 	if proc_type.params != nil {
 		seen_params := make(map[string]bool, p.allocator)
 		for field in proc_type.params.list {
@@ -1250,6 +1269,11 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 				)
 			}
 
+			is_vararg := false
+			if field.type != nil {
+				_, is_vararg = field.type.derived_expr.(^ast.Ellipsis)
+			}
+
 			for name_expr in field.names {
 				rel_name_offset := open_paren + max(name_expr.pos.offset - len(prefix), 0)
 				param_pos := advance_pos_by_offset(tok.pos, raw_src, rel_name_offset)
@@ -1261,6 +1285,15 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 					return error(p, param_pos, "duplicate parameter %q in macro %q", ident.name, name)
 				}
 				seen_params[ident.name] = true
+				append(&out_node.param_names, ident.name)
+				if is_vararg {
+					out_node.has_varargs = true
+				} else if field.default_value != nil {
+					out_node.max_args += 1
+				} else {
+					out_node.min_args += 1
+					out_node.max_args += 1
+				}
 			}
 		}
 	}
@@ -1304,8 +1337,169 @@ validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool
 	}
 
 	out_node.name = ident.name
+	out_node.name_pos = advance_pos_by_offset(tok.pos, raw_src, call.expr.pos.offset)
+	out_node.args = make([dynamic]Call_Arg_Info, 0, len(call.args), p.allocator)
+
+	seen_named := false
+	seen_arg_names := make(map[string]bool, p.allocator)
+	for arg in call.args {
+		arg_pos := advance_pos_by_offset(tok.pos, raw_src, arg.pos.offset)
+		if fv, is_fv := arg.derived_expr.(^ast.Field_Value); is_fv {
+			seen_named = true
+			field_ident, is_field_ident := fv.field.derived_expr.(^ast.Ident)
+			if !is_field_ident {
+				return error(p, arg_pos, "invalid named argument in call to macro %q: expected parameter identifier", ident.name)
+			}
+			if seen_arg_names[field_ident.name] {
+				return error(p, arg_pos, "duplicate argument %q in call to macro %q", field_ident.name, ident.name)
+			}
+			seen_arg_names[field_ident.name] = true
+			append(&out_node.args, Call_Arg_Info{name = field_ident.name, pos = arg_pos})
+		} else {
+			if seen_named {
+				return error(
+					p,
+					arg_pos,
+					"positional argument cannot follow named argument in call to macro %q",
+					ident.name,
+				)
+			}
+			append(&out_node.args, Call_Arg_Info{pos = arg_pos})
+		}
+	}
+
 	inner_args := raw_src[call.open.offset + 1 : call.close.offset]
 	out_node.args_src = strip_trailing_comma_and_comments(inner_args)
+	return true
+}
+
+check_macro_call_node :: proc(
+	call_node: ^Node_Call,
+	macros: map[string]^Node_Macro,
+	allocator := context.temp_allocator,
+) -> (
+	err_pos: Pos,
+	err_col_len: int,
+	err_msg: string,
+	ok: bool,
+) {
+	mac, found := macros[call_node.name]
+	if !found {
+		if len(macros) == 0 {
+			return call_node.name_pos,
+				len(call_node.name),
+				fmt.aprintf("undefined macro %q (no macros are defined in this template)", call_node.name, allocator = allocator),
+				false
+		}
+		valid_names := make([dynamic]string, 0, len(macros), allocator)
+		for k in macros {
+			append(&valid_names, k)
+		}
+		for i := 1; i < len(valid_names); i += 1 {
+			key := valid_names[i]
+			j := i - 1
+			for j >= 0 && valid_names[j] > key {
+				valid_names[j + 1] = valid_names[j]
+				j -= 1
+			}
+			valid_names[j + 1] = key
+		}
+		valid_list := strings.join(valid_names[:], ", ", allocator)
+		return call_node.name_pos,
+			len(call_node.name),
+			fmt.aprintf("undefined macro %q (available macros: %s)", call_node.name, valid_list, allocator = allocator),
+			false
+	}
+
+	for arg in call_node.args {
+		if len(arg.name) > 0 {
+			known_param := false
+			for pname in mac.param_names {
+				if pname == arg.name {
+					known_param = true
+					break
+				}
+			}
+			if !known_param {
+				return arg.pos,
+					len(arg.name),
+					fmt.aprintf("unknown parameter %q in call to macro %q", arg.name, call_node.name, allocator = allocator),
+					false
+			}
+		}
+	}
+
+	n_args := len(call_node.args)
+	if mac.has_varargs {
+		if n_args < mac.min_args {
+			return call_node.name_pos,
+				len(call_node.name),
+				fmt.aprintf("macro %q expects at least %i argument(s), got %i", call_node.name, mac.min_args, n_args, allocator = allocator),
+				false
+		}
+	} else if mac.min_args == mac.max_args {
+		if n_args != mac.min_args {
+			return call_node.name_pos,
+				len(call_node.name),
+				fmt.aprintf("macro %q expects %i argument(s), got %i", call_node.name, mac.min_args, n_args, allocator = allocator),
+				false
+		}
+	} else {
+		if n_args < mac.min_args || n_args > mac.max_args {
+			return call_node.name_pos,
+				len(call_node.name),
+				fmt.aprintf("macro %q expects %i to %i arguments, got %i", call_node.name, mac.min_args, mac.max_args, n_args, allocator = allocator),
+				false
+		}
+	}
+
+	return {}, 0, "", true
+}
+
+@(private = "file")
+validate_standalone_macro_calls :: proc(p: ^Parser) {
+	macros := make(map[string]^Node_Macro, p.allocator)
+	for node in p.template.content {
+		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+			macros[mac.name] = mac
+		}
+	}
+	_ = validate_calls_in_parser_nodes(p, p.template.content[:], macros)
+}
+
+@(private = "file")
+validate_calls_in_parser_nodes :: proc(
+	p: ^Parser,
+	nodes: []Node,
+	macros: map[string]^Node_Macro,
+) -> bool {
+	for node in nodes {
+		switch d in node.derived {
+		case ^Node_Call:
+			if err_pos, _, err_msg, ok := check_macro_call_node(d, macros, p.allocator); !ok {
+				return error(p, err_pos, "%s", err_msg)
+			}
+		case ^Node_Block:
+			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
+		case ^Node_Macro:
+			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
+		case ^Node_If:
+			validate_calls_in_parser_nodes(p, d._if.body[:], macros) or_return
+			for ef in d.elseifs {
+				validate_calls_in_parser_nodes(p, ef.body[:], macros) or_return
+			}
+			if els, ok := d._else.?; ok {
+				validate_calls_in_parser_nodes(p, els.body[:], macros) or_return
+			}
+		case ^Node_For:
+			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
+		case ^Node_Switch:
+			for c in d.cases {
+				validate_calls_in_parser_nodes(p, c.body[:], macros) or_return
+			}
+		case ^Node_Text, ^Node_Output, ^Node_Let, ^Node_Embed, ^Node_Extends, ^Node_Super:
+		}
+	}
 	return true
 }
 

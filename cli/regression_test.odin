@@ -499,9 +499,7 @@ test_three_level_inheritance_super_and_relative_embeds :: proc(t: ^testing.T) {
 		`"Home"`,
 		`"</title>"`,
 		`"<meta name=\"sec\">"`,
-		`"<main>"`,
-		`"BASE"`,
-		`"</main>"`,
+		`"<main>BASE</main>"`,
 		`"<footer>foot</footer>"`,
 		`"</html>"`,
 	}

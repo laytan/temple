@@ -82,10 +82,7 @@ transpile :: proc(
 	indent(&t)
 	write_newline(&t)
 
-	for node in templ.content {
-		transpile_node(&t, node)
-		write_newline(&t)
-	}
+	transpile_template_nodes(&t, templ.content[:])
 
 	ws(t.w, "return")
 
@@ -105,6 +102,75 @@ transpile :: proc(
 	dedent(&t)
 	write_newline(&t)
 	ws(t.w, "}")
+}
+
+@(private = "file")
+estimate_nodes_approx :: proc(t: ^Transpiler, nodes: []Node) -> int {
+	total := 0
+	for node in nodes {
+		switch d in node.derived {
+		case ^Node_Text:
+			total += len(d.text.value)
+		case ^Node_Output:
+			total += 10
+		case ^Node_If:
+			max_b := estimate_nodes_approx(t, d._if.body[:])
+			for ef in d.elseifs {
+				max_b = max(max_b, estimate_nodes_approx(t, ef.body[:]))
+			}
+			if els, ok := d._else.?; ok {
+				max_b = max(max_b, estimate_nodes_approx(t, els.body[:]))
+			}
+			total += max_b
+		case ^Node_For:
+			total += estimate_nodes_approx(t, d.body[:])
+		case ^Node_Switch:
+			max_c := 0
+			for c in d.cases {
+				max_c = max(max_c, estimate_nodes_approx(t, c.body[:]))
+			}
+			total += max_c
+		case ^Node_Block:
+			total += estimate_nodes_approx(t, d.body[:])
+		case ^Node_Call:
+			if mb, found := t.macro_approx[d.name]; found {
+				total += mb
+			} else {
+				total += 10
+			}
+		case ^Node_Let, ^Node_Embed, ^Node_Macro, ^Node_Extends, ^Node_Super:
+		}
+	}
+	return total
+}
+
+transpile_template_nodes :: proc(t: ^Transpiler, nodes: []Node) {
+	// Pre-seed macro approx_bytes so even forward macro-to-macro calls resolve accurately.
+	for _ in 0 ..< 2 {
+		for node in nodes {
+			if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+				t.macro_approx[mac.name] = estimate_nodes_approx(t, mac.body[:])
+			}
+		}
+	}
+
+	// Pass 1: Hoist all `Node_Macro` declarations before body nodes so `t.macro_approx`
+	// is populated (including any embedded templates inside macros) before `transpile_call` runs.
+	for node in nodes {
+		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+			transpile_macro(t, mac)
+			write_newline(t)
+		}
+	}
+
+	// Pass 2: Emit all non-macro body nodes.
+	for node in nodes {
+		if _, is_mac := node.derived.(^Node_Macro); is_mac {
+			continue
+		}
+		transpile_node(t, node)
+		write_newline(t)
+	}
 }
 
 transpile_node :: proc(t: ^Transpiler, node: Node) {
@@ -470,6 +536,10 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	}
 
 	if t.embed_parser != nil {
+		prev_macro_approx := t.macro_approx
+		t.macro_approx = make(map[string]int, t.allocator)
+		defer t.macro_approx = prev_macro_approx
+
 		_ = t.embed_parser(t, node, t.embed_data)
 	}
 
