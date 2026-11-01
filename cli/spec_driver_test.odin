@@ -151,7 +151,9 @@ driver_collect_calls_from_source :: proc(d: ^Spec_Driver, pkg_dir, filename, odi
 	pkg_proc_aliases["compiled"] = .Compiled
 	pkg_proc_aliases["compiled_inline"] = .Compiled_Inline
 	temple_names := make([dynamic]string, d.alloc)
+	strict_names := make([dynamic]string, d.alloc)
 	append(&temple_names, "temple")
+	append(&strict_names, "temple")
 	for imp in file.imports {
 		trimmed_path := strings.trim(imp.fullpath, "\"`")
 		if strings.has_prefix(trimmed_path, "core:") ||
@@ -159,19 +161,20 @@ driver_collect_calls_from_source :: proc(d: ^Spec_Driver, pkg_dir, filename, odi
 			strings.has_prefix(trimmed_path, "vendor:") {
 			continue
 		}
-		alias := imp.name.text
-		if len(alias) == 0 {
-			alias = trimmed_path
-			if colon_idx := strings.last_index_byte(alias, ':'); colon_idx != -1 {
-				alias = alias[colon_idx+1:]
-			}
-			alias = strings.trim_right(alias, "/\\")
-			if slash_idx := strings.last_index_any(alias, "/\\"); slash_idx != -1 {
-				alias = alias[slash_idx+1:]
-			}
+		base_pkg := trimmed_path
+		if colon_idx := strings.last_index_byte(base_pkg, ':'); colon_idx != -1 {
+			base_pkg = base_pkg[colon_idx+1:]
 		}
+		base_pkg = strings.trim_right(base_pkg, "/\\")
+		if slash_idx := strings.last_index_any(base_pkg, "/\\"); slash_idx != -1 {
+			base_pkg = base_pkg[slash_idx+1:]
+		}
+		alias := imp.name.text if len(imp.name.text) > 0 else base_pkg
 		if len(alias) > 0 && alias != "." && alias != ".." {
 			append(&temple_names, alias)
+			if base_pkg == "temple" || alias == "temple" {
+				append(&strict_names, alias)
+			}
 		}
 	}
 
@@ -180,7 +183,7 @@ driver_collect_calls_from_source :: proc(d: ^Spec_Driver, pkg_dir, filename, odi
 	}
 	for _ in 0 ..< 3 {
 		for decl in file.decls {
-			collect_proc_aliases(decl, temple_names[:], &pkg_proc_aliases)
+			collect_proc_aliases(decl, strict_names[:], &pkg_proc_aliases)
 		}
 	}
 
@@ -194,16 +197,17 @@ driver_collect_calls_from_source :: proc(d: ^Spec_Driver, pkg_dir, filename, odi
 
 	seen := make(map[string]string, d.alloc)
 	walk_ctx := File_Collect_Ctx{
-		pkg_fullpath    = pkg.fullpath,
-		file            = file,
-		temple_names    = temple_names[:],
-		proc_aliases    = pkg_proc_aliases,
-		string_consts   = resolved_consts,
-		raw_const_exprs = pkg_string_consts,
-		calls           = &d.collected,
-		seen            = &seen,
-		out_allocator   = d.alloc,
-		out_errors      = &d.collect_errors,
+		pkg_fullpath        = pkg.fullpath,
+		file                = file,
+		temple_names        = temple_names[:],
+		strict_temple_names = strict_names[:],
+		proc_aliases        = pkg_proc_aliases,
+		string_consts       = resolved_consts,
+		raw_const_exprs     = pkg_string_consts,
+		calls               = &d.collected,
+		seen                = &seen,
+		out_allocator       = d.alloc,
+		out_errors          = &d.collect_errors,
 	}
 
 	v := ast.Visitor{

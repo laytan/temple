@@ -760,6 +760,30 @@ main :: proc() {
 		then_collected_templates_are(s, {})
 		testing.expect_value(t, len(s.collect_errors), 0)
 	}
+
+	// 4. Unrelated third-party package selector `shader.compiled(runtime_var, flags)` or `regex.compiled(pat)`
+	// must NOT emit false-positive constant string errors
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package app
+import "shared:temple"
+import shader "../gfx/shader"
+import regex "../util/regex"
+
+Ctx :: struct { name: string }
+
+compile_assets :: proc(runtime_src: string, flags: u32) {
+	_ = shader.compiled(runtime_src, flags)
+	_ = regex.compiled(runtime_src)
+	_ = temple.compiled("valid_page.html", Ctx)
+}
+`)
+
+		then_collected_templates_are(s, {"valid_page.html"})
+		testing.expect_value(t, len(s.collect_errors), 0)
+	}
 }
 
 @(test)
@@ -876,6 +900,31 @@ test_cli_dx_flags_and_modes :: proc(t: ^testing.T) {
 		_ = os.remove(tpl_file)
 		snap_removed := capture_workspace_snapshot(watch_dir, gen_file, alloc)
 		testing.expect(t, has_workspace_snapshot_changed(snap1, snap_removed))
+	}
+
+	// 4. `run_cli_once` returns `false` without `os.exit(1)` when an `.odin` file has a collection error (keeping `--watch` alive)
+	{
+		bad_dir := ".tmp/test_watch_collect_err"
+		_ = os.make_directory(".tmp")
+		_ = os.make_directory(bad_dir)
+		bad_odin := ".tmp/test_watch_collect_err/bad.odin"
+		out_gen := ".tmp/test_watch_collect_err/templates_gen.odin"
+		defer {
+			_ = os.remove(bad_odin)
+			_ = os.remove(out_gen)
+		}
+
+		_ = os.write_entire_file(
+			bad_odin,
+			transmute([]byte)string("package bad\nimport \"temple\"\nfoo :: proc(x: string) { _ = temple.compiled(x, int) }\n"),
+		)
+		ok_run := run_cli_once(Cli_Options{
+			project_dir = bad_dir,
+			out_file    = out_gen,
+			pkg_name    = "bad",
+			watch       = true,
+		})
+		testing.expect(t, !ok_run)
 	}
 }
 

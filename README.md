@@ -159,7 +159,7 @@ t := temple.compiled_inline(`{{ this.price | fmt("$%.2f") }}`, struct{ price: f6
 t := temple.compiled_inline(`{{ fmt("%s (%i)", this.name, this.count) }}`, struct{ name: string, count: int })
 t := temple.compiled_inline(`{{ this.price | fmt("<b>$%.2f</b>") | raw }}`, struct{ price: f64 })
 
-// Use `default(val, fallback)` or `| default(fallback)` to provide a fallback when a string/slice is empty (`len(val) == 0`):
+// Use `default(val, fallback)` or `| default(fallback)` to provide a fallback when a string/slice is empty (`len(val) == 0`) or a `Maybe(T)` is `nil`:
 t := temple.compiled_inline(`{{ this.nickname | default("Anonymous") }}`, struct{ nickname: string })
 t := temple.compiled_inline(`{{ this.bio_html | default("<i>None</i>") | raw }}`, struct{ bio_html: string })
 
@@ -267,6 +267,8 @@ t := temple.compiled_inline(`
 ```
 
 ### Parameterized Macros (`macro` & `call`)
+
+> **Note:** Each `{% macro %}` compiles to a non-capturing local Odin procedure (`proc`), so values from `this` or outer `{% let %}` bindings cannot be captured implicitly and must be passed explicitly as macro parameters.
 
 ```twig
 {# Define reusable typed Odin macros inside a template or parent layout #}

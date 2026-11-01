@@ -9,12 +9,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - **Decoupled External Package Codegen & Shared Collection Support (`-out`, `-pkg`, `-temple-import`) (`cli/main.odin`, `cli/transpiler.odin`):**
   - Added `-out:<file>` / `--out=<file>`, `-pkg:<package>` / `--pkg=<package>` (with automatic package name inference from `.odin` files in the output directory), and `-temple-import:<path>` / `--temple-import=<path>` (defaulting to `"shared:temple"`) while maintaining full backwards compatibility with legacy 2-argument `<project_dir> <temple_dir>` invocations.
-  - Emitted `import __temple "<import_path>"` and qualified `__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_fmt_escaped`, `__temple.__temple_write_fmt_raw`, and `__temple.__temple_default` when generating outside `package temple`.
-  - Updated `collect_compile_calls` to discover unqualified same-package `compiled` / `compiled_inline` calls alongside imported `temple.compiled` / aliased package calls, and skipped generated template files regardless of filename.
+  - Emitted `import __temple "<import_path>"` and qualified `__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_safe_url`, `__temple.__temple_write_url_param`, `__temple.__temple_write_js_string`, `__temple.__temple_write_fmt_escaped`, `__temple.__temple_write_fmt_raw`, and `__temple.__temple_default` when generating outside `package temple`.
+  - Updated `collect_compile_calls` to discover unqualified same-package `compiled` / `compiled_inline` calls alongside imported `temple.compiled` / aliased package calls, avoided false-positive constant diagnostics on unrelated third-party `pkg.compiled(...)` calls, and skipped generated template files regardless of filename.
+- **Context-Aware Escaping (`url`, `url_param`, `js` / `json`) (`runtime.odin`, `cli/parser.odin`, `cli/transpiler.odin`):**
+  - Added `{{ url(expr) }}` / `{{ expr | url }}` (`__temple_write_safe_url`) to validate URL schemes against an explicit safe allowlist (`http`, `https`, `mailto`, `tel`, non-SVG `data:image/*`, and relative URLs), neutralize dangerous or control-char-obfuscated schemes (`javascript:`, `vbscript:`, `data:text/html`, `data:image/svg+xml`) to `#ZgotmplZ`, and HTML-escape the result.
+  - Added `{{ url_param(expr) }}` / `{{ expr | url_param }}` (`__temple_write_url_param`) for RFC 3986 percent-encoding of query parameters and URI components.
+  - Added `{{ js(expr) }}` / `{{ expr | js }}` and `{{ json(expr) }}` / `{{ expr | json }}` (`__temple_write_js_string`) to escape JavaScript/JSON string contents, control characters, line/paragraph separators (`\u2028`, `\u2029`), and `<`/`>`/`&`/`/` (`\u003c`, `\u003e`, `\u0026`, `\/`) to prevent `</script>` breakout inside inline script blocks.
 - **AST-Powered Pipe Filter DSL (`|`), `fmt(...)`, and `default(...)` (`cli/parser.odin`, `cli/transpiler.odin`, `runtime.odin`):**
-  - Added pipe filter syntax (`|`) inside `{{ ... }}` output tags for `raw`, `magic`, `len`, numeric/rune casts (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`), `fmt(...)`, and `default(...)`.
+  - Added pipe filter syntax (`|`) inside `{{ ... }}` output tags for `raw`, `magic`, `url`, `url_param`, `js`, `json`, `len`, numeric/rune casts (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`), `fmt(...)`, and `default(...)`.
   - Added stack-buffered formatted output via `{{ fmt(format, ...args) }}`, `{{ expr | fmt(format) }}` (`__temple_write_fmt_escaped`), and `{{ expr | fmt(format) | raw }}` (`__temple_write_fmt_raw`) with multi-byte UTF-8 boundary fallback to `fmt.tprintf`.
-  - Added default fallback expressions via `{{ default(val, fallback) }}` and `{{ val | default(fallback) }}`.
+  - Added overloaded default fallback expressions via `{{ default(val, fallback) }}` and `{{ val | default(fallback) }}` (`__temple_default` proc group supporting `string`, `$S/[]$E` slices, and `Maybe($T)`).
   - Added compile-time diagnostics for unknown pipe filters, piped `super()`, and invalid filter chains after terminal modifiers.
 - **Component-Style Named Props on `embed` (`cli/parser.odin`, `cli/transpiler.odin`):**
   - Added `{% embed "path.html"(name = expr, ...) %}` (and `with (name = expr, ...)`) with field-punning shorthand (`this.field` -> `field = this.field` and `ident` -> `ident = ident`) and duplicate-prop diagnostics.
@@ -22,6 +26,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Parameterized Template Macros (`{% macro %}` & `{% call %}`) (`cli/lexer.odin`, `cli/parser.odin`, `cli/transpiler.odin`, `cli/main.odin`):**
   - Added `{% macro name(params...) %}...{% end %}` with `core:odin/parser` signature validation (supporting typed parameters, default values, and zero-argument macros) and `{% call name(args...) %}`.
   - Transpiled macros into local Odin procedures `__temple_macro_<name> :: proc(__temple_w: __temple_io.Writer, <params>) -> (__temple_n: int, __temple_err: __temple_io.Error)` and supported macro inheritance and overrides across `{% extends %}` layouts.
+- **Developer Experience & CLI Modes (`--check`, `--warn-unused`, `--watch`) (`cli/main.odin`):**
+  - Added `--check` mode for CI pipelines to verify that all templates compile cleanly and the generated `.odin` file on disk matches the freshly transpiled output byte-for-byte without writing to disk.
+  - Added `--warn-unused` to scan the project directory and report unreferenced `.temple.twig`, `.temple.html`, and `.twig` template files.
+  - Added `--watch` polling mode with resilient non-fatal error recovery across both `.odin` call collection and template transpilation.
+- **Cross-Platform Path Normalization & GitHub Actions CI (`cli/main.odin`, `.github/workflows/ci.yml`):**
+  - Added `normalize_slash_path` to normalize Windows backslash separators (`\`) to canonical forward slashes (`/`) across call collection, relative `extends`/`embed` resolution, unused template detection, and generated `when path == "..."` clauses.
+  - Added multi-OS GitHub Actions CI workflow (`.github/workflows/ci.yml`) running unit, ATDD specification, CLI `--check` / `--warn-unused`, and end-to-end integration suites across `ubuntu-latest`, `macos-latest`, and `windows-latest`.
 - **4-Layer ATDD Executable Specification Suite (`cli/temple_spec_test.odin`, `cli/spec_dsl_test.odin`, `cli/spec_driver_test.odin`):**
   - Added declarative executable specifications, a domain-specific test language, and an in-memory protocol driver that automatically verifies every compiled template parses as valid Odin AST via `core:odin/parser`.
 

@@ -104,6 +104,7 @@ test_write_safe_url_allows_safe_schemes_and_relative_paths :: proc(t: ^testing.T
 		{input = "?redirect=http://example.com&a=1",          expected = "?redirect=http://example.com&amp;a=1"},
 		{input = "/wiki/Category:Odin",                       expected = "/wiki/Category:Odin"},
 		{input = "page.html",                                 expected = "page.html"},
+		{input = "  https://example.com/padded?a=1&b=2",      expected = "  https://example.com/padded?a=1&amp;b=2"},
 		{input = "data:image/png;base64,iVBORw0KGgo=",        expected = "data:image/png;base64,iVBORw0KGgo="},
 		{input = "DATA:IMAGE/WEBP;base64,UklGRg==",           expected = "DATA:IMAGE/WEBP;base64,UklGRg=="},
 	}
@@ -127,6 +128,7 @@ test_write_safe_url_neutralizes_dangerous_and_obfuscated_schemes :: proc(t: ^tes
 		"java\tscript:alert(1)",
 		"java\nscript:alert(1)",
 		"\x00javascript:alert(1)",
+		"\x00https://example.com",
 		"javascript:alert('https://example.com')",
 		"vbscript:msgbox(\"xss\")",
 		"data:text/html,<script>alert(1)</script>",
@@ -192,4 +194,32 @@ test_write_js_string_prevents_script_breakout_and_escapes_specials :: proc(t: ^t
 		testing.expect_value(t, strings.to_string(sb), c.expected)
 		testing.expect_value(t, n, len(c.expected))
 	}
+}
+
+@(test)
+test_default_overloads_for_string_slice_and_maybe :: proc(t: ^testing.T) {
+	// 1. string
+	testing.expect_value(t, __temple_default("", "Anon"), "Anon")
+	testing.expect_value(t, __temple_default("Ada", "Anon"), "Ada")
+
+	// 2. []T slice
+	empty_items: []string = {}
+	fallback_items := []string{"default_a", "default_b"}
+	non_empty_items := []string{"custom"}
+	res_empty := __temple_default(empty_items, fallback_items)
+	res_non_empty := __temple_default(non_empty_items, fallback_items)
+	testing.expect_value(t, len(res_empty), 2)
+	testing.expect_value(t, len(res_non_empty), 1)
+	testing.expect_value(t, res_non_empty[0], "custom")
+
+	// 3. Maybe(T)
+	none_str: Maybe(string) = nil
+	some_str: Maybe(string) = "Present"
+	testing.expect_value(t, __temple_default(none_str, "Missing"), "Missing")
+	testing.expect_value(t, __temple_default(some_str, "Missing"), "Present")
+
+	none_int: Maybe(int) = nil
+	some_int: Maybe(int) = 99
+	testing.expect_value(t, __temple_default(none_int, 42), 42)
+	testing.expect_value(t, __temple_default(some_int, 42), 99)
 }

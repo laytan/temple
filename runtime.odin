@@ -102,8 +102,22 @@ __temple_write_fmt_raw :: proc(w: io.Writer, fmt_str: string, args: ..any) -> (n
 	return io.write_string(w, formatted)
 }
 
-__temple_default :: proc(val, fallback: string) -> string {
+__temple_default_string :: proc(val, fallback: string) -> string {
 	return val if len(val) > 0 else fallback
+}
+
+__temple_default_slice :: proc(val, fallback: $S/[]$E) -> S {
+	return val if len(val) > 0 else fallback
+}
+
+__temple_default_maybe :: proc(val: Maybe($T), fallback: T) -> T {
+	return val.? or_else fallback
+}
+
+__temple_default :: proc {
+	__temple_default_string,
+	__temple_default_slice,
+	__temple_default_maybe,
 }
 
 @(private = "file")
@@ -143,6 +157,9 @@ __temple_is_safe_url :: proc(str: string) -> bool {
 	}
 
 	scheme := str[:colon_idx]
+	for len(scheme) > 0 && scheme[0] == ' ' {
+		scheme = scheme[1:]
+	}
 	if __temple_ascii_eq_fold(scheme, "http") ||
 	   __temple_ascii_eq_fold(scheme, "https") ||
 	   __temple_ascii_eq_fold(scheme, "mailto") ||

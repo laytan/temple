@@ -316,9 +316,18 @@ parse_cli_args :: proc(
 }
 
 run_cli_once :: proc(opts: Cli_Options) -> bool {
-	calls := collect_compile_calls(opts.project_dir)
-	free_all(context.temp_allocator)
+	collect_errs := make([dynamic]string, context.temp_allocator)
+	calls := collect_compile_calls(opts.project_dir, context.allocator, &collect_errs)
 	defer delete(calls)
+
+	if len(collect_errs) > 0 {
+		for msg in collect_errs {
+			fmt.eprintf("\x1b[0;31mTemple Error:\x1b[0m %s\n", msg)
+		}
+		free_all(context.temp_allocator)
+		return false
+	}
+	free_all(context.temp_allocator)
 
 	return transpile_calls(opts.temple_dir, calls[:], opts)
 }
@@ -621,6 +630,7 @@ collect_from_dir :: proc(
 
 	// Pass 1: Build per-file temple import alias table and package-level constant tables
 	file_temple_pkgs := make(map[^ast.File][dynamic]string, context.temp_allocator)
+	file_strict_temple_pkgs := make(map[^ast.File][dynamic]string, context.temp_allocator)
 	pkg_string_consts := make(map[string]^ast.Expr, context.temp_allocator)
 	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, context.temp_allocator)
 	pkg_proc_aliases["compiled"] = .Compiled
@@ -630,6 +640,8 @@ collect_from_dir :: proc(
 
 	for file in parsed_files {
 		import_names := make([dynamic]string, context.temp_allocator)
+		strict_names := make([dynamic]string, context.temp_allocator)
+		append(&strict_names, "temple")
 		for imp in file.imports {
 			trimmed_path := strings.trim(imp.fullpath, "\"`")
 			if strings.has_prefix(trimmed_path, "core:") ||
@@ -637,23 +649,25 @@ collect_from_dir :: proc(
 				strings.has_prefix(trimmed_path, "vendor:") {
 				continue
 			}
-			alias := imp.name.text
-			if len(alias) == 0 {
-				alias = trimmed_path
-				if colon_idx := strings.last_index_byte(alias, ':'); colon_idx != -1 {
-					alias = alias[colon_idx+1:]
-				}
-				alias = strings.trim_right(alias, "/\\")
-				if slash_idx := strings.last_index_any(alias, "/\\"); slash_idx != -1 {
-					alias = alias[slash_idx+1:]
-				}
+			base_pkg := trimmed_path
+			if colon_idx := strings.last_index_byte(base_pkg, ':'); colon_idx != -1 {
+				base_pkg = base_pkg[colon_idx+1:]
 			}
+			base_pkg = strings.trim_right(base_pkg, "/\\")
+			if slash_idx := strings.last_index_any(base_pkg, "/\\"); slash_idx != -1 {
+				base_pkg = base_pkg[slash_idx+1:]
+			}
+			alias := imp.name.text if len(imp.name.text) > 0 else base_pkg
 			if len(alias) > 0 && alias != "." && alias != ".." {
 				has_any_temple_import = true
 				append(&import_names, alias)
+				if base_pkg == "temple" || alias == "temple" {
+					append(&strict_names, alias)
+				}
 			}
 		}
 		file_temple_pkgs[file] = import_names
+		file_strict_temple_pkgs[file] = strict_names
 
 		// Collect top-level constant declarations
 		for decl in file.decls {
@@ -675,9 +689,9 @@ collect_from_dir :: proc(
 	// Iteratively resolve aliases in case of chained aliases `c1 :: temple.compiled; c2 :: c1`
 	for _ in 0 ..< 3 {
 		for file in parsed_files {
-			temple_names := file_temple_pkgs[file]
+			strict_names := file_strict_temple_pkgs[file]
 			for decl in file.decls {
-				collect_proc_aliases(decl, temple_names[:], &pkg_proc_aliases)
+				collect_proc_aliases(decl, strict_names[:], &pkg_proc_aliases)
 			}
 		}
 	}
@@ -694,6 +708,7 @@ collect_from_dir :: proc(
 	// Pass 2: Walk only files that import temple or reference a package-level temple alias
 	for file in parsed_files {
 		temple_names := file_temple_pkgs[file]
+		strict_names := file_strict_temple_pkgs[file]
 		if len(temple_names) == 0 && len(pkg_proc_aliases) == 0 {
 			continue
 		}
@@ -703,16 +718,17 @@ collect_from_dir :: proc(
 		file_string_consts := clone_string_consts(resolved_consts, context.temp_allocator)
 
 		walk_ctx := File_Collect_Ctx {
-			pkg_fullpath    = pkg.fullpath,
-			file            = file,
-			temple_names    = temple_names[:],
-			proc_aliases    = file_proc_aliases,
-			string_consts   = file_string_consts,
-			raw_const_exprs = pkg_string_consts,
-			calls           = calls,
-			seen            = seen_identifiers,
-			out_allocator   = out_allocator,
-			out_errors      = out_errors,
+			pkg_fullpath        = pkg.fullpath,
+			file                = file,
+			temple_names        = temple_names[:],
+			strict_temple_names = strict_names[:],
+			proc_aliases        = file_proc_aliases,
+			string_consts       = file_string_consts,
+			raw_const_exprs     = pkg_string_consts,
+			calls               = calls,
+			seen                = seen_identifiers,
+			out_allocator       = out_allocator,
+			out_errors          = out_errors,
 		}
 
 		v := ast.Visitor {
@@ -916,17 +932,42 @@ unquote_odin_string :: proc(lit: string) -> (string, bool) {
 	return "", false
 }
 
+is_strict_temple_call :: proc(
+	expr: ^ast.Expr,
+	strict_temple_names: []string,
+	proc_aliases: map[string]Temple_Proc_Kind,
+) -> bool {
+	if expr == nil do return false
+	expr := ast.unparen_expr(expr)
+
+	#partial switch e in expr.derived_expr {
+	case ^ast.Selector_Expr:
+		ident, iok := e.expr.derived_expr.(^ast.Ident)
+		if !iok do return false
+		if ident.name == "temple" do return true
+		for tn in strict_temple_names {
+			if ident.name == tn do return true
+		}
+		return false
+	case ^ast.Ident:
+		_, found := proc_aliases[e.name]
+		return found
+	}
+	return false
+}
+
 File_Collect_Ctx :: struct {
-	pkg_fullpath:    string,
-	file:            ^ast.File,
-	temple_names:    []string,
-	proc_aliases:    map[string]Temple_Proc_Kind,
-	string_consts:   map[string]string,
-	raw_const_exprs: map[string]^ast.Expr,
-	calls:           ^[dynamic]Compile_Call,
-	seen:            ^map[string]string,
-	out_allocator:   mem.Allocator,
-	out_errors:      ^[dynamic]string,
+	pkg_fullpath:        string,
+	file:                ^ast.File,
+	temple_names:        []string,
+	strict_temple_names: []string,
+	proc_aliases:        map[string]Temple_Proc_Kind,
+	string_consts:       map[string]string,
+	raw_const_exprs:     map[string]^ast.Expr,
+	calls:               ^[dynamic]Compile_Call,
+	seen:                ^map[string]string,
+	out_allocator:       mem.Allocator,
+	out_errors:          ^[dynamic]string,
 }
 
 collect_error :: proc(ctx: ^File_Collect_Ctx, pos: tokenizer.Pos, msg: string, args: ..any) {
@@ -1057,8 +1098,12 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 		if kind == .None {
 			return visitor
 		}
+		is_strict := is_strict_temple_call(n.expr, ctx.strict_temple_names, ctx.proc_aliases)
 
 		if len(n.args) != 2 {
+			if !is_strict {
+				return visitor
+			}
 			collect_error(
 				ctx,
 				n.pos,
@@ -1080,42 +1125,50 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 				if field_ident, fok := fv.field.derived_expr.(^ast.Ident); fok {
 					if field_ident.name == "path" {
 						if has_path {
-							collect_error(
-								ctx,
-								fv.pos,
-								"duplicate parameter `path` in call to `temple.compiled`",
-							)
+							if is_strict {
+								collect_error(
+									ctx,
+									fv.pos,
+									"duplicate parameter `path` in call to `temple.compiled`",
+								)
+							}
 							had_arg_err = true
 						}
 						has_path = true
 						path_arg = fv.value
 					} else if field_ident.name == "T" {
 						if has_T {
-							collect_error(
-								ctx,
-								fv.pos,
-								"duplicate parameter `T` in call to `temple.compiled`",
-							)
+							if is_strict {
+								collect_error(
+									ctx,
+									fv.pos,
+									"duplicate parameter `T` in call to `temple.compiled`",
+								)
+							}
 							had_arg_err = true
 						}
 						has_T = true
 					} else {
-						collect_error(
-							ctx,
-							fv.pos,
-							"unknown named parameter %q in call to `temple.compiled` (expected `path` or `T`)",
-							field_ident.name,
-						)
+						if is_strict {
+							collect_error(
+								ctx,
+								fv.pos,
+								"unknown named parameter %q in call to `temple.compiled` (expected `path` or `T`)",
+								field_ident.name,
+							)
+						}
 						had_arg_err = true
 					}
 				}
 			} else {
 				if seen_named {
-					collect_error(
-						ctx,
-						arg.pos,
-						"positional argument cannot follow named argument in call to `temple.compiled`",
-					)
+					if is_strict {
+						collect_error(
+							ctx,
+							arg.pos,
+							"positional argument cannot follow named argument in call to `temple.compiled`",
+						)
+					}
 					had_arg_err = true
 				} else if idx == 0 {
 					has_path = true
@@ -1127,10 +1180,13 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 		}
 
 		if had_arg_err {
-			return nil
+			return nil if is_strict else visitor
 		}
 
 		if !has_path || path_arg == nil {
+			if !is_strict {
+				return visitor
+			}
 			collect_error(
 				ctx,
 				n.pos,
@@ -1140,6 +1196,9 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 		}
 
 		if !has_T {
+			if !is_strict {
+				return visitor
+			}
 			collect_error(
 				ctx,
 				n.pos,
@@ -1150,6 +1209,9 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 
 		resolved_str, ok := eval_const_string(path_arg, ctx.string_consts, ctx.raw_const_exprs)
 		if !ok {
+			if !is_strict {
+				return visitor
+			}
 			collect_error(
 				ctx,
 				path_arg.pos,
