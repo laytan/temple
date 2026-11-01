@@ -20,23 +20,63 @@ Compiled :: struct($T: typeid) {
 Writes a string to the writer with special characters that can be used in XSS escaped.
 */
 __temple_write_escaped_string :: proc(w: io.Writer, str: string) -> (n: int, err: io.Error) {
-	for i in 0 ..< len(str) {
-		b := str[i]
-		switch b {
-		case '&':
-			n += io.write_string(w, "&amp;") or_return
-		case '"':
-			n += io.write_string(w, "&quot;") or_return
-		case '\'':
-			n += io.write_string(w, "&#039;") or_return
-		case '<':
-			n += io.write_string(w, "&lt;") or_return
-		case '>':
-			n += io.write_string(w, "&gt;") or_return
-		case:
-			io.write_byte(w, b) or_return
-			n += 1
+	start := 0
+	for start < len(str) {
+		replacement := ""
+		stop := start
+		scan: for ; stop < len(str); stop += 1 {
+			switch str[stop] {
+			case '&':
+				replacement = "&amp;"
+				break scan
+			case '"':
+				replacement = "&quot;"
+				break scan
+			case '\'':
+				replacement = "&#039;"
+				break scan
+			case '<':
+				replacement = "&lt;"
+				break scan
+			case '>':
+				replacement = "&gt;"
+				break scan
+			}
 		}
+		if stop > start {
+			n += io.write_string(w, str[start:stop]) or_return
+		}
+		if len(replacement) > 0 {
+			n += io.write_string(w, replacement) or_return
+		}
+		start = stop + 1
+	}
+	return
+}
+
+/*
+Writes a string wrapped in `.magic-text__word` spans for each space-separated word.
+*/
+__temple_write_magic_string :: proc(w: io.Writer, str: string) -> (n: int, err: io.Error) {
+	if len(str) == 0 do return
+	start := 0
+	for i in 0 ..< len(str) {
+		if str[i] == ' ' {
+			if i > start {
+				n += io.write_string(w, `<span class="magic-text__word">`) or_return
+				n += __temple_write_escaped_string(w, str[start:i]) or_return
+				n += io.write_string(w, `</span> `) or_return
+			} else {
+				io.write_byte(w, ' ') or_return
+				n += 1
+			}
+			start = i + 1
+		}
+	}
+	if start < len(str) {
+		n += io.write_string(w, `<span class="magic-text__word">`) or_return
+		n += __temple_write_escaped_string(w, str[start:]) or_return
+		n += io.write_string(w, `</span>`) or_return
 	}
 	return
 }
