@@ -158,6 +158,50 @@ infer_package_from_odin_source :: proc(src: string, allocator := context.temp_al
 	return strings.clone(name_tok.text, allocator), true
 }
 
+is_valid_odin_pkg_ident :: proc(s: string) -> bool {
+	return is_valid_block_ident(s) && s != "_"
+}
+
+sanitize_package_ident :: proc(raw: string, allocator := context.temp_allocator) -> (string, bool) {
+	trimmed := strings.trim_space(raw)
+	if len(trimmed) == 0 {
+		return "", false
+	}
+
+	sb := strings.builder_make(0, len(trimmed) + 1, allocator)
+	if trimmed[0] >= '0' && trimmed[0] <= '9' {
+		strings.write_byte(&sb, '_')
+	}
+
+	has_alnum := false
+	for i in 0 ..< len(trimmed) {
+		c := trimmed[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			has_alnum = true
+			strings.write_byte(&sb, c)
+		} else {
+			strings.write_byte(&sb, '_')
+		}
+	}
+
+	res := strings.to_string(sb)
+	if !has_alnum || !is_valid_odin_pkg_ident(res) {
+		return "", false
+	}
+	return res, true
+}
+
+should_skip_walk_dir :: proc(name: string) -> bool {
+	if strings.has_prefix(name, ".") {
+		return true
+	}
+	switch name {
+	case "vendor", "node_modules", "build", "bin", "dist":
+		return true
+	}
+	return false
+}
+
 infer_package_from_dir :: proc(
 	dir_path: string,
 	exclude_file := "",
@@ -202,7 +246,7 @@ infer_package_from_dir :: proc(
 
 	base := filepath.base(dir_path)
 	if len(base) > 0 && base != "." && base != ".." && base != "/" && base != "\\" {
-		return strings.clone(base, allocator), true
+		return sanitize_package_ident(base, allocator)
 	}
 	return "", false
 }
@@ -243,6 +287,9 @@ parse_cli_args :: proc(
 			case "pkg":
 				if !has_val || len(val) == 0 {
 					return opts, "flag `-pkg` requires a non-empty package name (e.g. `-pkg:views`)", false
+				}
+				if !is_valid_odin_pkg_ident(val) {
+					return opts, fmt.aprintf("invalid package name %q for `-pkg`: must be a valid Odin identifier", val, allocator = allocator), false
 				}
 				opts.pkg_name = val
 			case "temple-import":
@@ -315,7 +362,7 @@ parse_cli_args :: proc(
 	return opts, "", true
 }
 
-run_cli_once :: proc(opts: Cli_Options) -> bool {
+run_cli_once :: proc(opts: Cli_Options, out_used_files: ^[dynamic]string = nil) -> bool {
 	collect_errs := make([dynamic]string, context.temp_allocator)
 	calls := collect_compile_calls(opts.project_dir, context.allocator, &collect_errs)
 	defer delete(calls)
@@ -329,7 +376,7 @@ run_cli_once :: proc(opts: Cli_Options) -> bool {
 	}
 	free_all(context.temp_allocator)
 
-	return transpile_calls(opts.temple_dir, calls[:], opts)
+	return transpile_calls(opts.temple_dir, calls[:], opts, out_used_files)
 }
 
 main :: proc() {
@@ -540,7 +587,11 @@ collect_compile_calls :: proc(
 			continue
 		}
 
-		if strings.has_prefix(info.name, ".") {
+		if info.fullpath == root {
+			continue
+		}
+
+		if should_skip_walk_dir(info.name) {
 			filepath.walker_skip_dir(&w)
 			continue
 		}
@@ -1334,7 +1385,12 @@ Worker_Batch :: struct {
 	external_pkg: bool,
 }
 
-transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Options = {}) -> bool {
+transpile_calls :: proc(
+	temple_path: string,
+	calls: []Compile_Call,
+	opts: Cli_Options = {},
+	out_used_files: ^[dynamic]string = nil,
+) -> bool {
 	pkg_name := opts.pkg_name if len(opts.pkg_name) > 0 else "temple"
 	external_pkg := pkg_name != "temple"
 
@@ -1414,6 +1470,15 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 				free(b)
 			}
 		}
+	}
+
+	if out_used_files != nil {
+		for k, v in used_files {
+			if v {
+				append(out_used_files, strings.clone(k, out_used_files.allocator))
+			}
+		}
+		slice.sort(out_used_files[:])
 	}
 
 	// Check for any diagnostics across all compiled calls
@@ -1584,7 +1649,7 @@ discover_project_template_files :: proc(root_dir: string, allocator := context.a
 			continue
 		}
 		if info.type == .Directory {
-			if info.fullpath != root_dir && strings.has_prefix(info.name, ".") {
+			if info.fullpath != root_dir && should_skip_walk_dir(info.name) {
 				filepath.walker_skip_dir(&w)
 			}
 			continue
@@ -1621,6 +1686,7 @@ capture_workspace_snapshot :: proc(
 	root_dir: string,
 	exclude_out_file := "",
 	allocator := context.allocator,
+	extra_files: []string = nil,
 ) -> Workspace_Snapshot {
 	snap := make(Workspace_Snapshot, allocator)
 	abs_exclude := ""
@@ -1632,34 +1698,69 @@ capture_workspace_snapshot :: proc(
 		}
 	}
 
-	w := filepath.walker_create(root_dir)
-	defer filepath.walker_destroy(&w)
+	snapshot_walk_dir :: proc(
+		dir_to_walk: string,
+		abs_exclude: string,
+		snap: ^Workspace_Snapshot,
+		allocator: mem.Allocator,
+	) {
+		w := filepath.walker_create(dir_to_walk)
+		defer filepath.walker_destroy(&w)
 
-	for info in filepath.walker_walk(&w) {
-		if _, err := filepath.walker_error(&w); err != nil {
-			continue
-		}
-		if info.type == .Directory {
-			if info.fullpath != root_dir && strings.has_prefix(info.name, ".") {
-				filepath.walker_skip_dir(&w)
+		for info in filepath.walker_walk(&w) {
+			if _, err := filepath.walker_error(&w); err != nil {
+				continue
 			}
-			continue
-		}
-		if !is_watched_workspace_file(info.name) || info.name == "templates.odin" {
-			continue
-		}
-		abs_path := info.fullpath
-		if ap, err := os.get_absolute_path(info.fullpath, context.temp_allocator); err == nil {
-			abs_path = ap
-		}
-		if len(abs_exclude) > 0 && abs_path == abs_exclude {
-			continue
-		}
-		snap[strings.clone(abs_path, allocator)] = File_Stamp{
-			mtime_nsec = info.modification_time._nsec,
-			size       = info.size,
+			if info.type == .Directory {
+				if info.fullpath != dir_to_walk && should_skip_walk_dir(info.name) {
+					filepath.walker_skip_dir(&w)
+				}
+				continue
+			}
+			if !is_watched_workspace_file(info.name) || info.name == "templates.odin" {
+				continue
+			}
+			abs_path := info.fullpath
+			if ap, err := os.get_absolute_path(info.fullpath, context.temp_allocator); err == nil {
+				abs_path = ap
+			}
+			if len(abs_exclude) > 0 && abs_path == abs_exclude {
+				continue
+			}
+			if _, exists := snap^[abs_path]; !exists {
+				snap^[strings.clone(abs_path, allocator)] = File_Stamp{
+					mtime_nsec = info.modification_time._nsec,
+					size       = info.size,
+				}
+			}
 		}
 	}
+
+	snapshot_walk_dir(root_dir, abs_exclude, &snap, allocator)
+
+	for extra in extra_files {
+		if len(extra) == 0 {
+			continue
+		}
+		abs_extra := extra
+		if ap, err := os.get_absolute_path(extra, context.temp_allocator); err == nil {
+			abs_extra = ap
+		}
+		if len(abs_exclude) > 0 && abs_extra == abs_exclude {
+			continue
+		}
+		if info, stat_err := os.stat(abs_extra, context.temp_allocator); stat_err == nil {
+			if info.type == .Directory {
+				snapshot_walk_dir(abs_extra, abs_exclude, &snap, allocator)
+			} else if _, exists := snap[abs_extra]; !exists {
+				snap[strings.clone(abs_extra, allocator)] = File_Stamp{
+					mtime_nsec = info.modification_time._nsec,
+					size       = info.size,
+				}
+			}
+		}
+	}
+
 	return snap
 }
 
@@ -1678,25 +1779,28 @@ has_workspace_snapshot_changed :: proc(prev, curr: Workspace_Snapshot) -> bool {
 
 watch_workspace :: proc(opts: Cli_Options, max_iterations := 0, poll_interval := 250 * time.Millisecond) {
 	fmt.printf("watching %q for template and Odin file changes...\n", opts.project_dir)
-	_ = run_cli_once(opts)
 
 	snapshot_arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&snapshot_arena)
 	defer mem.dynamic_arena_destroy(&snapshot_arena)
 	snap_alloc := mem.dynamic_arena_allocator(&snapshot_arena)
 
-	prev_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc)
+	watched_used := make([dynamic]string, snap_alloc)
+	_ = run_cli_once(opts, &watched_used)
+
+	prev_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc, watched_used[:])
 	free_all(context.temp_allocator)
 
 	for iter := 0; max_iterations <= 0 || iter < max_iterations; iter += 1 {
 		time.sleep(poll_interval)
 
-		curr_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, context.temp_allocator)
+		curr_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, context.temp_allocator, watched_used[:])
 		if has_workspace_snapshot_changed(prev_snap, curr_snap) {
 			fmt.println("change detected; recompiling templates...")
-			_ = run_cli_once(opts)
 			mem.dynamic_arena_reset(&snapshot_arena)
-			prev_snap = capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc)
+			watched_used = make([dynamic]string, snap_alloc)
+			_ = run_cli_once(opts, &watched_used)
+			prev_snap = capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc, watched_used[:])
 		}
 		free_all(context.temp_allocator)
 	}

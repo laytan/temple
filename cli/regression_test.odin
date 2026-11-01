@@ -661,15 +661,24 @@ test_cli_options_parsing_and_package_inference :: proc(t: ^testing.T) {
 		testing.expect_value(t, opts.temple_import, "shared:temple")
 	}
 
-	// 6. Automatic package inference fallback to directory basename when directory has no `.odin` files yet
+	// 6. Automatic package inference fallback to directory basename when directory has no `.odin` files yet,
+	// including sanitizing hyphens and leading digits into valid Odin identifiers
 	{
 		opts, err_msg, ok := parse_cli_args({"temple_cli", "src", "-out:nonexistent_views_dir/templates_gen.odin"}, alloc)
 		testing.expect(t, ok, err_msg)
 		testing.expect_value(t, opts.pkg_name, "nonexistent_views_dir")
 		testing.expect_value(t, opts.temple_import, "shared:temple")
+
+		opts_hyphen, err_hyphen, ok_hyphen := parse_cli_args({"temple_cli", "src", "-out:my-views/templates_gen.odin"}, alloc)
+		testing.expect(t, ok_hyphen, err_hyphen)
+		testing.expect_value(t, opts_hyphen.pkg_name, "my_views")
+
+		opts_digit, err_digit, ok_digit := parse_cli_args({"temple_cli", "src", "-out:2026-views/templates_gen.odin"}, alloc)
+		testing.expect(t, ok_digit, err_digit)
+		testing.expect_value(t, opts_digit.pkg_name, "_2026_views")
 	}
 
-	// 7. Invalid invocations must fail cleanly
+	// 7. Invalid invocations (including invalid `-pkg` identifiers) must fail cleanly
 	{
 		_, _, ok_empty := parse_cli_args({"temple_cli"}, alloc)
 		testing.expect(t, !ok_empty)
@@ -682,6 +691,16 @@ test_cli_options_parsing_and_package_inference :: proc(t: ^testing.T) {
 
 		_, _, ok_empty_val := parse_cli_args({"temple_cli", "src", "-out:"}, alloc)
 		testing.expect(t, !ok_empty_val)
+
+		_, err_bad_pkg_hyphen, ok_bad_pkg_hyphen := parse_cli_args({"temple_cli", "src", "-out:views/templates.odin", "-pkg:my-views"}, alloc)
+		testing.expect(t, !ok_bad_pkg_hyphen)
+		testing.expect(t, strings.contains(err_bad_pkg_hyphen, "must be a valid Odin identifier"), err_bad_pkg_hyphen)
+
+		_, _, ok_bad_pkg_digit := parse_cli_args({"temple_cli", "src", "-out:views/templates.odin", "-pkg:123views"}, alloc)
+		testing.expect(t, !ok_bad_pkg_digit)
+
+		_, _, ok_bad_pkg_underscore := parse_cli_args({"temple_cli", "src", "-out:views/templates.odin", "-pkg:_"}, alloc)
+		testing.expect(t, !ok_bad_pkg_underscore)
 	}
 }
 
@@ -799,6 +818,50 @@ test_cli_dx_flags_and_modes :: proc(t: ^testing.T) {
 		_ = os.remove(tpl_file)
 		snap_removed := capture_workspace_snapshot(watch_dir, gen_file, alloc)
 		testing.expect(t, has_workspace_snapshot_changed(snap1, snap_removed))
+
+		// External `extra_files` outside `watch_dir` (e.g. shared parent layouts) are included in snapshots
+		ext_dir := ".tmp/test_watch_external_layouts"
+		_ = os.make_directory(ext_dir)
+		ext_layout := ".tmp/test_watch_external_layouts/base.temple.html"
+		defer {
+			_ = os.remove(ext_layout)
+			_ = os.remove(ext_dir)
+		}
+		_ = os.write_entire_file(ext_layout, transmute([]byte)string("<html>{% block body %}v1{% end %}</html>"))
+		snap_with_ext1 := capture_workspace_snapshot(watch_dir, gen_file, alloc, {ext_layout})
+		snap_with_ext2 := capture_workspace_snapshot(watch_dir, gen_file, alloc, {ext_layout})
+		testing.expect(t, !has_workspace_snapshot_changed(snap_with_ext1, snap_with_ext2))
+
+		_ = os.write_entire_file(ext_layout, transmute([]byte)string("<html>{% block body %}version_2_longer{% end %}</html>"))
+		snap_with_ext_modified := capture_workspace_snapshot(watch_dir, gen_file, alloc, {ext_layout})
+		testing.expect(t, has_workspace_snapshot_changed(snap_with_ext1, snap_with_ext_modified))
+
+		// Directories in `should_skip_walk_dir` (`vendor`, `node_modules`, `build`, `bin`, `dist`) are skipped during walks
+		vendor_dir := ".tmp/test_watch_snapshot/vendor"
+		node_modules_dir := ".tmp/test_watch_snapshot/node_modules"
+		build_dir := ".tmp/test_watch_snapshot/build"
+		_ = os.make_directory(vendor_dir)
+		_ = os.make_directory(node_modules_dir)
+		_ = os.make_directory(build_dir)
+		vendor_tpl := ".tmp/test_watch_snapshot/vendor/ignored.temple.html"
+		nm_tpl := ".tmp/test_watch_snapshot/node_modules/ignored.temple.html"
+		build_odin := ".tmp/test_watch_snapshot/build/ignored.odin"
+		defer {
+			_ = os.remove(vendor_tpl)
+			_ = os.remove(nm_tpl)
+			_ = os.remove(build_odin)
+			_ = os.remove(vendor_dir)
+			_ = os.remove(node_modules_dir)
+			_ = os.remove(build_dir)
+		}
+		_ = os.write_entire_file(vendor_tpl, transmute([]byte)string("ignored"))
+		_ = os.write_entire_file(nm_tpl, transmute([]byte)string("ignored"))
+		_ = os.write_entire_file(build_odin, transmute([]byte)string(`package build; import "temple"; x := temple.compiled("ignored.html", int)`))
+
+		discovered := discover_project_template_files(watch_dir, alloc)
+		testing.expect_value(t, len(discovered), 0)
+		snap_after_ignored := capture_workspace_snapshot(watch_dir, gen_file, alloc)
+		testing.expect(t, !has_workspace_snapshot_changed(snap_removed, snap_after_ignored))
 	}
 
 	// 4. `run_cli_once` returns `false` without `os.exit(1)` when an `.odin` file has a collection error (keeping `--watch` alive)
