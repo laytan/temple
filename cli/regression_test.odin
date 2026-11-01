@@ -897,4 +897,10 @@ test_cross_platform_path_normalization :: proc(t: ^testing.T) {
 	testing.expect_value(t, normalize_slash_path(`views\pages\home.temple.twig`, alloc), "views/pages/home.temple.twig")
 	testing.expect_value(t, normalize_slash_path(`a/b\c\\d/e.html`, alloc), "a/b/c/d/e.html")
 	testing.expect_value(t, normalize_slash_path(`already/normalized.html`, alloc), "already/normalized.html")
+
+	// Cross-platform relative path joining and dot-segment cleaning (preserving leading `/` and drive prefixes)
+	testing.expect_value(t, join_relative_slash_path("/app/views/home.html", "../layouts/base.html", alloc), "/app/layouts/base.html")
+	testing.expect_value(t, join_relative_slash_path("/app/views/pages/home.html", "../../layouts/section/child.html", alloc), "/app/layouts/section/child.html")
+	testing.expect_value(t, join_relative_slash_path(`D:\a\temple\app\views\home.html`, `..\partials\card.html`, alloc), "D:/a/temple/app/partials/card.html")
+	testing.expect_value(t, join_relative_slash_path("views/home.html", "../partials/card.html", alloc), "partials/card.html")
 }

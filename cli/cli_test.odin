@@ -700,7 +700,7 @@ test_review_round_two_fixes :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(ctx.diagnostics), 1)
 		if len(ctx.diagnostics) == 1 {
 			d := ctx.diagnostics[0]
-			testing.expect_value(t, d.pos.file, parent_err_base)
+			testing.expect_value(t, d.pos.file, normalize_slash_path(parent_err_base, context.temp_allocator))
 			testing.expect_value(t, d.pos.line, 2)
 			testing.expect(t, strings.contains(d.snippet, `missing_in_base.html`), d.snippet)
 		}

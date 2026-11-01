@@ -200,6 +200,17 @@ parse_cli_flag_kv :: proc(arg: string) -> (key: string, val: string, is_flag: bo
 	return trimmed, "", true, false
 }
 
+@(private)
+is_abs_slash_path :: proc(path: string) -> bool {
+	if strings.has_prefix(path, "/") || strings.has_prefix(path, "\\") {
+		return true
+	}
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\') {
+		return true
+	}
+	return filepath.is_abs(path)
+}
+
 @(private = "file")
 slice_file_dir :: proc(file: string) -> string {
 	if slash_idx := strings.last_index_any(file, "/\\"); slash_idx != -1 {
@@ -211,7 +222,116 @@ slice_file_dir :: proc(file: string) -> string {
 	return "."
 }
 
-@(private = "file")
+@(private)
+clean_slash_path :: proc(path: string, allocator := context.temp_allocator) -> string {
+	norm := normalize_slash_path(path, allocator)
+	if len(norm) == 0 {
+		return "."
+	}
+	if !strings.contains(norm, "/.") && !strings.has_prefix(norm, "./") && !strings.has_prefix(norm, "../") && norm != "." && norm != ".." {
+		if len(norm) > 1 && norm[len(norm)-1] == '/' {
+			if !(len(norm) == 3 && norm[1] == ':' && norm[2] == '/') {
+				return norm[:len(norm)-1]
+			}
+		}
+		return norm
+	}
+
+	prefix := ""
+	rest := norm
+	if len(rest) >= 2 && rest[1] == ':' {
+		if len(rest) >= 3 && rest[2] == '/' {
+			prefix = rest[:3]
+			rest = rest[3:]
+		} else {
+			prefix = rest[:2]
+			rest = rest[2:]
+		}
+	} else if strings.has_prefix(rest, "/") {
+		prefix = "/"
+		rest = rest[1:]
+	}
+	rooted := strings.has_suffix(prefix, "/")
+
+	segs_buf: [64]string
+	seg_cnt := 0
+	segs_var: [dynamic]string
+
+	start := 0
+	for i := 0; i <= len(rest); i += 1 {
+		if i == len(rest) || rest[i] == '/' {
+			part := rest[start:i]
+			start = i + 1
+			if len(part) == 0 || part == "." {
+				continue
+			}
+			if part == ".." {
+				cur_len := len(segs_var) if segs_var != nil else seg_cnt
+				last_seg := ""
+				if cur_len > 0 {
+					last_seg = segs_var[cur_len-1] if segs_var != nil else segs_buf[cur_len-1]
+				}
+				if cur_len > 0 && last_seg != ".." {
+					if segs_var != nil {
+						pop(&segs_var)
+					} else {
+						seg_cnt -= 1
+					}
+				} else if !rooted {
+					if segs_var != nil {
+						append(&segs_var, "..")
+					} else if seg_cnt < len(segs_buf) {
+						segs_buf[seg_cnt] = ".."
+						seg_cnt += 1
+					} else {
+						segs_var = make([dynamic]string, 0, seg_cnt * 2, allocator)
+						for s in segs_buf {
+							append(&segs_var, s)
+						}
+						append(&segs_var, "..")
+					}
+				}
+				continue
+			}
+			if segs_var != nil {
+				append(&segs_var, part)
+			} else if seg_cnt < len(segs_buf) {
+				segs_buf[seg_cnt] = part
+				seg_cnt += 1
+			} else {
+				segs_var = make([dynamic]string, 0, seg_cnt * 2, allocator)
+				for s in segs_buf {
+					append(&segs_var, s)
+				}
+				append(&segs_var, part)
+			}
+		}
+	}
+
+	segs := segs_var[:] if segs_var != nil else segs_buf[:seg_cnt]
+	if len(segs) == 0 {
+		if len(prefix) > 0 {
+			return prefix
+		}
+		return "."
+	}
+
+	total_len := len(prefix) + len(segs) - 1
+	for s in segs {
+		total_len += len(s)
+	}
+	sb := strings.builder_make(0, total_len, allocator)
+	strings.write_string(&sb, prefix)
+	for s, idx in segs {
+		if idx > 0 {
+			strings.write_byte(&sb, '/')
+		}
+		strings.write_string(&sb, s)
+	}
+	return strings.to_string(sb)
+}
+
+@(private)
 join_relative_slash_path :: proc(origin_file, rel_path: string, allocator := context.temp_allocator) -> string {
 	if !strings.has_prefix(rel_path, ".") && !strings.contains(rel_path, "/.") && !strings.contains(rel_path, "\\") {
 		if slash_idx := strings.last_index_any(origin_file, "/\\"); slash_idx != -1 {
@@ -220,8 +340,14 @@ join_relative_slash_path :: proc(origin_file, rel_path: string, allocator := con
 		}
 		return rel_path
 	}
-	joined, _ := filepath.join({slice_file_dir(origin_file), rel_path}, allocator)
-	return normalize_slash_path(joined, allocator)
+	base_dir := slice_file_dir(origin_file)
+	if base_dir == "." {
+		return clean_slash_path(rel_path, allocator)
+	}
+	if base_dir == "/" || base_dir == "\\" {
+		return clean_slash_path(strings.concatenate({"/", rel_path}, allocator), allocator)
+	}
+	return clean_slash_path(strings.concatenate({base_dir, "/", rel_path}, allocator), allocator)
 }
 
 normalize_slash_path :: proc(path: string, allocator := context.temp_allocator) -> string {
@@ -1580,9 +1706,8 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 		}
 
 		target_fullpath := resolved_str
-		if kind == .Compiled && !filepath.is_abs(resolved_str) {
-			joined_fp, _ := filepath.join({ctx.pkg_fullpath, resolved_str}, context.temp_allocator)
-			target_fullpath = normalize_slash_path(joined_fp, context.temp_allocator)
+		if kind == .Compiled && !is_abs_slash_path(resolved_str) {
+			target_fullpath = clean_slash_path(strings.concatenate({ctx.pkg_fullpath, "/", resolved_str}, context.temp_allocator), context.temp_allocator)
 		}
 
 		// Deduplicate calls with identical template identifier, erroring on cross-package collisions
@@ -3475,12 +3600,11 @@ rewrite_nodes_embeds :: proc(
 			new_emb^ = d^
 			new_emb.derived = new_emb
 			apply_origin_fallback(&new_emb.origin_file, &new_emb.origin_src, origin_file, origin_src)
-			if len(new_emb.resolved_path) == 0 && !filepath.is_abs(rel) && len(base_dir) > 0 {
+			if len(new_emb.resolved_path) == 0 && !is_abs_slash_path(rel) && len(base_dir) > 0 {
 				if len(origin_file) > 0 {
 					new_emb.resolved_path = join_relative_slash_path(origin_file, rel, ctx.allocator)
 				} else {
-					abs_path, _ := filepath.join({base_dir, rel}, ctx.allocator)
-					new_emb.resolved_path = normalize_slash_path(abs_path, ctx.allocator)
+					new_emb.resolved_path = clean_slash_path(strings.concatenate({base_dir, "/", rel}, ctx.allocator), ctx.allocator)
 				}
 			}
 			append(&out, new_emb)
@@ -3538,7 +3662,7 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 	fullpath: string
 	if len(node.resolved_path) > 0 {
 		fullpath = normalize_slash_path(node.resolved_path, ctx.allocator)
-	} else if filepath.is_abs(raw_path) {
+	} else if is_abs_slash_path(raw_path) {
 		fullpath = raw_path
 	} else {
 		fullpath = join_relative_slash_path(embed_origin_file, raw_path, ctx.allocator)
