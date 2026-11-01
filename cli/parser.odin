@@ -8,13 +8,17 @@ import "core:odin/tokenizer"
 import "core:strings"
 
 Parser :: struct {
-	lexer:         Lexer,
-	allocator:     mem.Allocator,
-	template:      Template,
-	last_txt_node: Maybe(^Node_Text),
-	in_block:      int,
-	body_depth:    int,
-	seen_macros:   map[string]bool,
+	lexer:          Lexer,
+	allocator:      mem.Allocator,
+	template:       Template,
+	last_txt_node:  Maybe(^Node_Text),
+	in_block:       int,
+	body_depth:     int,
+	seen_macros:    [16]string,
+	seen_macro_cnt: int,
+	dummy_odin_pkg: ast.Package,
+	slab:           []byte,
+	slab_off:       int,
 }
 
 Parser_Error :: struct {
@@ -70,16 +74,19 @@ Output_Write_Kind :: enum {
 	I64,
 	F32,
 	F64,
+	F64_Prec,
 }
 
 Node_Output :: struct {
-	using node: Node,
-	open:       Token,
-	expression: Token,
-	close:      Token,
-	write_kind: Output_Write_Kind,
-	inner_expr: string,
-	fmt_str:    string, // Populated when write_kind is .Fmt_Escaped or .Fmt_Raw
+	using node:  Node,
+	open:        Token,
+	expression:  Token,
+	write_kind:  Output_Write_Kind,
+	inner_expr:  string,
+	wrap_call:   string, // Optional wrapper function/cast name, e.g. "len", "int", "f64"
+	default_arg: string, // Optional second argument to `__temple_default(inner_expr, default_arg)`
+	fmt_str:     string, // Populated when write_kind is .Fmt_Escaped or .Fmt_Raw
+	float_prec:  int,    // Populated when write_kind is .F64_Prec
 }
 
 Node_If :: struct {
@@ -87,35 +94,27 @@ Node_If :: struct {
 	_if:        Node_If_Part,
 	elseifs:    [dynamic]^Node_If_Part,
 	_else:      Maybe(^Node_If_Part),
-	end:        Node_End,
 }
 
 Node_Case :: struct {
 	open:       Token,
-	case_tok:   Token,
 	expression: Maybe(Token), // `nil` for default `{% case %}`
-	close:      Token,
 	body:       [dynamic]Node,
 }
 
 Node_Switch :: struct {
 	using node: Node,
 	open:       Token,
-	switch_tok: Token,
 	is_partial: bool,         // true for `{% #partial switch ... %}`
 	expression: Maybe(Token), // `nil` for blank `{% switch %}`
-	close:      Token,
 	cases:      [dynamic]^Node_Case,
-	end:        Node_End,
 }
 
 Node_Let :: struct {
 	using node:    Node,
 	open:          Token,
-	let_tok:       Token,
 	assignment:    Token, // e.g., `x = this.count + 1` or `val, ok := this.opt.?`
 	has_type_decl: bool,  // true when declared with explicit type e.g. `x: int = 5`
-	close:         Token,
 }
 
 Embed_Prop :: struct {
@@ -127,14 +126,12 @@ Embed_Prop :: struct {
 Node_Embed :: struct {
 	using node:    Node,
 	open:          Token,
-	embed:         Token,
 	path:          Token,
 	resolved_path: string,
 	origin_file:   string,
 	origin_src:    []byte,
 	with:          Maybe(^Node_Embed_With),
 	props:         [dynamic]Embed_Prop, // Populated for `{% embed "x.html"(a = 1, b = 2) %}`
-	close:         Token,
 }
 
 Node_Embed_With :: struct {
@@ -145,22 +142,17 @@ Node_Embed_With :: struct {
 Node_Extends :: struct {
 	using node: Node,
 	open:       Token,
-	extends:    Token,
 	path:       Token,
-	close:      Token,
 }
 
 Node_Block :: struct {
 	using node:  Node,
 	open:        Token,
-	block:       Token,
 	name_tok:    Token,
 	name:        string,
 	origin_file: string,
 	origin_src:  []byte,
-	close:       Token,
 	body:        [dynamic]Node,
-	end:         Node_End,
 }
 
 Node_Super :: struct {
@@ -169,13 +161,11 @@ Node_Super :: struct {
 	super_tok:   Token,
 	origin_file: string,
 	origin_src:  []byte,
-	close:       Token,
 }
 
 Node_Macro :: struct {
 	using node:  Node,
 	open:        Token,
-	macro_tok:   Token,
 	signature:   Token,
 	name:        string,
 	params_src:  string,
@@ -185,9 +175,7 @@ Node_Macro :: struct {
 	has_varargs: bool,
 	origin_file: string,
 	origin_src:  []byte,
-	close:       Token,
 	body:        [dynamic]Node,
-	end:         Node_End,
 }
 
 Call_Arg_Info :: struct {
@@ -198,23 +186,21 @@ Call_Arg_Info :: struct {
 Node_Call :: struct {
 	using node:  Node,
 	open:        Token,
-	call_tok:    Token,
 	call_expr:   Token,
 	name_pos:    Pos,
 	name:        string,
 	args_src:    string,
+	arg_count:   int,
 	args:        [dynamic]Call_Arg_Info,
 	origin_file: string,
 	origin_src:  []byte,
-	close:       Token,
 }
 
 Node_If_Part :: struct {
 	start: struct {
-		open:  Token,
-		type:  Token,
-		expr:  Maybe(Token), // Set if type is .If or .ElseIf, not with .Else.
-		close: Token,
+		open: Token,
+		type: Token,
+		expr: Maybe(Token), // Set if type is .If or .ElseIf, not with .Else.
 	},
 	body:  [dynamic]Node,
 }
@@ -223,26 +209,63 @@ Node_For :: struct {
 	using node: Node,
 	start:      struct {
 		open:       Token,
-		_for:       Token,
 		expression: Token,
-		close:      Token,
 	},
 	body:       [dynamic]Node,
-	end:        Node_End,
-}
-
-Node_End :: struct {
-	open:  Token,
-	end:   Token,
-	close: Token,
 }
 
 parser_init_bytes :: proc(p: ^Parser, source: []byte, allocator := context.allocator) {
 	lexer_init(&p.lexer, source)
 
 	p.allocator = allocator
-	p.template.content = make([dynamic]Node, allocator)
-	p.seen_macros = make(map[string]bool, allocator)
+	init_cap := clamp(len(source) / 64, 2, 16)
+	p.template.content = make([dynamic]Node, 0, init_cap, allocator)
+	p.seen_macro_cnt = 0
+	p.slab = nil
+	p.slab_off = 0
+}
+
+@(private = "file")
+alloc_parser_node :: proc(p: ^Parser, $T: typeid) -> ^T {
+	align :: int(align_of(T))
+	size :: int(size_of(T))
+	off := (p.slab_off + (align - 1)) & ~(align - 1)
+	if off + size > len(p.slab) {
+		slab_bytes := clamp(len(p.lexer.source) * 2 + 512, 512, 4096)
+		if slab_bytes < size + align {
+			slab_bytes = size + align
+		}
+		p.slab = make([]byte, slab_bytes, p.allocator)
+		off = 0
+	}
+	res := cast(^T)&p.slab[off]
+	p.slab_off = off + size
+	return res
+}
+
+@(private = "file")
+alloc_node_text :: #force_inline proc(p: ^Parser) -> ^Node_Text {
+	return alloc_parser_node(p, Node_Text)
+}
+
+@(private = "file")
+alloc_node_output :: #force_inline proc(p: ^Parser) -> ^Node_Output {
+	return alloc_parser_node(p, Node_Output)
+}
+
+@(private = "file")
+alloc_node_block :: #force_inline proc(p: ^Parser) -> ^Node_Block {
+	return alloc_parser_node(p, Node_Block)
+}
+
+@(private = "file")
+alloc_node_call :: #force_inline proc(p: ^Parser) -> ^Node_Call {
+	return alloc_parser_node(p, Node_Call)
+}
+
+@(private = "file")
+alloc_node_case :: #force_inline proc(p: ^Parser) -> ^Node_Case {
+	return alloc_parser_node(p, Node_Case)
 }
 
 parser_init_str :: proc(p: ^Parser, source: string, allocator := context.allocator) {
@@ -269,6 +292,67 @@ error :: proc(p: ^Parser, pos: Pos, msg: string, args: ..any) -> bool {
 	return false
 }
 
+@(private = "file")
+append_parsed_node :: proc(p: ^Parser, container: ^[dynamic]Node, node: Node) {
+	if txt, is_txt := node.derived.(^Node_Text); is_txt {
+		if len(txt.text.value) == 0 {
+			return
+		}
+		if len(container^) > 0 {
+			if prev_txt, is_prev := container^[len(container^) - 1].derived.(^Node_Text); is_prev {
+				prev_txt.text.value = strings.concatenate({prev_txt.text.value, txt.text.value}, p.allocator)
+				p.last_txt_node = prev_txt
+				return
+			}
+		}
+		append(container, txt)
+		return
+	}
+
+	if d, is_out := node.derived.(^Node_Output); is_out {
+		if d.write_kind == .Fmt_Escaped || d.write_kind == .Fmt_Raw {
+			v := d.inner_expr if len(d.inner_expr) > 0 else strings.trim_space(d.expression.value)
+			if len(d.default_arg) > 0 || !has_top_level_comma(v) {
+				if spec := try_parse_simple_fmt_literal(d.fmt_str, p.allocator); spec.is_simple {
+					is_raw := d.write_kind == .Fmt_Raw
+					if len(spec.prefix) > 0 {
+						pre_val := spec.prefix if is_raw else escape_html_literal_at_compile_time(spec.prefix, p.allocator)
+						append_parsed_node(p, container, parse_text(p, Token{type = .Text, value = pre_val, pos = d.open.pos}))
+					}
+					switch spec.verb {
+					case 's':
+						d.write_kind = .Raw_String if is_raw else .Escaped_String
+						d.inner_expr = v
+					case 'i', 'd':
+						d.write_kind = .Int
+						d.inner_expr = v
+						if len(d.wrap_call) == 0 {
+							d.wrap_call = "int"
+						}
+					case 'f':
+						d.write_kind = .F64_Prec
+						d.float_prec = spec.float_prec
+						d.inner_expr = v
+						if len(d.wrap_call) == 0 {
+							d.wrap_call = "f64"
+						}
+					}
+					append(container, d)
+					p.last_txt_node = nil
+					if len(spec.suffix) > 0 {
+						suf_val := spec.suffix if is_raw else escape_html_literal_at_compile_time(spec.suffix, p.allocator)
+						append_parsed_node(p, container, parse_text(p, Token{type = .Text, value = suf_val, pos = d.open.pos}))
+					}
+					return
+				}
+			}
+		}
+	}
+
+	append(container, node)
+	p.last_txt_node = nil
+}
+
 parse :: proc(p: ^Parser) -> Template {
 	parse_loop: for {
 		t := lexer_next(&p.lexer)
@@ -276,17 +360,17 @@ parse :: proc(p: ^Parser) -> Template {
 		switch t.type {
 		case .Output_Open:
 			if out, ok := parse_output(p, t); ok {
-				append(&p.template.content, out)
+				append_parsed_node(p, &p.template.content, out)
 			} else {
 				break parse_loop
 			}
 
 		case .Text:
-			append(&p.template.content, parse_text(p, t))
+			append_parsed_node(p, &p.template.content, parse_text(p, t))
 
 		case .Process_Open:
 			if out, ok := parse_process(p, t); ok {
-				append(&p.template.content, out)
+				append_parsed_node(p, &p.template.content, out)
 			} else {
 				break parse_loop
 			}
@@ -407,22 +491,20 @@ parse_output :: proc(p: ^Parser, open_token: Token) -> (n: Node, ok: bool) {
 		) or_return
 	}
 
-	t := new(Node_Output, p.allocator)
+	t := alloc_node_output(p)
 	t.derived = t
 	t.open = open_token
 	t.expression = expr_tok
-	t.close = close_tok
 
 	is_super := validate_and_classify_output_expr(p, t) or_return
 	if is_super {
 		if p.in_block <= 0 {
 			error(p, open_token.pos, "\"super()\" can only be used inside a \"block\" tag") or_return
 		}
-		sup := new(Node_Super, p.allocator)
+		sup := alloc_parser_node(p, Node_Super)
 		sup.derived = sup
 		sup.open = open_token
 		sup.super_tok = expr_tok
-		sup.close = close_tok
 		return sup, true
 	}
 
@@ -430,7 +512,7 @@ parse_output :: proc(p: ^Parser, open_token: Token) -> (n: Node, ok: bool) {
 }
 
 parse_text :: proc(p: ^Parser, text_token: Token) -> ^Node_Text {
-	t := new(Node_Text, p.allocator)
+	t := alloc_node_text(p)
 	t.derived = t
 
 	t.text = text_token
@@ -506,10 +588,9 @@ parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = 
 parse_let :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Let, ok: bool) {
 	assert(process_type.type == .Let)
 
-	t = new(Node_Let, p.allocator)
+	t = alloc_parser_node(p, Node_Let)
 	t.derived = t
 	t.open = process
-	t.let_tok = process_type
 
 	expr_tok := lexer_next(&p.lexer)
 	if expr_tok.type != .Text || len(strings.trim_space(expr_tok.value)) == 0 {
@@ -548,13 +629,13 @@ parse_let :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_
 
 	t.assignment = expr_tok
 	t.has_type_decl = has_type_decl
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.close.pos,
+			close_tok.pos,
 			"invalid token following `let` assignment, expected \"%%}\", got: %q",
-			t.close.value,
+			close_tok.value,
 		) or_return
 	}
 
@@ -630,30 +711,30 @@ find_top_level_colon :: proc(s: string) -> int {
 }
 
 parse_switch :: proc(p: ^Parser, process: Token, process_type: Token, is_partial: bool) -> (t: ^Node_Switch, ok: bool) {
-	t = new(Node_Switch, p.allocator)
+	t = alloc_parser_node(p, Node_Switch)
 	t.derived = t
 	t.open = process
-	t.switch_tok = process_type
 	t.is_partial = is_partial
-	t.cases.allocator = p.allocator
+	t.cases = make([dynamic]^Node_Case, 0, 3, p.allocator)
 
 	next := lexer_next(&p.lexer)
+	close_tok: Token
 	if next.type == .Text {
 		if len(strings.trim_space(next.value)) > 0 {
 			validate_switch_header_expr(p, next, is_partial) or_return
 			t.expression = next
 		}
-		t.close = lexer_next(&p.lexer)
+		close_tok = lexer_next(&p.lexer)
 	} else {
-		t.close = next
+		close_tok = next
 	}
 
-	if t.close.type != .Process_Close {
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.close.pos,
+			close_tok.pos,
 			"invalid token in \"switch\" tag, expected \"%%}\", got: %q",
-			t.close.value,
+			close_tok.value,
 		) or_return
 	}
 
@@ -695,12 +776,12 @@ parse_switch :: proc(p: ^Parser, process: Token, process_type: Token, is_partial
 
 	has_default := false
 	for stmt_type.type == .Case {
-		c := new(Node_Case, p.allocator)
+		c := alloc_node_case(p)
 		c.open = stmt_open
-		c.case_tok = stmt_type
-		c.body.allocator = p.allocator
+		c.body = make([dynamic]Node, 0, 2, p.allocator)
 
 		case_next := lexer_next(&p.lexer)
+		case_close: Token
 		if case_next.type == .Text {
 			if len(strings.trim_space(case_next.value)) > 0 {
 				validate_case_expr(p, case_next) or_return
@@ -711,21 +792,21 @@ parse_switch :: proc(p: ^Parser, process: Token, process_type: Token, is_partial
 				}
 				has_default = true
 			}
-			c.close = lexer_next(&p.lexer)
+			case_close = lexer_next(&p.lexer)
 		} else {
 			if has_default {
 				error(p, stmt_open.pos, "duplicate default `{{%% case %%}}` in `switch` block") or_return
 			}
 			has_default = true
-			c.close = case_next
+			case_close = case_next
 		}
 
-		if c.close.type != .Process_Close {
+		if case_close.type != .Process_Close {
 			error(
 				p,
-				c.close.pos,
+				case_close.pos,
 				"invalid token in \"case\" tag, expected \"%%}\", got: %q",
-				c.close.value,
+				case_close.value,
 			) or_return
 		}
 
@@ -757,15 +838,13 @@ parse_switch :: proc(p: ^Parser, process: Token, process_type: Token, is_partial
 		error(p, process.pos, "`switch` block must contain at least one `{{%% case %%}}`") or_return
 	}
 
-	t.end.open = stmt_open
-	t.end.end = stmt_type
-	t.end.close = lexer_next(&p.lexer)
-	if t.end.close.type != .Process_Close {
+	end_close := lexer_next(&p.lexer)
+	if end_close.type != .Process_Close {
 		error(
 			p,
-			t.end.close.pos,
+			end_close.pos,
 			"invalid token after \"end\", expected \"%%}\", got: %q",
-			t.end.close.value,
+			end_close.value,
 		) or_return
 	}
 
@@ -778,7 +857,7 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 	open_pos := process.pos
 	process, process_type := process, process_type
 
-	t = new(Node_If, p.allocator)
+	t = alloc_parser_node(p, Node_If)
 	t.derived = t
 	t._if.body.allocator = p.allocator
 	t.elseifs.allocator  = p.allocator
@@ -811,13 +890,13 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 			if_part.start.expr = expr
 		}
 
-		if_part.start.close = lexer_next(&p.lexer)
-		if if_part.start.close.type != .Process_Close {
+		close_tok := lexer_next(&p.lexer)
+		if close_tok.type != .Process_Close {
 			error(
 				p,
-				if_part.start.close.pos,
+				close_tok.pos,
 				"invalid token, expected \"%%}\", got: %q",
-				if_part.start.close.value,
+				close_tok.value,
 			) or_return
 		}
 
@@ -842,7 +921,7 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 
 	process, process_type = parse_if_part(p, &t._if, process, process_type, open_pos) or_return
 	for process_type.type == .ElseIf {
-		part := new(Node_If_Part, p.allocator)
+		part := alloc_parser_node(p, Node_If_Part)
 		part.body.allocator = p.allocator
 		process, process_type = parse_if_part(p, part, process, process_type, open_pos) or_return
 		append(&t.elseifs, part)
@@ -850,7 +929,7 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 
 	#partial switch process_type.type {
 	case .Else:
-		part := new(Node_If_Part, p.allocator)
+		part := alloc_parser_node(p, Node_If_Part)
 		part.body.allocator = p.allocator
 		process, process_type = parse_if_part(p, part, process, process_type, open_pos) or_return
 		t._else = part
@@ -864,11 +943,9 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 		error(p, process_type.pos, "invalid token, expected \"end\", got %q", process_type.value) or_return
 	}
 
-	t.end.open = process
-	t.end.end = process_type
-	t.end.close = lexer_next(&p.lexer)
-	if t.end.close.type != .Process_Close {
-		error(p, t.end.close.pos, "invalid token after \"end\", expected \"%%}\", got: %q", t.end.close.value) or_return
+	end_close := lexer_next(&p.lexer)
+	if end_close.type != .Process_Close {
+		error(p, end_close.pos, "invalid token after \"end\", expected \"%%}\", got: %q", end_close.value) or_return
 	}
 
 	ok = true
@@ -878,12 +955,11 @@ parse_if :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_I
 parse_for :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_For, ok: bool) {
 	assert(process_type.type == .For)
 
-	t = new(Node_For, p.allocator)
+	t = alloc_parser_node(p, Node_For)
 	t.derived = t
-	t.body.allocator = p.allocator
+	t.body = make([dynamic]Node, 0, 12, p.allocator)
 
 	t.start.open = process
-	t.start._for = process_type
 
 	t.start.expression = lexer_next(&p.lexer)
 	if t.start.expression.type != .Text {
@@ -897,18 +973,18 @@ parse_for :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_
 
 	validate_for_clause_expr(p, t.start.expression) or_return
 
-	t.start.close = lexer_next(&p.lexer)
-	if t.start.close.type != .Process_Close {
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.start.close.pos,
+			close_tok.pos,
 			"invalid token following the for expression %q, expected \"%%}\", got: %q",
 			t.start.expression.value,
-			t.start.close.value,
+			close_tok.value,
 		) or_return
 	}
 
-	t.end.open, t.end.end = parse_body(
+	_, end_tok := parse_body(
 		p,
 		&t.body,
 		proc(t: Token) -> bool { return t.type == .End },
@@ -916,13 +992,13 @@ parse_for :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_
 		process.pos,
 	) or_return
 
-	t.end.close = lexer_next(&p.lexer)
-	if t.end.close.type != .Process_Close {
+	end_close := lexer_next(&p.lexer)
+	if end_close.type != .Process_Close {
 		error(
 			p,
-			t.end.end.pos,
+			end_tok.pos,
 			"invalid token following the \"{{%% end\", expected \"%%}\", got: %q",
-			t.end.end.value,
+			end_tok.value,
 		) or_return
 	}
 
@@ -933,11 +1009,10 @@ parse_for :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_
 parse_block :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Block, ok: bool) {
 	assert(process_type.type == .Block)
 
-	t = new(Node_Block, p.allocator)
+	t = alloc_node_block(p)
 	t.derived = t
-	t.body.allocator = p.allocator
+	t.body = make([dynamic]Node, 0, 8, p.allocator)
 	t.open = process
-	t.block = process_type
 
 	name_tok := lexer_next(&p.lexer)
 	if name_tok.type != .Text {
@@ -962,21 +1037,21 @@ parse_block :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 	t.name_tok = name_tok
 	t.name = name
 
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.close.pos,
+			close_tok.pos,
 			"invalid token following block name %q, expected \"%%}\", got: %q",
 			name,
-			t.close.value,
+			close_tok.value,
 		) or_return
 	}
 
 	p.in_block += 1
 	defer p.in_block -= 1
 
-	t.end.open, t.end.end = parse_body(
+	_, _ = parse_body(
 		p,
 		&t.body,
 		proc(t: Token) -> bool { return t.type == .End },
@@ -984,13 +1059,13 @@ parse_block :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 		process.pos,
 	) or_return
 
-	t.end.close = lexer_next(&p.lexer)
-	if t.end.close.type != .Process_Close {
+	end_close := lexer_next(&p.lexer)
+	if end_close.type != .Process_Close {
 		error(
 			p,
-			t.end.close.pos,
+			end_close.pos,
 			"invalid token after \"end\", expected \"%%}\", got: %q",
-			t.end.close.value,
+			end_close.value,
 		) or_return
 	}
 
@@ -1008,10 +1083,9 @@ parse_extends :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^N
 		error(p, process.pos, "\"extends\" must be at the top level of a template") or_return
 	}
 
-	t = new(Node_Extends, p.allocator)
+	t = alloc_parser_node(p, Node_Extends)
 	t.derived = t
 	t.open = process
-	t.extends = process_type
 
 	t.path = lexer_next(&p.lexer)
 	if t.path.type != .Embed_Path || len(t.path.value) < 2 || t.path.value[len(t.path.value)-1] != '"' {
@@ -1027,9 +1101,9 @@ parse_extends :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^N
 		error(p, t.path.pos, "invalid extends path, expected a non-empty path, got: %q", t.path.value) or_return
 	}
 
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
-		error(p, t.close.pos, "invalid token after extends path, expected \"%%}\", got: %q", t.close.value) or_return
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
+		error(p, close_tok.pos, "invalid token after extends path, expected \"%%}\", got: %q", close_tok.value) or_return
 	}
 
 	ok = true
@@ -1043,14 +1117,14 @@ parse_super :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 		error(p, process.pos, "\"super\" can only be used inside a \"block\" tag") or_return
 	}
 
-	t = new(Node_Super, p.allocator)
+	t = alloc_parser_node(p, Node_Super)
 	t.derived = t
 	t.open = process
 	t.super_tok = process_type
 
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
-		error(p, t.close.pos, "invalid token after \"super\", expected \"%%}\", got: %q", t.close.value) or_return
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
+		error(p, close_tok.pos, "invalid token after \"super\", expected \"%%}\", got: %q", close_tok.value) or_return
 	}
 
 	ok = true
@@ -1064,11 +1138,10 @@ parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 		error(p, process.pos, "\"macro\" must be declared at the top level of a template") or_return
 	}
 
-	t = new(Node_Macro, p.allocator)
+	t = alloc_parser_node(p, Node_Macro)
 	t.derived = t
 	t.body.allocator = p.allocator
 	t.open = process
-	t.macro_tok = process_type
 
 	sig_tok := lexer_next(&p.lexer)
 	if sig_tok.type != .Text || len(strings.trim_space(sig_tok.value)) == 0 {
@@ -1082,14 +1155,14 @@ parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 	validate_macro_signature(p, sig_tok, t) or_return
 
 	t.signature = sig_tok
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.close.pos,
+			close_tok.pos,
 			"invalid token following macro signature %q, expected \"%%}\", got: %q",
 			t.name,
-			t.close.value,
+			close_tok.value,
 		) or_return
 	}
 
@@ -1097,7 +1170,7 @@ parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 	p.in_block = 0
 	defer p.in_block = prev_in_block
 
-	t.end.open, t.end.end = parse_body(
+	_, _ = parse_body(
 		p,
 		&t.body,
 		proc(tok: Token) -> bool { return tok.type == .End },
@@ -1105,13 +1178,13 @@ parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 		process.pos,
 	) or_return
 
-	t.end.close = lexer_next(&p.lexer)
-	if t.end.close.type != .Process_Close {
+	end_close := lexer_next(&p.lexer)
+	if end_close.type != .Process_Close {
 		error(
 			p,
-			t.end.close.pos,
+			end_close.pos,
 			"invalid token after \"end\", expected \"%%}\", got: %q",
-			t.end.close.value,
+			end_close.value,
 		) or_return
 	}
 
@@ -1122,10 +1195,9 @@ parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 parse_call :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Call, ok: bool) {
 	assert(process_type.type == .Call)
 
-	t = new(Node_Call, p.allocator)
+	t = alloc_node_call(p)
 	t.derived = t
 	t.open = process
-	t.call_tok = process_type
 
 	expr_tok := lexer_next(&p.lexer)
 	if expr_tok.type != .Text || len(strings.trim_space(expr_tok.value)) == 0 {
@@ -1139,13 +1211,13 @@ parse_call :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node
 	validate_call_expr(p, expr_tok, t) or_return
 
 	t.call_expr = expr_tok
-	t.close = lexer_next(&p.lexer)
-	if t.close.type != .Process_Close {
+	close_tok := lexer_next(&p.lexer)
+	if close_tok.type != .Process_Close {
 		error(
 			p,
-			t.close.pos,
+			close_tok.pos,
 			"invalid token following \"call\" expression, expected \"%%}\", got: %q",
-			t.close.value,
+			close_tok.value,
 		) or_return
 	}
 
@@ -1171,7 +1243,7 @@ parse_prefixed_odin_expr :: proc(
 
 	op: odin_parser.Parser
 	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic, false)
+	init_odin_snippet_parser(p, &op, &file, synthetic, false)
 
 	expr = odin_parser.parse_expr(&op, false)
 	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
@@ -1222,8 +1294,10 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		return error(p, name_pos, "invalid macro name %q, expected a valid identifier", name)
 	}
 
-	if p.seen_macros[name] {
-		return error(p, name_pos, "duplicate macro definition %q in template", name)
+	for i in 0 ..< p.seen_macro_cnt {
+		if p.seen_macros[i] == name {
+			return error(p, name_pos, "duplicate macro definition %q in template", name)
+		}
 	}
 
 	prefix :: "proc"
@@ -1244,13 +1318,14 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		return error(p, tok.pos, "invalid macro signature: macros cannot declare a return type")
 	}
 
-	out_node.param_names = make([dynamic]string, p.allocator)
+	if out_node.param_names == nil {
+		out_node.param_names = make([dynamic]string, p.allocator)
+	}
 	out_node.min_args = 0
 	out_node.max_args = 0
 	out_node.has_varargs = false
 
 	if proc_type.params != nil {
-		seen_params := make(map[string]bool, p.allocator)
 		for field in proc_type.params.list {
 			field_syn_off := field.pos.offset
 			if field_syn_off <= 0 && field.type != nil {
@@ -1281,10 +1356,11 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 				if !is_ident {
 					return error(p, param_pos, "invalid parameter name in macro %q", name)
 				}
-				if seen_params[ident.name] {
-					return error(p, param_pos, "duplicate parameter %q in macro %q", ident.name, name)
+				for prev_p in out_node.param_names {
+					if prev_p == ident.name {
+						return error(p, param_pos, "duplicate parameter %q in macro %q", ident.name, name)
+					}
 				}
-				seen_params[ident.name] = true
 				append(&out_node.param_names, ident.name)
 				if is_vararg {
 					out_node.has_varargs = true
@@ -1298,7 +1374,10 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		}
 	}
 
-	p.seen_macros[name] = true
+	if p.seen_macro_cnt < len(p.seen_macros) {
+		p.seen_macros[p.seen_macro_cnt] = name
+		p.seen_macro_cnt += 1
+	}
 	out_node.name = name
 	if proc_type.params != nil && len(proc_type.params.list) > 0 {
 		close_paren_off := proc_type.end.offset - 1
@@ -1313,9 +1392,94 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 }
 
 @(private = "file")
+try_fast_validate_call_expr :: proc(p: ^Parser, tok: Token, raw_src: string, out_node: ^Node_Call) -> bool {
+	if len(raw_src) < 3 || raw_src[len(raw_src) - 1] != ')' {
+		return false
+	}
+	open_p := strings.index_byte(raw_src, '(')
+	if open_p <= 0 {
+		return false
+	}
+	name_lead := 0
+	for name_lead < open_p && is_ws(raw_src[name_lead]) {
+		name_lead += 1
+	}
+	name := strings.trim_space(raw_src[:open_p])
+	if !is_valid_non_keyword_ident(name) {
+		return false
+	}
+
+	inner_args := raw_src[open_p + 1 : len(raw_src) - 1]
+	trimmed_inner := strings.trim_space(inner_args)
+	out_node.name = name
+	out_node.name_pos = advance_pos_by_offset(tok.pos, raw_src, name_lead)
+	out_node.arg_count = 0
+	out_node.args = nil
+
+	if len(trimmed_inner) == 0 {
+		out_node.args_src = ""
+		return true
+	}
+
+	// Fast path for comma-separated simple arguments (clean string literals or simple selector chains)
+	// with no nested parentheses, brackets, braces, comments, or '=' named arguments.
+	in_quote := false
+	for i := 0; i < len(inner_args); i += 1 {
+		c := inner_args[i]
+		if in_quote {
+			if c == '\\' || c == '\n' || c == '\r' {
+				return false
+			}
+			if c == '"' {
+				in_quote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			in_quote = true
+		case '(', ')', '[', ']', '{', '}', '=', '/', '`', '\'':
+			return false
+		}
+	}
+	if in_quote {
+		return false
+	}
+
+	parsed_count := 0
+	seg_start := 0
+	for i := 0; i <= len(inner_args); i += 1 {
+		if i == len(inner_args) || inner_args[i] == ',' {
+			seg := inner_args[seg_start:i]
+			arg_trimmed := strings.trim_space(seg)
+			if len(arg_trimmed) == 0 {
+				if i == len(inner_args) && parsed_count > 0 {
+					// Trailing comma after valid arguments
+					break
+				}
+				return false
+			}
+			if !is_simple_clean_string_literal(arg_trimmed) && !is_simple_selector_expr(arg_trimmed) {
+				return false
+			}
+			parsed_count += 1
+			seg_start = i + 1
+		}
+	}
+
+	out_node.arg_count = parsed_count
+	out_node.args_src = strip_trailing_comma_and_comments(inner_args)
+	return true
+}
+
+@(private = "file")
 validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool {
 	raw_src := strings.trim_right_space(tok.value)
 	context.allocator = p.allocator
+
+	if try_fast_validate_call_expr(p, tok, raw_src, out_node) {
+		return true
+	}
 
 	expr, _ := parse_prefixed_odin_expr(p, tok, raw_src, "", "\"call\" tag") or_return
 
@@ -1341,7 +1505,6 @@ validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool
 	out_node.args = make([dynamic]Call_Arg_Info, 0, len(call.args), p.allocator)
 
 	seen_named := false
-	seen_arg_names := make(map[string]bool, p.allocator)
 	for arg in call.args {
 		arg_pos := advance_pos_by_offset(tok.pos, raw_src, arg.pos.offset)
 		if fv, is_fv := arg.derived_expr.(^ast.Field_Value); is_fv {
@@ -1350,10 +1513,11 @@ validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool
 			if !is_field_ident {
 				return error(p, arg_pos, "invalid named argument in call to macro %q: expected parameter identifier", ident.name)
 			}
-			if seen_arg_names[field_ident.name] {
-				return error(p, arg_pos, "duplicate argument %q in call to macro %q", field_ident.name, ident.name)
+			for prev_arg in out_node.args {
+				if prev_arg.name == field_ident.name {
+					return error(p, arg_pos, "duplicate argument %q in call to macro %q", field_ident.name, ident.name)
+				}
 			}
-			seen_arg_names[field_ident.name] = true
 			append(&out_node.args, Call_Arg_Info{name = field_ident.name, pos = arg_pos})
 		} else {
 			if seen_named {
@@ -1369,13 +1533,14 @@ validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool
 	}
 
 	inner_args := raw_src[call.open.offset + 1 : call.close.offset]
+	out_node.arg_count = len(out_node.args)
 	out_node.args_src = strip_trailing_comma_and_comments(inner_args)
 	return true
 }
 
 check_macro_call_node :: proc(
 	call_node: ^Node_Call,
-	macros: map[string]^Node_Macro,
+	macros: []^Node_Macro,
 	allocator := context.temp_allocator,
 ) -> (
 	err_pos: Pos,
@@ -1383,8 +1548,14 @@ check_macro_call_node :: proc(
 	err_msg: string,
 	ok: bool,
 ) {
-	mac, found := macros[call_node.name]
-	if !found {
+	mac: ^Node_Macro
+	for m in macros {
+		if m.name == call_node.name {
+			mac = m
+			break
+		}
+	}
+	if mac == nil {
 		if len(macros) == 0 {
 			return call_node.name_pos,
 				len(call_node.name),
@@ -1392,8 +1563,8 @@ check_macro_call_node :: proc(
 				false
 		}
 		valid_names := make([dynamic]string, 0, len(macros), allocator)
-		for k in macros {
-			append(&valid_names, k)
+		for m in macros {
+			append(&valid_names, m.name)
 		}
 		for i := 1; i < len(valid_names); i += 1 {
 			key := valid_names[i]
@@ -1429,7 +1600,7 @@ check_macro_call_node :: proc(
 		}
 	}
 
-	n_args := len(call_node.args)
+	n_args := call_node.arg_count if len(call_node.args) == 0 else len(call_node.args)
 	if mac.has_varargs {
 		if n_args < mac.min_args {
 			return call_node.name_pos,
@@ -1458,20 +1629,35 @@ check_macro_call_node :: proc(
 
 @(private = "file")
 validate_standalone_macro_calls :: proc(p: ^Parser) {
-	macros := make(map[string]^Node_Macro, p.allocator)
+	inline_macros: [16]^Node_Macro
+	macro_count := 0
+	var_macros: [dynamic]^Node_Macro
+
 	for node in p.template.content {
 		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-			macros[mac.name] = mac
+			if macro_count < len(inline_macros) {
+				inline_macros[macro_count] = mac
+				macro_count += 1
+			} else {
+				if var_macros == nil {
+					var_macros = make([dynamic]^Node_Macro, 0, macro_count * 2, p.allocator)
+					for m in inline_macros {
+						append(&var_macros, m)
+					}
+				}
+				append(&var_macros, mac)
+			}
 		}
 	}
-	_ = validate_calls_in_parser_nodes(p, p.template.content[:], macros)
+	macros_slice := var_macros[:] if var_macros != nil else inline_macros[:macro_count]
+	_ = validate_calls_in_parser_nodes(p, p.template.content[:], macros_slice)
 }
 
 @(private = "file")
 validate_calls_in_parser_nodes :: proc(
 	p: ^Parser,
 	nodes: []Node,
-	macros: map[string]^Node_Macro,
+	macros: []^Node_Macro,
 ) -> bool {
 	for node in nodes {
 		switch d in node.derived {
@@ -1505,6 +1691,29 @@ validate_calls_in_parser_nodes :: proc(
 
 @(private = "file")
 strip_trailing_comma_and_comments :: proc(s: string) -> string {
+	// Fast path when no `//` or `/*` comments are present
+	if strings.index_byte(s, '/') == -1 {
+		end := len(s)
+		for end > 0 {
+			c := s[end - 1]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' {
+				end -= 1
+			} else {
+				break
+			}
+		}
+		start := 0
+		for start < end {
+			c := s[start]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				start += 1
+			} else {
+				break
+			}
+		}
+		return s[start:end]
+	}
+
 	t: tokenizer.Tokenizer
 	tokenizer.init(&t, s, "snippet", odin_silent_err_handler)
 	t.flags += {.Insert_Semicolon}
@@ -1551,10 +1760,10 @@ parse_body :: proc(
 
 		switch tok.type {
 		case .Output_Open:
-			append(container, parse_output(p, tok) or_return)
+			append_parsed_node(p, container, parse_output(p, tok) or_return)
 
 		case .Text:
-			append(container, parse_text(p, tok))
+			append_parsed_node(p, container, parse_text(p, tok))
 
 		case .Process_Open:
 			parser_maybe_remove_whitespace(p, tok)
@@ -1590,7 +1799,7 @@ parse_body :: proc(
 				) or_return
 			}
 
-			append(container, parse_process(p, tok, process_type) or_return)
+			append_parsed_node(p, container, parse_process(p, tok, process_type) or_return)
 
 		case .EOF:
 			error(
@@ -1614,12 +1823,11 @@ parse_body :: proc(
 parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Embed, ok: bool) {
 	assert(process_type.type == .Embed)
 
-	t = new(Node_Embed, p.allocator)
+	t = alloc_parser_node(p, Node_Embed)
 	t.derived = t
 	t.props.allocator = p.allocator
 
-	t.open  = process
-	t.embed = process_type
+	t.open = process
 
 	t.path = lexer_next(&p.lexer)
 	if t.path.type != .Embed_Path || len(t.path.value) < 2 || t.path.value[len(t.path.value)-1] != '"' {
@@ -1632,7 +1840,7 @@ parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 
 	next := lexer_next(&p.lexer)
 	if next.type == .Embed_With {
-		with := new(Node_Embed_With, p.allocator)
+		with := alloc_parser_node(p, Node_Embed_With)
 		with.with = next
 
 		with.expr = lexer_next(&p.lexer)
@@ -1654,9 +1862,9 @@ parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 			t.with = with
 		}
 
-		t.close = lexer_next(&p.lexer)
-		if t.close.type != .Process_Close {
-			error(p, t.close.pos, "invalid token after with expression, expected \"%%}\", got: %q", t.close.value) or_return
+		close_tok := lexer_next(&p.lexer)
+		if close_tok.type != .Process_Close {
+			error(p, close_tok.pos, "invalid token after with expression, expected \"%%}\", got: %q", close_tok.value) or_return
 		}
 	} else if next.type == .Text {
 		// Support direct call-style `{% embed "card.html"(title = this.title, active = true) %}`
@@ -1666,12 +1874,12 @@ parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 		}
 		parse_embed_props_expr(p, next, &t.props) or_return
 
-		t.close = lexer_next(&p.lexer)
-		if t.close.type != .Process_Close {
-			error(p, t.close.pos, "invalid token after embed props, expected \"%%}\", got: %q", t.close.value) or_return
+		close_tok := lexer_next(&p.lexer)
+		if close_tok.type != .Process_Close {
+			error(p, close_tok.pos, "invalid token after embed props, expected \"%%}\", got: %q", close_tok.value) or_return
 		}
 	} else if next.type == .Process_Close {
-		t.close = next
+		// Valid close token
 	} else {
 		error(p, next.pos, "invalid token after embed path, expected \"with\", \"(props...)\", or \"%%}\", got: %q", next.value) or_return
 	}
@@ -1704,9 +1912,135 @@ try_parse_embed_props :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embed
 }
 
 @(private = "file")
+is_simple_embed_prop_value :: proc(s: string) -> bool {
+	if s == "true" || s == "false" || s == "nil" {
+		return true
+	}
+	if is_simple_clean_string_literal(s) || is_simple_selector_expr(s) {
+		return true
+	}
+	if len(s) > 0 && s[0] >= '0' && s[0] <= '9' {
+		all_digits := true
+		for i in 0 ..< len(s) {
+			if (s[i] < '0' || s[i] > '9') && s[i] != '_' {
+				all_digits = false
+				break
+			}
+		}
+		if all_digits {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+try_fast_parse_embed_props :: proc(p: ^Parser, tok: Token, raw_src: string, out_props: ^[dynamic]Embed_Prop) -> bool {
+	open_p := 0
+	for open_p < len(raw_src) && is_ws(raw_src[open_p]) {
+		open_p += 1
+	}
+	if open_p >= len(raw_src) || raw_src[open_p] != '(' || raw_src[len(raw_src) - 1] != ')' {
+		return false
+	}
+	inner := raw_src[open_p + 1 : len(raw_src) - 1]
+	if len(strings.trim_space(inner)) == 0 {
+		return false
+	}
+
+	// Reject characters that require full Odin expression parsing
+	prop_count := 1
+	in_quote := false
+	for i := 0; i < len(inner); i += 1 {
+		c := inner[i]
+		if in_quote {
+			if c == '\\' || c == '\n' || c == '\r' {
+				return false
+			}
+			if c == '"' {
+				in_quote = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			in_quote = true
+		case '(', ')', '[', ']', '{', '}', '/', '`', '\'', ':', '+', '-', '*', '%', '&', '|', '<', '>', '!':
+			return false
+		case ',':
+			prop_count += 1
+		}
+	}
+	if in_quote {
+		return false
+	}
+
+	temp_props := make([dynamic]Embed_Prop, 0, prop_count, p.allocator)
+	seg_start := 0
+	for i := 0; i <= len(inner); i += 1 {
+		if i == len(inner) || inner[i] == ',' {
+			seg := inner[seg_start:i]
+			lead := 0
+			for lead < len(seg) && is_ws(seg[lead]) {
+				lead += 1
+			}
+			seg_trimmed := strings.trim_space(seg)
+			if len(seg_trimmed) == 0 {
+				if i == len(inner) && len(temp_props) > 0 {
+					break
+				}
+				return false
+			}
+			arg_pos := advance_pos_by_offset(tok.pos, raw_src, open_p + 1 + seg_start + lead)
+			prop_name: string
+			val_str: string
+
+			if eq_idx := strings.index_byte(seg_trimmed, '='); eq_idx != -1 {
+				lhs := strings.trim_space(seg_trimmed[:eq_idx])
+				rhs := strings.trim_space(seg_trimmed[eq_idx + 1:])
+				if !is_valid_non_keyword_ident(lhs) || !is_simple_embed_prop_value(rhs) {
+					return false
+				}
+				prop_name = lhs
+				val_str = rhs
+			} else if is_simple_selector_expr(seg_trimmed) {
+				if dot_idx := strings.last_index_byte(seg_trimmed, '.'); dot_idx != -1 {
+					prop_name = seg_trimmed[dot_idx + 1:]
+				} else {
+					prop_name = seg_trimmed
+				}
+				val_str = seg_trimmed
+			} else {
+				return false
+			}
+
+			for prev_prop in temp_props {
+				if prev_prop.name == prop_name {
+					return false
+				}
+			}
+
+			append(&temp_props, Embed_Prop{
+				name     = prop_name,
+				val_expr = val_str,
+				pos      = arg_pos,
+			})
+			seg_start = i + 1
+		}
+	}
+
+	out_props^ = temp_props
+	return true
+}
+
+@(private = "file")
 parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embed_Prop) -> bool {
 	raw_src := strings.trim_right_space(tok.value)
 	context.allocator = p.allocator
+
+	if try_fast_parse_embed_props(p, tok, raw_src, out_props) {
+		return true
+	}
 
 	prefix :: "__component"
 	expr, synthetic := parse_prefixed_odin_expr(p, tok, raw_src, prefix, "embed props") or_return
@@ -1715,8 +2049,6 @@ parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embe
 	if !is_call || len(call.args) == 0 {
 		return error(p, tok.pos, "embed props list cannot be empty; pass at least one prop or omit parentheses")
 	}
-
-	seen_names := make(map[string]bool, p.allocator)
 
 	for arg, i in call.args {
 		arg_limit := call.args[i + 1].pos.offset if i + 1 < len(call.args) else call.close.offset
@@ -1756,10 +2088,11 @@ parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embe
 			)
 		}
 
-		if seen_names[prop_name] {
-			return error(p, arg_pos, "duplicate prop %q in embed tag", prop_name)
+		for prev_prop in out_props^ {
+			if prev_prop.name == prop_name {
+				return error(p, arg_pos, "duplicate prop %q in embed tag", prop_name)
+			}
 		}
-		seen_names[prop_name] = true
 
 		append(out_props, Embed_Prop{
 			name     = prop_name,
@@ -1768,6 +2101,57 @@ parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embe
 		})
 	}
 
+	return true
+}
+
+@(private = "file")
+is_odin_reserved_keyword :: proc(s: string) -> bool {
+	switch s {
+	case "asm", "auto_cast", "bit_field", "bit_set", "break", "case", "cast",
+	     "continue", "defer", "distinct", "do", "dynamic", "else", "enum",
+	     "fallthrough", "for", "foreign", "if", "import", "in", "map",
+	     "matrix", "not_in", "or_break", "or_continue", "or_else", "or_return",
+	     "package", "proc", "return", "struct", "switch", "transmute",
+	     "typeid", "union", "using", "when", "where":
+		return true
+	}
+	return false
+}
+
+@(private = "file")
+is_valid_non_keyword_ident :: proc(s: string) -> bool {
+	return is_valid_block_ident(s) && !is_odin_reserved_keyword(s)
+}
+
+@(private = "file")
+is_simple_selector_expr :: proc(s: string) -> bool {
+	if len(s) == 0 {
+		return false
+	}
+	seg_start := 0
+	for i := 0; i <= len(s); i += 1 {
+		if i == len(s) || s[i] == '.' {
+			seg := s[seg_start:i]
+			if !is_valid_non_keyword_ident(seg) {
+				return false
+			}
+			seg_start = i + 1
+		}
+	}
+	return true
+}
+
+@(private = "file")
+is_simple_clean_string_literal :: proc(s: string) -> bool {
+	if len(s) < 2 || s[0] != '"' || s[len(s) - 1] != '"' {
+		return false
+	}
+	for i := 1; i < len(s) - 1; i += 1 {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1827,13 +2211,12 @@ advance_pos_by_offset :: proc(base: Pos, src: string, byte_offset: int) -> Pos {
 }
 
 @(private = "file")
-init_odin_snippet_parser :: proc(op: ^odin_parser.Parser, file: ^ast.File, src: string, insert_semicolon := true) {
-	NO_POS :: tokenizer.Pos{}
+init_odin_snippet_parser :: proc(p: ^Parser, op: ^odin_parser.Parser, file: ^ast.File, src: string, insert_semicolon := true) {
 	op^ = odin_parser.default_parser()
 	op.err = odin_silent_err_handler
 	op.warn = odin_silent_warn_handler
 	file^ = {}
-	file.pkg = ast.new(ast.Package, NO_POS, NO_POS)
+	file.pkg = &p.dummy_odin_pkg
 	file.src = src
 	file.fullpath = "template"
 	op.file = file
@@ -1846,6 +2229,203 @@ init_odin_snippet_parser :: proc(op: ^odin_parser.Parser, file: ^ast.File, src: 
 }
 
 @(private = "file")
+is_simple_int_literal :: proc(s: string) -> bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i += 1 {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (i > 0 && c == '_')) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private = "file")
+is_simple_value_expr :: proc(s: string) -> bool {
+	if is_simple_selector_expr(s) {
+		return true
+	}
+	if strings.has_prefix(s, "len(") && s[len(s) - 1] == ')' {
+		return is_simple_selector_expr(strings.trim_space(s[4 : len(s) - 1]))
+	}
+	for i := 1; i < len(s) - 1; i += 1 {
+		if s[i] == '+' || s[i] == '-' {
+			lhs := strings.trim_space(s[:i])
+			rhs := strings.trim_space(s[i + 1:])
+			if is_simple_selector_expr(lhs) && (is_simple_int_literal(rhs) || is_simple_selector_expr(rhs)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+@(private = "file")
+try_fast_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output, trimmed: string) -> (matched: bool, is_super: bool) {
+	if trimmed == "super()" {
+		return true, true
+	}
+	if is_simple_selector_expr(trimmed) {
+		node.write_kind = .Escaped_String
+		node.inner_expr = trimmed
+		return true, false
+	}
+
+	// Single-pipe and two-stage pipe fast path: `<simple_expr> | <filter>` or `<simple_expr> | <stage1> | <stage2>`
+	if pipe_idx := strings.index_byte(trimmed, '|'); pipe_idx > 0 {
+		lhs := strings.trim_space(trimmed[:pipe_idx])
+		rhs := strings.trim_space(trimmed[pipe_idx + 1:])
+		if is_simple_value_expr(lhs) {
+			second_pipe := strings.index_byte(rhs, '|')
+			if second_pipe == -1 {
+				if is_valid_non_keyword_ident(rhs) {
+					switch rhs {
+					case "raw":
+						node.write_kind = .Raw_String
+						node.inner_expr = lhs
+						return true, false
+					case "magic":
+						node.write_kind = .Magic_String
+						node.inner_expr = lhs
+						return true, false
+					case "url":
+						node.write_kind = .Url_String
+						node.inner_expr = lhs
+						return true, false
+					case "url_param":
+						node.write_kind = .Url_Param_String
+						node.inner_expr = lhs
+						return true, false
+					case "js", "json":
+						node.write_kind = .Js_String
+						node.inner_expr = lhs
+						return true, false
+					case "len":
+						node.write_kind = .Int
+						node.inner_expr = lhs
+						node.wrap_call = "len"
+						return true, false
+					case "int", "uint", "i64", "u64", "i128", "u128", "f32", "f64", "byte", "rune":
+						node.write_kind = cast_name_to_write_kind(rhs)
+						node.inner_expr = lhs
+						node.wrap_call = rhs
+						return true, false
+					}
+				} else if strings.has_prefix(rhs, "default(") && rhs[len(rhs) - 1] == ')' {
+					arg := strings.trim_space(rhs[8 : len(rhs) - 1])
+					if is_simple_clean_string_literal(arg) || is_simple_selector_expr(arg) {
+						node.write_kind = .Escaped_String
+						node.inner_expr = lhs
+						node.default_arg = arg
+						return true, false
+					}
+				} else if strings.has_prefix(rhs, "fmt(") && rhs[len(rhs) - 1] == ')' {
+					arg := strings.trim_space(rhs[4 : len(rhs) - 1])
+					if is_simple_clean_string_literal(arg) {
+						node.write_kind = .Fmt_Escaped
+						node.fmt_str = arg
+						node.inner_expr = lhs
+						return true, false
+					}
+				}
+			} else if second_pipe > 0 {
+				stage1 := strings.trim_space(rhs[:second_pipe])
+				stage2 := strings.trim_space(rhs[second_pipe + 1:])
+				if strings.index_byte(stage2, '|') == -1 {
+					if strings.has_prefix(stage1, "default(") && stage1[len(stage1) - 1] == ')' {
+						def_arg := strings.trim_space(stage1[8 : len(stage1) - 1])
+						if is_simple_clean_string_literal(def_arg) || is_simple_selector_expr(def_arg) {
+							if is_valid_non_keyword_ident(stage2) {
+								switch stage2 {
+								case "raw":
+									node.write_kind = .Raw_String
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									return true, false
+								case "magic":
+									node.write_kind = .Magic_String
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									return true, false
+								case "url":
+									node.write_kind = .Url_String
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									return true, false
+								case "url_param":
+									node.write_kind = .Url_Param_String
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									return true, false
+								case "js", "json":
+									node.write_kind = .Js_String
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									return true, false
+								case "len":
+									node.write_kind = .Int
+									node.inner_expr = lhs
+									node.default_arg = def_arg
+									node.wrap_call = "len"
+									return true, false
+								}
+							}
+						}
+					} else if strings.has_prefix(stage1, "fmt(") && stage1[len(stage1) - 1] == ')' && stage2 == "raw" {
+						fmt_arg := strings.trim_space(stage1[4 : len(stage1) - 1])
+						if is_simple_clean_string_literal(fmt_arg) {
+							node.write_kind = .Fmt_Raw
+							node.fmt_str = fmt_arg
+							node.inner_expr = lhs
+							return true, false
+						}
+					}
+				}
+			}
+		}
+		return false, false
+	}
+
+	// Simple single-arg function/cast call: `int(total_rows)`, `int(idx + 1)`, `raw(this.html)`, etc.
+	if open_p := strings.index_byte(trimmed, '('); open_p > 0 && trimmed[len(trimmed) - 1] == ')' {
+		fn_name := trimmed[:open_p]
+		arg := strings.trim_space(trimmed[open_p + 1 : len(trimmed) - 1])
+		if is_simple_value_expr(arg) {
+			switch fn_name {
+			case "byte", "rune", "int", "len", "uint", "i128", "u128", "u64", "i64", "f32", "f64":
+				node.write_kind = cast_name_to_write_kind(fn_name)
+				node.inner_expr = trimmed
+				return true, false
+			case "raw":
+				node.write_kind = .Raw_String
+				node.inner_expr = arg
+				return true, false
+			case "magic":
+				node.write_kind = .Magic_String
+				node.inner_expr = arg
+				return true, false
+			case "url":
+				node.write_kind = .Url_String
+				node.inner_expr = arg
+				return true, false
+			case "url_param":
+				node.write_kind = .Url_Param_String
+				node.inner_expr = arg
+				return true, false
+			case "js", "json":
+				node.write_kind = .Js_String
+				node.inner_expr = arg
+				return true, false
+			}
+		}
+	}
+
+	return false, false
+}
+
+@(private = "file")
 validate_and_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output) -> (is_super: bool, ok: bool) {
 	raw_src := node.expression.value
 	trimmed := strings.trim_space(raw_src)
@@ -1853,11 +2433,15 @@ validate_and_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output) -> (is
 		return false, error(p, node.expression.pos, "empty output expression inside \"{{ ... }}\"")
 	}
 
+	if matched, fast_super := try_fast_classify_output_expr(p, node, trimmed); matched {
+		return fast_super, true
+	}
+
 	context.allocator = p.allocator
 
 	op: odin_parser.Parser
 	file: ast.File
-	init_odin_snippet_parser(&op, &file, raw_src, false)
+	init_odin_snippet_parser(p, &op, &file, raw_src, false)
 
 	expr := odin_parser.parse_expr(&op, false)
 	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
@@ -2186,21 +2770,51 @@ validate_let_assignment_expr :: proc(p: ^Parser, tok: Token, eq_idx: int) -> (ha
 	lhs_slice := raw_src[:eq_idx]
 	rhs_slice := raw_src[eq_idx+1:]
 	lhs_trimmed := strings.trim_space(lhs_slice)
+	rhs_trimmed := strings.trim_space(rhs_slice)
+
+	ident_candidate := strings.trim_space(lhs_trimmed[:len(lhs_trimmed)-1]) if strings.has_suffix(lhs_trimmed, ":") else lhs_trimmed
+	if is_valid_non_keyword_ident(ident_candidate) {
+		if is_simple_selector_expr(rhs_trimmed) || is_simple_clean_string_literal(rhs_trimmed) {
+			return false, true
+		}
+		if strings.has_prefix(rhs_trimmed, "len(") && rhs_trimmed[len(rhs_trimmed)-1] == ')' {
+			if is_simple_selector_expr(strings.trim_space(rhs_trimmed[4 : len(rhs_trimmed)-1])) {
+				return false, true
+			}
+		}
+	}
 
 	synthetic: string
+	stack_buf: [512]byte
 	if strings.has_suffix(lhs_trimmed, ":") {
 		ident_part := strings.trim_space(lhs_trimmed[:len(lhs_trimmed)-1])
-		synthetic = strings.concatenate({ident_part, " :=", rhs_slice}, p.allocator)
+		total_len := len(ident_part) + 3 + len(rhs_slice)
+		if total_len <= len(stack_buf) {
+			copy(stack_buf[0:], ident_part)
+			copy(stack_buf[len(ident_part):], " :=")
+			copy(stack_buf[len(ident_part)+3:], rhs_slice)
+			synthetic = string(stack_buf[:total_len])
+		} else {
+			synthetic = strings.concatenate({ident_part, " :=", rhs_slice}, p.allocator)
+		}
 	} else if find_top_level_colon(lhs_trimmed) != -1 {
 		has_type_decl = true
 		synthetic = raw_src
 	} else {
-		synthetic = strings.concatenate({lhs_slice, ":=", rhs_slice}, p.allocator)
+		total_len := len(lhs_slice) + 2 + len(rhs_slice)
+		if total_len <= len(stack_buf) {
+			copy(stack_buf[0:], lhs_slice)
+			copy(stack_buf[len(lhs_slice):], ":=")
+			copy(stack_buf[len(lhs_slice)+2:], rhs_slice)
+			synthetic = string(stack_buf[:total_len])
+		} else {
+			synthetic = strings.concatenate({lhs_slice, ":=", rhs_slice}, p.allocator)
+		}
 	}
 
 	op: odin_parser.Parser
 	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic)
+	init_odin_snippet_parser(p, &op, &file, synthetic)
 
 	dummy_node: ast.Node
 	op.curr_proc = &dummy_node
@@ -2248,10 +2862,20 @@ validate_wrapped_stmt :: proc(p: ^Parser, tok: Token, prefix, suffix, label: str
 	raw_src := strings.trim_right_space(tok.value)
 	context.allocator = p.allocator
 
-	synthetic := strings.concatenate({prefix, raw_src, suffix}, p.allocator)
+	synthetic: string
+	stack_buf: [512]byte
+	total_len := len(prefix) + len(raw_src) + len(suffix)
+	if total_len <= len(stack_buf) {
+		copy(stack_buf[0:], prefix)
+		copy(stack_buf[len(prefix):], raw_src)
+		copy(stack_buf[len(prefix)+len(raw_src):], suffix)
+		synthetic = string(stack_buf[:total_len])
+	} else {
+		synthetic = strings.concatenate({prefix, raw_src, suffix}, p.allocator)
+	}
 	op: odin_parser.Parser
 	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic)
+	init_odin_snippet_parser(p, &op, &file, synthetic)
 
 	dummy_node: ast.Node
 	op.curr_proc = &dummy_node
@@ -2275,28 +2899,71 @@ validate_wrapped_stmt :: proc(p: ^Parser, tok: Token, prefix, suffix, label: str
 
 @(private = "file")
 validate_case_expr :: proc(p: ^Parser, tok: Token) -> bool {
+	trimmed := strings.trim_space(tok.value)
+	if len(trimmed) > 1 && trimmed[0] == '.' && is_valid_non_keyword_ident(trimmed[1:]) {
+		return true
+	}
+	if is_simple_clean_string_literal(trimmed) || is_simple_selector_expr(trimmed) {
+		return true
+	}
 	return validate_wrapped_stmt(p, tok, "switch { case ", ": }", "\"case\" expression")
 }
 
 @(private = "file")
 validate_switch_header_expr :: proc(p: ^Parser, tok: Token, is_partial: bool) -> bool {
+	trimmed := strings.trim_space(tok.value)
+	if is_simple_selector_expr(trimmed) {
+		return true
+	}
 	prefix := "#partial switch " if is_partial else "switch "
 	return validate_wrapped_stmt(p, tok, prefix, " {}", "\"switch\" expression")
 }
 
 @(private = "file")
 validate_if_condition_expr :: proc(p: ^Parser, tok: Token, tag_name: string) -> bool {
-	if len(strings.trim_space(tok.value)) == 0 {
+	trimmed := strings.trim_space(tok.value)
+	if len(trimmed) == 0 {
 		return error(p, tok.pos, "missing condition expression after %q", tag_name)
 	}
-	label := fmt.aprintf("%q condition", tag_name, allocator = p.allocator)
+	if is_simple_selector_expr(trimmed) {
+		return true
+	}
+	if len(trimmed) > 1 && trimmed[0] == '!' && is_simple_selector_expr(strings.trim_space(trimmed[1:])) {
+		return true
+	}
+	label: string
+	switch tag_name {
+	case "if":
+		label = "\"if\" condition"
+	case "elseif":
+		label = "\"elseif\" condition"
+	case:
+		label = fmt.aprintf("%q condition", tag_name, allocator = p.allocator)
+	}
 	return validate_wrapped_stmt(p, tok, "if ", " {}", label)
 }
 
 @(private = "file")
 validate_for_clause_expr :: proc(p: ^Parser, tok: Token) -> bool {
-	if len(strings.trim_space(tok.value)) == 0 {
+	trimmed := strings.trim_space(tok.value)
+	if len(trimmed) == 0 {
 		return error(p, tok.pos, "missing loop clause after \"for\"")
+	}
+	if in_idx := strings.index(trimmed, " in "); in_idx > 0 {
+		lhs := strings.trim_space(trimmed[:in_idx])
+		rhs := strings.trim_space(trimmed[in_idx + 4:])
+		if is_simple_selector_expr(rhs) {
+			if is_valid_non_keyword_ident(lhs) {
+				return true
+			}
+			if comma_idx := strings.index_byte(lhs, ','); comma_idx > 0 {
+				v1 := strings.trim_space(lhs[:comma_idx])
+				v2 := strings.trim_space(lhs[comma_idx + 1:])
+				if is_valid_non_keyword_ident(v1) && is_valid_non_keyword_ident(v2) {
+					return true
+				}
+			}
+		}
 	}
 	return validate_wrapped_stmt(p, tok, "for ", " {}", "\"for\" clause")
 }
@@ -2312,7 +2979,7 @@ validate_embed_with_expr :: proc(p: ^Parser, tok: Token) -> bool {
 
 	op: odin_parser.Parser
 	file: ast.File
-	init_odin_snippet_parser(&op, &file, raw_src, false)
+	init_odin_snippet_parser(p, &op, &file, raw_src, false)
 
 	expr := odin_parser.parse_expr(&op, false)
 	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {

@@ -35,6 +35,7 @@ driver_init :: proc(t: ^testing.T) -> ^Spec_Driver {
 	d.ctx.allocator = d.alloc
 	d.ctx.stack = make([dynamic]Trace_Frame, d.alloc)
 	d.ctx.raw_cache = make(map[string]Cached_Template, d.alloc)
+	d.ctx.resolved_cache = make(map[string]Template, d.alloc)
 	d.ctx.used_files = make(map[string]bool, d.alloc)
 	d.ctx.diagnostics = make([dynamic]Diagnostic, d.alloc)
 	d.seeded_files = make([dynamic]string, d.alloc)

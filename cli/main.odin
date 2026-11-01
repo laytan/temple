@@ -70,14 +70,100 @@ Cached_Template :: struct {
 }
 
 Compile_Context :: struct {
-	stack:        [dynamic]Trace_Frame,
-	diagnostics:  [dynamic]Diagnostic,
-	raw_cache:    map[string]Cached_Template,
-	used_files:   map[string]bool,
-	allocator:    mem.Allocator,
-	inline_file:  string,
-	inline_pos:   tokenizer.Pos,
-	external_pkg: bool,
+	stack:           [dynamic]Trace_Frame,
+	inline_stack:    [8]Trace_Frame,
+	inline_stack_cnt: int,
+	diagnostics:     [dynamic]Diagnostic,
+	raw_cache:       map[string]Cached_Template,
+	resolved_cache:  map[string]Template,
+	inline_raw:      [8]struct {
+		file:   string,
+		cached: Cached_Template,
+	},
+	inline_raw_cnt:  int,
+	inline_resolved: [8]struct {
+		file:     string,
+		template: Template,
+	},
+	inline_res_cnt:  int,
+	used_files:      map[string]bool,
+	allocator:       mem.Allocator,
+	inline_file:     string,
+	inline_pos:      tokenizer.Pos,
+	external_pkg:    bool,
+	ast_slab:        []byte,
+	ast_slab_off:    int,
+}
+
+@(private = "file")
+alloc_ctx_node :: proc(ctx: ^Compile_Context, $T: typeid) -> ^T {
+	align :: int(align_of(T))
+	size :: int(size_of(T))
+	off := (ctx.ast_slab_off + (align - 1)) & ~(align - 1)
+	if off + size > len(ctx.ast_slab) {
+		slab_bytes := 1024
+		if slab_bytes < size + align {
+			slab_bytes = size + align
+		}
+		ctx.ast_slab = make([]byte, slab_bytes, ctx.allocator)
+		off = 0
+	}
+	res := cast(^T)&ctx.ast_slab[off]
+	ctx.ast_slab_off = off + size
+	return res
+}
+
+@(private = "file")
+push_trace_frame :: proc(ctx: ^Compile_Context, frame: Trace_Frame) -> int {
+	if ctx.stack == nil && ctx.inline_stack_cnt < len(ctx.inline_stack) {
+		idx := ctx.inline_stack_cnt
+		ctx.inline_stack[idx] = frame
+		ctx.inline_stack_cnt += 1
+		return idx
+	}
+	if ctx.stack == nil {
+		ctx.stack = make([dynamic]Trace_Frame, 0, len(ctx.inline_stack) * 2, ctx.allocator)
+		for i in 0 ..< ctx.inline_stack_cnt {
+			append(&ctx.stack, ctx.inline_stack[i])
+		}
+	}
+	idx := len(ctx.stack)
+	append(&ctx.stack, frame)
+	return idx
+}
+
+@(private = "file")
+pop_trace_frame :: proc(ctx: ^Compile_Context) {
+	if ctx.stack != nil {
+		pop(&ctx.stack)
+	} else if ctx.inline_stack_cnt > 0 {
+		ctx.inline_stack_cnt -= 1
+	}
+}
+
+@(private = "file")
+get_trace_frames :: proc(ctx: ^Compile_Context) -> []Trace_Frame {
+	if ctx.stack != nil {
+		return ctx.stack[:]
+	}
+	return ctx.inline_stack[:ctx.inline_stack_cnt]
+}
+
+@(private = "file")
+set_trace_frame_snippet :: proc(ctx: ^Compile_Context, idx: int, snippet: string) {
+	if ctx.stack != nil {
+		ctx.stack[idx].snippet = snippet
+	} else if idx >= 0 && idx < ctx.inline_stack_cnt {
+		ctx.inline_stack[idx].snippet = snippet
+	}
+}
+
+@(private = "file")
+clear_trace_frames :: proc(ctx: ^Compile_Context) {
+	if ctx.stack != nil {
+		clear(&ctx.stack)
+	}
+	ctx.inline_stack_cnt = 0
 }
 
 Transpiled_Template :: struct {
@@ -114,9 +200,44 @@ parse_cli_flag_kv :: proc(arg: string) -> (key: string, val: string, is_flag: bo
 	return trimmed, "", true, false
 }
 
+@(private = "file")
+slice_file_dir :: proc(file: string) -> string {
+	if slash_idx := strings.last_index_any(file, "/\\"); slash_idx != -1 {
+		if slash_idx == 0 {
+			return file[:1]
+		}
+		return file[:slash_idx]
+	}
+	return "."
+}
+
+@(private = "file")
+join_relative_slash_path :: proc(origin_file, rel_path: string, allocator := context.temp_allocator) -> string {
+	if !strings.has_prefix(rel_path, ".") && !strings.contains(rel_path, "/.") && !strings.contains(rel_path, "\\") {
+		if slash_idx := strings.last_index_any(origin_file, "/\\"); slash_idx != -1 {
+			dir_prefix := origin_file[:slash_idx + 1]
+			return normalize_slash_path(strings.concatenate({dir_prefix, rel_path}, allocator), allocator)
+		}
+		return rel_path
+	}
+	joined, _ := filepath.join({slice_file_dir(origin_file), rel_path}, allocator)
+	return normalize_slash_path(joined, allocator)
+}
+
 normalize_slash_path :: proc(path: string, allocator := context.temp_allocator) -> string {
 	if len(path) == 0 {
 		return ""
+	}
+	needs_norm := false
+	for i in 0 ..< len(path) {
+		c := path[i]
+		if c == '\\' || (c == '/' && i + 1 < len(path) && path[i + 1] == '/') {
+			needs_norm = true
+			break
+		}
+	}
+	if !needs_norm {
+		return path
 	}
 	sb := strings.builder_make(0, len(path), allocator)
 	prev_slash := false
@@ -534,8 +655,9 @@ record_diagnostic :: proc(
 	d.caret_col = target_col
 	d.col_len = max(col_len, 1)
 
-	frames := make([]Trace_Frame, len(ctx.stack), ctx.allocator)
-	for f, i in ctx.stack {
+	active_frames := get_trace_frames(ctx)
+	frames := make([]Trace_Frame, len(active_frames), ctx.allocator)
+	for f, i in active_frames {
 		frames[i] = f
 		if len(ctx.inline_file) > 0 && f.pos.file == ctx.inline_file && f.kind != .Call_Site {
 			zero_line := max(f.pos.line - 1, 0)
@@ -728,18 +850,16 @@ collect_calls_from_parsed_files :: proc(
 	allocator := context.temp_allocator,
 ) {
 	// Pass 1: Build per-file temple import alias table and package-level constant tables
-	file_temple_pkgs := make(map[^ast.File][dynamic]string, allocator)
-	file_strict_temple_pkgs := make(map[^ast.File][dynamic]string, allocator)
-	pkg_string_consts := make(map[string]^ast.Expr, allocator)
-	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, allocator)
-	pkg_proc_aliases["compiled"] = .Compiled
-	pkg_proc_aliases["compiled_inline"] = .Compiled_Inline
+	file_temple_pkgs := make([][dynamic]string, len(parsed_files), allocator)
+	file_strict_temple_pkgs := make([][dynamic]string, len(parsed_files), allocator)
+	pkg_string_consts: map[string]^ast.Expr
+	pkg_proc_aliases: map[string]Temple_Proc_Kind
 
 	has_any_temple_import := false
 
-	for file in parsed_files {
-		import_names := make([dynamic]string, allocator)
-		strict_names := make([dynamic]string, allocator)
+	for file, file_idx in parsed_files {
+		import_names := make([dynamic]string, 0, max(len(file.imports), 2), allocator)
+		strict_names := make([dynamic]string, 0, max(len(file.imports) + 1, 2), allocator)
 		append(&strict_names, "temple")
 		for imp in file.imports {
 			trimmed_path := strings.trim(imp.fullpath, "\"`")
@@ -765,21 +885,21 @@ collect_calls_from_parsed_files :: proc(
 				}
 			}
 		}
-		file_temple_pkgs[file] = import_names
-		file_strict_temple_pkgs[file] = strict_names
+		file_temple_pkgs[file_idx] = import_names
+		file_strict_temple_pkgs[file_idx] = strict_names
 
 		// Collect top-level constant declarations
 		for decl in file.decls {
-			collect_top_level_consts(decl, &pkg_string_consts)
+			collect_top_level_consts(decl, &pkg_string_consts, allocator)
 		}
 	}
 
 	// If no file in this package imports temple, fallback to allowing "temple" identifier
 	// in case the user is in a sub-file or test setup without standard import path suffix
 	if !has_any_temple_import {
-		for file in parsed_files {
+		for file, file_idx in parsed_files {
 			if strings.contains(file.src, "temple") {
-				append(&file_temple_pkgs[file], "temple")
+				append(&file_temple_pkgs[file_idx], "temple")
 			}
 		}
 	}
@@ -787,47 +907,51 @@ collect_calls_from_parsed_files :: proc(
 	// Resolve constant procedure aliases (e.g. `c :: temple.compiled` or `ci :: t.compiled_inline`)
 	// Iteratively resolve aliases in case of chained aliases `c1 :: temple.compiled; c2 :: c1`
 	for _ in 0 ..< 3 {
-		for file in parsed_files {
-			strict_names := file_strict_temple_pkgs[file]
+		for file, file_idx in parsed_files {
+			strict_names := file_strict_temple_pkgs[file_idx]
 			for decl in file.decls {
-				collect_proc_aliases(decl, strict_names[:], &pkg_proc_aliases)
+				collect_proc_aliases(decl, strict_names[:], &pkg_proc_aliases, allocator)
 			}
 		}
 	}
 
 	// Evaluate package-level string constants
-	resolved_consts := make(map[string]string, allocator)
+	resolved_consts: map[string]string
+	visited: map[string]bool
 	for name, expr in pkg_string_consts {
-		visited := make(map[string]bool, allocator)
-		if val, ok := eval_const_string_from_ast(expr, pkg_string_consts, &visited); ok {
+		if visited.allocator.procedure != nil {
+			clear(&visited)
+		}
+		if val, ok := eval_const_string_from_ast(expr, pkg_string_consts, &visited, allocator); ok {
+			if resolved_consts.allocator.procedure == nil {
+				resolved_consts = make(map[string]string, allocator)
+			}
 			resolved_consts[name] = val
 		}
 	}
 
 	// Pass 2: Walk only files that import temple or reference a package-level temple alias
-	for file in parsed_files {
-		temple_names := file_temple_pkgs[file]
-		strict_names := file_strict_temple_pkgs[file]
-		if len(temple_names) == 0 && len(pkg_proc_aliases) == 0 {
+	for file, file_idx in parsed_files {
+		temple_names := file_temple_pkgs[file_idx]
+		strict_names := file_strict_temple_pkgs[file_idx]
+		if len(temple_names) == 0 && len(pkg_proc_aliases) == 0 && !strings.contains(file.src, "compiled") {
 			continue
 		}
-
-		// Clone maps per file/scope so procedure-local constants or shadowing variables do not mutate package-wide tables
-		file_proc_aliases := clone_proc_aliases(pkg_proc_aliases, allocator)
-		file_string_consts := clone_string_consts(resolved_consts, allocator)
 
 		walk_ctx := File_Collect_Ctx {
 			pkg_fullpath        = pkg_fullpath,
 			file                = file,
 			temple_names        = temple_names[:],
 			strict_temple_names = strict_names[:],
-			proc_aliases        = file_proc_aliases,
-			string_consts       = file_string_consts,
+			proc_aliases        = pkg_proc_aliases,
+			string_consts       = resolved_consts,
 			raw_const_exprs     = pkg_string_consts,
 			calls               = calls,
 			seen                = seen_identifiers,
 			out_allocator       = out_allocator,
 			out_errors          = out_errors,
+			owns_proc_aliases   = false,
+			owns_string_consts  = false,
 		}
 
 		v := ast.Visitor {
@@ -835,6 +959,40 @@ collect_calls_from_parsed_files :: proc(
 			visit = visit_odin_node,
 		}
 		for decl in file.decls {
+			if decl != nil && decl.pos.offset >= 0 && decl.end.offset > decl.pos.offset && decl.end.offset <= len(file.src) {
+				if vdecl, is_vd := decl.derived_stmt.(^ast.Value_Decl); is_vd && !vdecl.is_mutable {
+					all_procs := len(vdecl.values) > 0
+					for val in vdecl.values {
+						if _, is_proc := val.derived_expr.(^ast.Proc_Lit); !is_proc {
+							all_procs = false
+							break
+						}
+					}
+					if all_procs {
+						span := file.src[decl.pos.offset : decl.end.offset]
+						has_candidate := strings.index(span, "compiled") != -1
+						if !has_candidate && strings.index(span, "::") != -1 {
+							for t_name in temple_names {
+								if strings.index(span, t_name) != -1 {
+									has_candidate = true
+									break
+								}
+							}
+						}
+						if !has_candidate && len(pkg_proc_aliases) > 0 {
+							for alias_name, kind in pkg_proc_aliases {
+								if kind != .None && strings.index(span, alias_name) != -1 {
+									has_candidate = true
+									break
+								}
+							}
+						}
+						if !has_candidate {
+							continue
+						}
+					}
+				}
+			}
 			ast.walk(&v, decl)
 		}
 	}
@@ -856,14 +1014,18 @@ clone_string_consts :: proc(src: map[string]string, allocator := context.temp_al
 	return res
 }
 
-collect_top_level_consts :: proc(stmt: ^ast.Stmt, out_consts: ^map[string]^ast.Expr) {
+collect_top_level_consts :: proc(stmt: ^ast.Stmt, out_consts: ^map[string]^ast.Expr, allocator := context.temp_allocator) {
 	if stmt == nil do return
 	#partial switch d in stmt.derived_stmt {
 	case ^ast.Value_Decl:
 		if d.is_mutable do return
 		for name_expr, i in d.names {
 			if i >= len(d.values) do break
+			if _, is_proc := d.values[i].derived_expr.(^ast.Proc_Lit); is_proc do continue
 			if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+				if out_consts.allocator.procedure == nil {
+					out_consts^ = make(map[string]^ast.Expr, allocator)
+				}
 				out_consts[ident.name] = d.values[i]
 			}
 		}
@@ -871,17 +1033,17 @@ collect_top_level_consts :: proc(stmt: ^ast.Stmt, out_consts: ^map[string]^ast.E
 		if d.body != nil {
 			if blk, ok := d.body.derived_stmt.(^ast.Block_Stmt); ok {
 				for s in blk.stmts {
-					collect_top_level_consts(s, out_consts)
+					collect_top_level_consts(s, out_consts, allocator)
 				}
 			}
 		}
 		if d.else_stmt != nil {
 			if blk, ok := d.else_stmt.derived_stmt.(^ast.Block_Stmt); ok {
 				for s in blk.stmts {
-					collect_top_level_consts(s, out_consts)
+					collect_top_level_consts(s, out_consts, allocator)
 				}
 			} else {
-				collect_top_level_consts(d.else_stmt, out_consts)
+				collect_top_level_consts(d.else_stmt, out_consts, allocator)
 			}
 		}
 	}
@@ -891,6 +1053,7 @@ collect_proc_aliases :: proc(
 	stmt: ^ast.Stmt,
 	temple_names: []string,
 	proc_aliases: ^map[string]Temple_Proc_Kind,
+	allocator := context.temp_allocator,
 ) {
 	if stmt == nil do return
 	#partial switch d in stmt.derived_stmt {
@@ -898,20 +1061,36 @@ collect_proc_aliases :: proc(
 		if d.is_mutable {
 			for name_expr in d.names {
 				if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
-					delete_key(proc_aliases, ident.name)
+					if ident.name == "compiled" || ident.name == "compiled_inline" {
+						if proc_aliases.allocator.procedure == nil {
+							proc_aliases^ = make(map[string]Temple_Proc_Kind, allocator)
+						}
+						proc_aliases[ident.name] = .None
+					} else if proc_aliases.allocator.procedure != nil {
+						delete_key(proc_aliases, ident.name)
+					}
 				}
 			}
 			return
 		}
 		for name_expr, i in d.names {
 			if i >= len(d.values) do break
+			if _, is_proc := d.values[i].derived_expr.(^ast.Proc_Lit); is_proc do continue
 			ident, ok := name_expr.derived_expr.(^ast.Ident)
 			if !ok do continue
 			val := ast.unparen_expr(d.values[i])
 			kind := resolve_temple_proc_expr(val, temple_names, proc_aliases^)
 			if kind != .None {
+				if proc_aliases.allocator.procedure == nil {
+					proc_aliases^ = make(map[string]Temple_Proc_Kind, allocator)
+				}
 				proc_aliases[ident.name] = kind
-			} else {
+			} else if ident.name == "compiled" || ident.name == "compiled_inline" {
+				if proc_aliases.allocator.procedure == nil {
+					proc_aliases^ = make(map[string]Temple_Proc_Kind, allocator)
+				}
+				proc_aliases[ident.name] = .None
+			} else if proc_aliases.allocator.procedure != nil {
 				delete_key(proc_aliases, ident.name)
 			}
 		}
@@ -948,6 +1127,12 @@ resolve_temple_proc_expr :: proc(
 		if kind, found := proc_aliases[e.name]; found {
 			return kind
 		}
+		switch e.name {
+		case "compiled":
+			return .Compiled
+		case "compiled_inline":
+			return .Compiled_Inline
+		}
 	}
 	return .None
 }
@@ -956,6 +1141,7 @@ eval_const_string_from_ast :: proc(
 	expr: ^ast.Expr,
 	const_exprs: map[string]^ast.Expr,
 	visited: ^map[string]bool,
+	allocator := context.temp_allocator,
 ) -> (string, bool) {
 	if expr == nil do return "", false
 	expr := ast.unparen_expr(expr)
@@ -967,20 +1153,23 @@ eval_const_string_from_ast :: proc(
 		}
 	case ^ast.Binary_Expr:
 		if e.op.kind == .Add {
-			lhs, lok := eval_const_string_from_ast(e.left, const_exprs, visited)
+			lhs, lok := eval_const_string_from_ast(e.left, const_exprs, visited, allocator)
 			if !lok do return "", false
-			rhs, rok := eval_const_string_from_ast(e.right, const_exprs, visited)
+			rhs, rok := eval_const_string_from_ast(e.right, const_exprs, visited, allocator)
 			if !rok do return "", false
-			return strings.concatenate({lhs, rhs}, context.temp_allocator), true
+			return strings.concatenate({lhs, rhs}, allocator), true
 		}
 	case ^ast.Ident:
 		if visited[e.name] {
 			return "", false
 		}
 		if target, ok := const_exprs[e.name]; ok {
+			if visited.allocator.procedure == nil {
+				visited^ = make(map[string]bool, allocator)
+			}
 			visited[e.name] = true
 			defer delete_key(visited, e.name)
-			return eval_const_string_from_ast(target, const_exprs, visited)
+			return eval_const_string_from_ast(target, const_exprs, visited, allocator)
 		}
 	}
 	return "", false
@@ -1024,6 +1213,9 @@ unquote_odin_string :: proc(lit: string) -> (string, bool) {
 		return lit[1 : len(lit)-1], true
 	}
 	if lit[0] == '"' && lit[len(lit)-1] == '"' {
+		if strings.index_byte(lit[1 : len(lit)-1], '\\') == -1 {
+			return lit[1 : len(lit)-1], true
+		}
 		res, allocated, ok := strconv.unquote_string(lit, context.temp_allocator)
 		_ = allocated
 		return res, ok
@@ -1049,8 +1241,10 @@ is_strict_temple_call :: proc(
 		}
 		return false
 	case ^ast.Ident:
-		_, found := proc_aliases[e.name]
-		return found
+		if kind, found := proc_aliases[e.name]; found {
+			return kind != .None
+		}
+		return e.name == "compiled" || e.name == "compiled_inline"
 	}
 	return false
 }
@@ -1067,6 +1261,67 @@ File_Collect_Ctx :: struct {
 	seen:                ^map[string]string,
 	out_allocator:       mem.Allocator,
 	out_errors:          ^[dynamic]string,
+	owns_proc_aliases:   bool,
+	owns_string_consts:  bool,
+}
+
+@(private = "file")
+ensure_owned_proc_aliases :: proc(ctx: ^File_Collect_Ctx) {
+	if !ctx.owns_proc_aliases {
+		ctx.proc_aliases = clone_proc_aliases(ctx.proc_aliases, context.temp_allocator)
+		ctx.owns_proc_aliases = true
+	}
+}
+
+@(private = "file")
+ensure_owned_string_consts :: proc(ctx: ^File_Collect_Ctx) {
+	if !ctx.owns_string_consts {
+		ctx.string_consts = clone_string_consts(ctx.string_consts, context.temp_allocator)
+		ctx.owns_string_consts = true
+	}
+}
+
+@(private = "file")
+ctx_set_proc_alias :: proc(ctx: ^File_Collect_Ctx, name: string, kind: Temple_Proc_Kind) {
+	ensure_owned_proc_aliases(ctx)
+	ctx.proc_aliases[name] = kind
+	ctx_delete_string_const(ctx, name)
+}
+
+@(private = "file")
+ctx_set_string_const :: proc(ctx: ^File_Collect_Ctx, name: string, val: string) {
+	ensure_owned_string_consts(ctx)
+	ctx.string_consts[name] = val
+	ctx_delete_proc_alias(ctx, name)
+}
+
+@(private = "file")
+ctx_delete_proc_alias :: proc(ctx: ^File_Collect_Ctx, name: string) {
+	if name == "compiled" || name == "compiled_inline" {
+		if kind, found := ctx.proc_aliases[name]; !found || kind != .None {
+			ensure_owned_proc_aliases(ctx)
+			ctx.proc_aliases[name] = .None
+		}
+		return
+	}
+	if _, found := ctx.proc_aliases[name]; found {
+		ensure_owned_proc_aliases(ctx)
+		delete_key(&ctx.proc_aliases, name)
+	}
+}
+
+@(private = "file")
+ctx_delete_string_const :: proc(ctx: ^File_Collect_Ctx, name: string) {
+	if _, found := ctx.string_consts[name]; found {
+		ensure_owned_string_consts(ctx)
+		delete_key(&ctx.string_consts, name)
+	}
+}
+
+@(private = "file")
+ctx_shadow_ident :: proc(ctx: ^File_Collect_Ctx, name: string) {
+	ctx_delete_string_const(ctx, name)
+	ctx_delete_proc_alias(ctx, name)
 }
 
 collect_error :: proc(ctx: ^File_Collect_Ctx, pos: tokenizer.Pos, msg: string, args: ..any) {
@@ -1081,6 +1336,16 @@ collect_error :: proc(ctx: ^File_Collect_Ctx, pos: tokenizer.Pos, msg: string, a
 }
 
 precollect_scope_consts :: proc(stmts: []^ast.Stmt, ctx: ^File_Collect_Ctx) {
+	has_const_decl := false
+	for stmt in stmts {
+		if stmt == nil do continue
+		if vdecl, ok := stmt.derived_stmt.(^ast.Value_Decl); ok && !vdecl.is_mutable {
+			has_const_decl = true
+			break
+		}
+	}
+	if !has_const_decl do return
+
 	for _ in 0 ..< 2 {
 		for stmt in stmts {
 			if stmt == nil do continue
@@ -1090,14 +1355,11 @@ precollect_scope_consts :: proc(stmts: []^ast.Stmt, ctx: ^File_Collect_Ctx) {
 					if ident, iok := name_expr.derived_expr.(^ast.Ident); iok {
 						val_expr := vdecl.values[i]
 						if kind := resolve_temple_proc_expr(val_expr, ctx.temple_names, ctx.proc_aliases); kind != .None {
-							ctx.proc_aliases[ident.name] = kind
-							delete_key(&ctx.string_consts, ident.name)
+							ctx_set_proc_alias(ctx, ident.name, kind)
 						} else if str_val, sok := eval_const_string(val_expr, ctx.string_consts, ctx.raw_const_exprs); sok {
-							ctx.string_consts[ident.name] = str_val
-							delete_key(&ctx.proc_aliases, ident.name)
+							ctx_set_string_const(ctx, ident.name, str_val)
 						} else {
-							delete_key(&ctx.string_consts, ident.name)
-							delete_key(&ctx.proc_aliases, ident.name)
+							ctx_shadow_ident(ctx, ident.name)
 						}
 					}
 				}
@@ -1113,17 +1375,16 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 
 	#partial switch n in node.derived {
 	case ^ast.Proc_Lit:
-		// Isolate procedure-local constants and shadowing variables to this procedure's scope
+		// Isolate procedure-local constants and shadowing variables to this procedure's scope using copy-on-write
 		scoped_ctx := ctx^
-		scoped_ctx.proc_aliases = clone_proc_aliases(ctx.proc_aliases, context.temp_allocator)
-		scoped_ctx.string_consts = clone_string_consts(ctx.string_consts, context.temp_allocator)
+		scoped_ctx.owns_proc_aliases = false
+		scoped_ctx.owns_string_consts = false
 		if n.type != nil {
 			if n.type.params != nil {
 				for field in n.type.params.list {
 					for name_expr in field.names {
 						if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
-							delete_key(&scoped_ctx.string_consts, ident.name)
-							delete_key(&scoped_ctx.proc_aliases, ident.name)
+							ctx_shadow_ident(&scoped_ctx, ident.name)
 						}
 					}
 				}
@@ -1132,8 +1393,7 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 				for field in n.type.results.list {
 					for name_expr in field.names {
 						if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
-							delete_key(&scoped_ctx.string_consts, ident.name)
-							delete_key(&scoped_ctx.proc_aliases, ident.name)
+							ctx_shadow_ident(&scoped_ctx, ident.name)
 						}
 					}
 				}
@@ -1149,10 +1409,10 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 		return nil
 
 	case ^ast.Block_Stmt:
-		// Isolate block-local constants and shadowing variables to this block's scope
+		// Isolate block-local constants and shadowing variables to this block's scope using copy-on-write
 		scoped_ctx := ctx^
-		scoped_ctx.proc_aliases = clone_proc_aliases(ctx.proc_aliases, context.temp_allocator)
-		scoped_ctx.string_consts = clone_string_consts(ctx.string_consts, context.temp_allocator)
+		scoped_ctx.owns_proc_aliases = false
+		scoped_ctx.owns_string_consts = false
 		// Pre-collect non-mutable constant declarations in this block so order-independent constants resolve
 		precollect_scope_consts(n.stmts, &scoped_ctx)
 		scoped_v := ast.Visitor{
@@ -1172,22 +1432,18 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 				if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
 					val_expr := n.values[i]
 					if kind := resolve_temple_proc_expr(val_expr, ctx.temple_names, ctx.proc_aliases); kind != .None {
-						ctx.proc_aliases[ident.name] = kind
-						delete_key(&ctx.string_consts, ident.name)
+						ctx_set_proc_alias(ctx, ident.name, kind)
 					} else if str_val, sok := eval_const_string(val_expr, ctx.string_consts, ctx.raw_const_exprs); sok {
-						ctx.string_consts[ident.name] = str_val
-						delete_key(&ctx.proc_aliases, ident.name)
+						ctx_set_string_const(ctx, ident.name, str_val)
 					} else {
-						delete_key(&ctx.string_consts, ident.name)
-						delete_key(&ctx.proc_aliases, ident.name)
+						ctx_shadow_ident(ctx, ident.name)
 					}
 				}
 			}
 		} else {
 			for name_expr in n.names {
 				if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
-					delete_key(&ctx.string_consts, ident.name)
-					delete_key(&ctx.proc_aliases, ident.name)
+					ctx_shadow_ident(ctx, ident.name)
 				}
 			}
 		}
@@ -1836,11 +2092,12 @@ compile_batch_worker :: proc(batch: ^Worker_Batch) {
 	ctx.allocator = arena_alloc
 	ctx.stack = make([dynamic]Trace_Frame, arena_alloc)
 	ctx.raw_cache = make(map[string]Cached_Template, arena_alloc)
+	ctx.resolved_cache = make(map[string]Template, arena_alloc)
 	ctx.used_files = make(map[string]bool, arena_alloc)
 	ctx.external_pkg = batch.external_pkg
 
 	for call, i in batch.calls {
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		ctx.diagnostics = make([dynamic]Diagnostic, arena_alloc)
 
 		code, ok := compile_single_call(&ctx, call)
@@ -1883,12 +2140,12 @@ compile_single_call :: proc(ctx: ^Compile_Context, call: Compile_Call) -> (code:
 		call_pos := call.pos
 		call_pos.file = normalize_slash_path(call.pos.file, ctx.allocator)
 
-		append(&ctx.stack, Trace_Frame{
+		_ = push_trace_frame(ctx, Trace_Frame{
 			kind = .Call_Site,
 			pos  = call_pos,
 			file = file,
 		})
-		defer pop(&ctx.stack)
+		defer pop_trace_frame(ctx)
 
 		loaded_templ, loaded_src, load_ok := load_and_resolve_template_file(ctx, file, call_pos, nil, 0)
 		if !load_ok {
@@ -1924,12 +2181,12 @@ compile_single_call :: proc(ctx: ^Compile_Context, call: Compile_Call) -> (code:
 			ctx.inline_pos = {}
 		}
 
-		append(&ctx.stack, Trace_Frame{
+		_ = push_trace_frame(ctx, Trace_Frame{
 			kind = .Call_Site,
 			pos  = call.pos,
 			file = call.pos.file,
 		})
-		defer pop(&ctx.stack)
+		defer pop_trace_frame(ctx)
 
 		p: Parser
 		parser_init(&p, source, ctx.allocator)
@@ -1980,6 +2237,42 @@ compile_single_call :: proc(ctx: ^Compile_Context, call: Compile_Call) -> (code:
 	return "", false
 }
 
+cache_raw_template :: proc(ctx: ^Compile_Context, fullpath: string, cached: Cached_Template) {
+	for i in 0 ..< ctx.inline_raw_cnt {
+		if ctx.inline_raw[i].file == fullpath {
+			ctx.inline_raw[i].cached = cached
+			return
+		}
+	}
+	if ctx.inline_raw_cnt < len(ctx.inline_raw) {
+		ctx.inline_raw[ctx.inline_raw_cnt] = {
+			file   = fullpath,
+			cached = cached,
+		}
+		ctx.inline_raw_cnt += 1
+		return
+	}
+	if ctx.raw_cache.allocator.procedure == nil {
+		ctx.raw_cache = make(map[string]Cached_Template, ctx.allocator)
+	}
+	ctx.raw_cache[fullpath] = cached
+}
+
+@(private = "file")
+lookup_raw_cache :: proc(ctx: ^Compile_Context, fullpath: string) -> (Cached_Template, bool) {
+	for i in 0 ..< ctx.inline_raw_cnt {
+		if ctx.inline_raw[i].file == fullpath {
+			return ctx.inline_raw[i].cached, true
+		}
+	}
+	if ctx.raw_cache.allocator.procedure != nil {
+		if cached, found := ctx.raw_cache[fullpath]; found {
+			return cached, true
+		}
+	}
+	return {}, false
+}
+
 load_raw_template :: proc(
 	ctx: ^Compile_Context,
 	fullpath: string,
@@ -1994,7 +2287,7 @@ load_raw_template :: proc(
 	if ctx.used_files.allocator.procedure != nil && !ctx.used_files[fullpath] {
 		ctx.used_files[strings.clone(fullpath, ctx.allocator)] = true
 	}
-	if cached, found := ctx.raw_cache[fullpath]; found {
+	if cached, found := lookup_raw_cache(ctx, fullpath); found {
 		if err, has_err := cached.template.err.?; has_err {
 			pos := tokenizer.Pos{
 				offset = err.pos.offset,
@@ -2037,11 +2330,48 @@ load_raw_template :: proc(
 	}
 
 	cloned_path := strings.clone(fullpath, ctx.allocator)
-	ctx.raw_cache[cloned_path] = Cached_Template{
+	cache_raw_template(ctx, cloned_path, Cached_Template{
 		source   = data,
 		template = parsed,
-	}
+	})
 	return parsed, data, true
+}
+
+@(private = "file")
+lookup_resolved_cache :: proc(ctx: ^Compile_Context, fullpath: string) -> (Template, bool) {
+	for i in 0 ..< ctx.inline_res_cnt {
+		if ctx.inline_resolved[i].file == fullpath {
+			return ctx.inline_resolved[i].template, true
+		}
+	}
+	if ctx.resolved_cache.allocator.procedure != nil {
+		if cached_res, found := ctx.resolved_cache[fullpath]; found {
+			return cached_res, true
+		}
+	}
+	return {}, false
+}
+
+@(private = "file")
+store_resolved_cache :: proc(ctx: ^Compile_Context, fullpath: string, resolved: Template) {
+	for i in 0 ..< ctx.inline_res_cnt {
+		if ctx.inline_resolved[i].file == fullpath {
+			return
+		}
+	}
+	if ctx.inline_res_cnt < len(ctx.inline_resolved) {
+		ctx.inline_resolved[ctx.inline_res_cnt] = {
+			file     = fullpath,
+			template = resolved,
+		}
+		ctx.inline_res_cnt += 1
+		return
+	}
+	if ctx.resolved_cache.allocator.procedure != nil {
+		if _, exists := ctx.resolved_cache[fullpath]; !exists {
+			ctx.resolved_cache[strings.clone(fullpath, ctx.allocator)] = resolved
+		}
+	}
 }
 
 load_and_resolve_template_file :: proc(
@@ -2060,10 +2390,15 @@ load_and_resolve_template_file :: proc(
 		return {}, nil, false
 	}
 
+	if cached_res, found := lookup_resolved_cache(ctx, fullpath); found {
+		return cached_res, raw_src, true
+	}
+
 	resolved, res_ok := resolve_template_inheritance(ctx, raw_templ, raw_src, fullpath)
 	if !res_ok {
 		return {}, nil, false
 	}
+	store_resolved_cache(ctx, fullpath, resolved)
 	return resolved, raw_src, true
 }
 
@@ -2117,44 +2452,44 @@ map_branch_children :: proc(
 ) {
 	#partial switch d in node.derived {
 	case ^Node_If:
-		new_if := new(Node_If, ctx.allocator)
+		new_if := alloc_ctx_node(ctx, Node_If)
 		new_if^ = d^
 		new_if.derived = new_if
 		new_if._if.body = map_body(ctx, d._if.body[:], user_data)
 		new_if.elseifs = make([dynamic]^Node_If_Part, 0, len(d.elseifs), ctx.allocator)
 		for ef in d.elseifs {
-			new_ef := new(Node_If_Part, ctx.allocator)
+			new_ef := alloc_ctx_node(ctx, Node_If_Part)
 			new_ef^ = ef^
 			new_ef.body = map_body(ctx, ef.body[:], user_data)
 			append(&new_if.elseifs, new_ef)
 		}
 		if els, has_els := d._else.?; has_els {
-			new_els := new(Node_If_Part, ctx.allocator)
+			new_els := alloc_ctx_node(ctx, Node_If_Part)
 			new_els^ = els^
 			new_els.body = map_body(ctx, els.body[:], user_data)
 			new_if._else = new_els
 		}
 		return new_if, true
 	case ^Node_For:
-		new_for := new(Node_For, ctx.allocator)
+		new_for := alloc_ctx_node(ctx, Node_For)
 		new_for^ = d^
 		new_for.derived = new_for
 		new_for.body = map_body(ctx, d.body[:], user_data)
 		return new_for, true
 	case ^Node_Switch:
-		new_sw := new(Node_Switch, ctx.allocator)
+		new_sw := alloc_ctx_node(ctx, Node_Switch)
 		new_sw^ = d^
 		new_sw.derived = new_sw
 		new_sw.cases = make([dynamic]^Node_Case, 0, len(d.cases), ctx.allocator)
 		for c in d.cases {
-			new_c := new(Node_Case, ctx.allocator)
+			new_c := alloc_ctx_node(ctx, Node_Case)
 			new_c^ = c^
 			new_c.body = map_body(ctx, c.body[:], user_data)
 			append(&new_sw.cases, new_c)
 		}
 		return new_sw, true
 	case ^Node_Macro:
-		new_mac := new(Node_Macro, ctx.allocator)
+		new_mac := alloc_ctx_node(ctx, Node_Macro)
 		new_mac^ = d^
 		new_mac.derived = new_mac
 		new_mac.body = map_body(ctx, d.body[:], user_data)
@@ -2228,24 +2563,75 @@ resolve_template_inheritance :: proc(
 	ok: bool,
 ) {
 	// Validate that all blocks defined in this template (top-level or nested) have unique names
-	seen_local_blocks := make(map[string]^Node_Block, ctx.allocator)
-	if !validate_unique_blocks_in_nodes(ctx, child_templ.content[:], &seen_local_blocks, child_src, child_file) {
-		return {}, false
+	if nodes_contain_block(child_templ.content[:]) {
+		top_blk_count := 0
+		has_branch_blk := false
+		for node in child_templ.content {
+			if blk, is_blk := node.derived.(^Node_Block); is_blk {
+				top_blk_count += 1
+				if nodes_contain_block(blk.body[:]) {
+					has_branch_blk = true
+				}
+			} else if nodes_contain_block((&[1]Node{node})[:]) {
+				has_branch_blk = true
+			}
+		}
+		if has_branch_blk || top_blk_count > 8 {
+			seen_local_blocks := make(map[string]^Node_Block, ctx.allocator)
+			if !validate_unique_blocks_in_nodes(ctx, child_templ.content[:], &seen_local_blocks, child_src, child_file) {
+				return {}, false
+			}
+		} else if top_blk_count > 1 {
+			seen_names: [8]string
+			seen_len := 0
+			for node in child_templ.content {
+				if d, is_blk := node.derived.(^Node_Block); is_blk {
+					for i in 0 ..< seen_len {
+						if seen_names[i] == d.name {
+							file := d.origin_file if len(d.origin_file) > 0 else child_file
+							src := d.origin_src if d.origin_src != nil else child_src
+							blk_pos := tokenizer.Pos{
+								offset = d.name_tok.pos.offset,
+								line   = d.name_tok.pos.line + 1,
+								column = d.name_tok.pos.col + 1,
+								file   = file,
+							}
+							record_diagnostic(
+								ctx,
+								blk_pos,
+								src,
+								len(d.name),
+								"duplicate block definition %q in template",
+								d.name,
+							)
+							return {}, false
+						}
+					}
+					seen_names[seen_len] = d.name
+					seen_len += 1
+				}
+			}
+		}
 	}
 
 	ext, has_ext := find_extends_node(child_templ)
 	if !has_ext {
 		// Still validate that blocks in a non-extending template don't call `super()`
-		if !validate_no_orphan_super_in_nodes(ctx, child_templ.content[:], child_src, child_file) {
-			return {}, false
+		if nodes_contain_any_super(child_templ.content[:]) {
+			if !validate_no_orphan_super_in_nodes(ctx, child_templ.content[:], child_src, child_file) {
+				return {}, false
+			}
 		}
-		base_dir := "" if child_file == ctx.inline_file else filepath.dir(child_file)
+		if !nodes_need_embed_rewrite(child_templ.content[:]) {
+			return child_templ, true
+		}
+		base_dir := "" if child_file == ctx.inline_file else slice_file_dir(child_file)
 		return rewrite_embeds_relative_to_dir(ctx, child_templ, base_dir, child_file, child_src), true
 	}
 
+	child_dir := slice_file_dir(child_file)
 	relpath := normalize_slash_path(ext.path.value[1 : len(ext.path.value)-1], ctx.allocator)
-	joined_parent, _ := filepath.join({filepath.dir(child_file), relpath}, ctx.allocator)
-	parent_fullpath := normalize_slash_path(joined_parent, ctx.allocator)
+	parent_fullpath := join_relative_slash_path(child_file, relpath, ctx.allocator)
 
 	ext_pos := tokenizer.Pos{
 		offset = ext.path.pos.offset,
@@ -2255,7 +2641,7 @@ resolve_template_inheritance :: proc(
 	}
 
 	// Cycle check across active stack
-	for frame in ctx.stack {
+	for frame in get_trace_frames(ctx) {
 		if frame.file == parent_fullpath {
 			record_diagnostic(
 				ctx,
@@ -2271,48 +2657,99 @@ resolve_template_inheritance :: proc(
 	}
 
 	// Collect child blocks and macros (top-level overrides/definitions) and normalize relative embeds/origins inside them
-	child_blocks := make(map[string]^Node_Block, ctx.allocator)
-	child_macros := make(map[string]^Node_Macro, ctx.allocator)
-	child_macro_order := make([dynamic]^Node_Macro, ctx.allocator)
+	child_blocks_buf: [16]^Node_Block
+	child_block_cnt := 0
+	child_blocks_var: [dynamic]^Node_Block
+	child_macros_buf: [16]^Node_Macro
+	child_macro_cnt := 0
+	child_macros_var: [dynamic]^Node_Macro
+
 	for node in child_templ.content {
 		if blk, is_blk := node.derived.(^Node_Block); is_blk {
-			normalized_blk := clone_block_with_resolved_embeds(ctx, blk, filepath.dir(child_file), child_file, child_src)
-			child_blocks[blk.name] = normalized_blk
+			normalized_blk := clone_block_with_resolved_embeds(ctx, blk, child_dir, child_file, child_src)
+			replaced := false
+			if child_blocks_var != nil {
+				for &b in child_blocks_var {
+					if b.name == blk.name {
+						b = normalized_blk
+						replaced = true
+						break
+					}
+				}
+				if !replaced {
+					append(&child_blocks_var, normalized_blk)
+				}
+			} else {
+				for i in 0 ..< child_block_cnt {
+					if child_blocks_buf[i].name == blk.name {
+						child_blocks_buf[i] = normalized_blk
+						replaced = true
+						break
+					}
+				}
+				if !replaced {
+					if child_block_cnt < len(child_blocks_buf) {
+						child_blocks_buf[child_block_cnt] = normalized_blk
+						child_block_cnt += 1
+					} else {
+						child_blocks_var = make([dynamic]^Node_Block, 0, child_block_cnt * 2, ctx.allocator)
+						for b in child_blocks_buf {
+							append(&child_blocks_var, b)
+						}
+						append(&child_blocks_var, normalized_blk)
+					}
+				}
+			}
 		} else if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-			normalized_mac := clone_macro_with_resolved_embeds(ctx, mac, filepath.dir(child_file), child_file, child_src)
-			child_macros[mac.name] = normalized_mac
-			append(&child_macro_order, normalized_mac)
+			normalized_mac := clone_macro_with_resolved_embeds(ctx, mac, child_dir, child_file, child_src)
+			if child_macros_var != nil {
+				append(&child_macros_var, normalized_mac)
+			} else if child_macro_cnt < len(child_macros_buf) {
+				child_macros_buf[child_macro_cnt] = normalized_mac
+				child_macro_cnt += 1
+			} else {
+				child_macros_var = make([dynamic]^Node_Macro, 0, child_macro_cnt * 2, ctx.allocator)
+				for m in child_macros_buf {
+					append(&child_macros_var, m)
+				}
+				append(&child_macros_var, normalized_mac)
+			}
+		}
+	}
+	child_blocks := child_blocks_var[:] if child_blocks_var != nil else child_blocks_buf[:child_block_cnt]
+	child_macro_order := child_macros_var[:] if child_macros_var != nil else child_macros_buf[:child_macro_cnt]
+
+	// Push extends frame and load/resolve parent layout (supports multi-level inheritance)
+	parent_templ: Template
+	parent_ok: bool
+	{
+		ext_frame_idx := push_trace_frame(ctx, Trace_Frame{
+			kind    = .Extends,
+			pos     = ext_pos,
+			file    = parent_fullpath,
+			col_len = len(ext.path.value),
+		})
+		defer pop_trace_frame(ctx)
+
+		parent_templ, _, parent_ok = load_and_resolve_template_file(
+			ctx,
+			parent_fullpath,
+			ext_pos,
+			child_src,
+			len(ext.path.value),
+		)
+		if !parent_ok {
+			set_trace_frame_snippet(ctx, ext_frame_idx, extract_line_snippet(child_src, ext_pos.line, ctx.allocator))
+			return {}, false
 		}
 	}
 
-	// Push extends frame and load/resolve parent layout (supports multi-level inheritance)
-	append(&ctx.stack, Trace_Frame{
-		kind    = .Extends,
-		pos     = ext_pos,
-		file    = parent_fullpath,
-		snippet = extract_line_snippet(child_src, ext_pos.line, ctx.allocator),
-		col_len = len(ext.path.value),
-	})
-	defer pop(&ctx.stack)
-
-	parent_templ, _, parent_ok := load_and_resolve_template_file(
-		ctx,
-		parent_fullpath,
-		ext_pos,
-		child_src,
-		len(ext.path.value),
-	)
-	if !parent_ok {
-		return {}, false
-	}
-
-	// Collect all valid block names available in the resolved parent layout
-	parent_blocks := make(map[string]^Node_Block, ctx.allocator)
-	collect_layout_blocks(parent_templ.content[:], &parent_blocks)
-
-	// Validate that every child block exists in the parent layout
-	for blk_name, child_blk in child_blocks {
-		if _, exists := parent_blocks[blk_name]; !exists {
+	// Validate that every child block exists in the parent layout (only allocate map on error)
+	for child_blk in child_blocks {
+		blk_name := child_blk.name
+		if !has_layout_block_named(parent_templ.content[:], blk_name) {
+			parent_blocks := make(map[string]^Node_Block, ctx.allocator)
+			collect_layout_blocks(parent_templ.content[:], &parent_blocks)
 			valid_names := make([dynamic]string, ctx.allocator)
 			for k in parent_blocks {
 				append(&valid_names, k)
@@ -2340,24 +2777,32 @@ resolve_template_inheritance :: proc(
 	}
 
 	// Splice child blocks and macros into parent layout AST (handling `super()` recursively)
-	spliced_parent := splice_nodes(ctx, parent_templ.content[:], child_blocks)
+	flatten_blocks := len(get_trace_frames(ctx)) <= 1
+	spliced_parent := splice_nodes(ctx, parent_templ.content[:], child_blocks, flatten_blocks)
 	spliced: Template
 	if len(child_macro_order) > 0 {
-		parent_macro_names := make(map[string]bool, ctx.allocator)
-		for node in spliced_parent {
-			if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-				parent_macro_names[mac.name] = true
-			}
-		}
 		merged := make([dynamic]Node, 0, len(spliced_parent) + len(child_macro_order), ctx.allocator)
 		for mac in child_macro_order {
-			if !parent_macro_names[mac.name] {
+			in_parent := false
+			for node in spliced_parent {
+				if pmac, is_mac := node.derived.(^Node_Macro); is_mac && pmac.name == mac.name {
+					in_parent = true
+					break
+				}
+			}
+			if !in_parent {
 				append(&merged, mac)
 			}
 		}
 		for node in spliced_parent {
 			if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-				if override_mac, has_ovr := child_macros[mac.name]; has_ovr {
+				override_mac: ^Node_Macro
+				for cmac in child_macro_order {
+					if cmac.name == mac.name {
+						override_mac = cmac
+					}
+				}
+				if override_mac != nil {
 					append(&merged, override_mac)
 					continue
 				}
@@ -2368,13 +2813,66 @@ resolve_template_inheritance :: proc(
 	} else {
 		spliced.content = spliced_parent
 	}
-	if !validate_no_orphan_super_in_nodes(ctx, spliced.content[:], child_src, child_file) {
-		return {}, false
+	if nodes_contain_any_super(spliced.content[:]) {
+		if !validate_no_orphan_super_in_nodes(ctx, spliced.content[:], child_src, child_file) {
+			return {}, false
+		}
 	}
 	if !validate_macro_calls_in_template(ctx, spliced.content[:], child_src, child_file) {
 		return {}, false
 	}
+	if len(child_file) > 0 && child_file != ctx.inline_file {
+		store_resolved_cache(ctx, child_file, spliced)
+	}
 	return spliced, true
+}
+
+@(private = "file")
+nodes_contain_call :: proc(nodes: []Node) -> bool {
+	visit_cb :: proc(body: []Node, _: rawptr) -> bool {
+		return !nodes_contain_call(body)
+	}
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Call:
+			return true
+		case ^Node_Block:
+			if nodes_contain_call(d.body[:]) {
+				return true
+			}
+		case ^Node_Macro:
+			if nodes_contain_call(d.body[:]) {
+				return true
+			}
+		case:
+			if !walk_branch_children(node, nil, visit_cb) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+@(private = "file")
+nodes_contain_any_super :: proc(nodes: []Node) -> bool {
+	visit_cb :: proc(body: []Node, _: rawptr) -> bool {
+		return !nodes_contain_any_super(body)
+	}
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Super:
+			return true
+		case ^Node_Block:
+			if nodes_contain_any_super(d.body[:]) {
+				return true
+			}
+		case:
+			if !walk_branch_children(node, nil, visit_cb) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 validate_macro_calls_in_template :: proc(
@@ -2383,25 +2881,43 @@ validate_macro_calls_in_template :: proc(
 	fallback_src: []byte,
 	fallback_file: string,
 ) -> bool {
-	macros := make(map[string]^Node_Macro, ctx.allocator)
+	if !nodes_contain_call(nodes) {
+		return true
+	}
+	inline_macros: [16]^Node_Macro
+	macro_count := 0
+	var_macros: [dynamic]^Node_Macro
+
 	for node in nodes {
 		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-			macros[mac.name] = mac
+			if macro_count < len(inline_macros) {
+				inline_macros[macro_count] = mac
+				macro_count += 1
+			} else {
+				if var_macros == nil {
+					var_macros = make([dynamic]^Node_Macro, 0, macro_count * 2, ctx.allocator)
+					for m in inline_macros {
+						append(&var_macros, m)
+					}
+				}
+				append(&var_macros, mac)
+			}
 		}
 	}
-	return validate_macro_calls_in_nodes(ctx, nodes, macros, fallback_src, fallback_file)
+	macros_slice := var_macros[:] if var_macros != nil else inline_macros[:macro_count]
+	return validate_macro_calls_in_nodes(ctx, nodes, macros_slice, fallback_src, fallback_file)
 }
 
 validate_macro_calls_in_nodes :: proc(
 	ctx: ^Compile_Context,
 	nodes: []Node,
-	macros: map[string]^Node_Macro,
+	macros: []^Node_Macro,
 	src: []byte,
 	file: string,
 ) -> bool {
 	Walk_State :: struct {
 		ctx:    ^Compile_Context,
-		macros: map[string]^Node_Macro,
+		macros: []^Node_Macro,
 		src:    []byte,
 		file:   string,
 	}
@@ -2500,6 +3016,31 @@ validate_no_orphan_super_in_nodes :: proc(
 	return true
 }
 
+has_layout_block_named :: proc(nodes: []Node, target: string) -> bool {
+	State :: struct {
+		target: string,
+	}
+	state := State{target}
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		s := cast(^State)user_data
+		return !has_layout_block_named(body, s.target)
+	}
+
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Block:
+			if d.name == target || has_layout_block_named(d.body[:], target) {
+				return true
+			}
+		case:
+			if !walk_branch_children(node, &state, visit_cb) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 collect_layout_blocks :: proc(nodes: []Node, out: ^map[string]^Node_Block) {
 	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
 		collect_layout_blocks(body, cast(^map[string]^Node_Block)user_data)
@@ -2517,86 +3058,218 @@ collect_layout_blocks :: proc(nodes: []Node, out: ^map[string]^Node_Block) {
 	}
 }
 
-clone_overrides_without :: proc(
-	ctx: ^Compile_Context,
-	overrides: map[string]^Node_Block,
-	exclude_name: string,
-) -> map[string]^Node_Block {
-	res := make(map[string]^Node_Block, len(overrides), ctx.allocator)
-	for k, v in overrides {
-		if k != exclude_name {
-			res[k] = v
+@(private = "file")
+find_override_block :: proc(overrides: []^Node_Block, name: string) -> ^Node_Block {
+	for b in overrides {
+		if b.name == name {
+			return b
 		}
 	}
-	return res
+	return nil
+}
+
+clone_overrides_without :: proc(
+	ctx: ^Compile_Context,
+	overrides: []^Node_Block,
+	exclude_name: string,
+) -> []^Node_Block {
+	if len(overrides) <= 1 {
+		return nil
+	}
+	n := 0
+	res_backing := make([]^Node_Block, len(overrides) - 1, ctx.allocator)
+	for v in overrides {
+		if v.name != exclude_name {
+			res_backing[n] = v
+			n += 1
+		}
+	}
+	return res_backing[:n]
+}
+
+@(private = "file")
+nodes_contain_block :: proc(nodes: []Node) -> bool {
+	visit_cb :: proc(body: []Node, _: rawptr) -> bool {
+		return !nodes_contain_block(body)
+	}
+	for node in nodes {
+		if _, is_blk := node.derived.(^Node_Block); is_blk {
+			return true
+		}
+		if !walk_branch_children(node, nil, visit_cb) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private = "file")
+nodes_contain_super :: proc(nodes: []Node) -> bool {
+	visit_cb :: proc(body: []Node, _: rawptr) -> bool {
+		return !nodes_contain_super(body)
+	}
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Super:
+			return true
+		case ^Node_Block:
+			// Do not inspect inside nested `Node_Block` (outer block's `super` does not substitute there)
+			continue
+		case:
+			if !walk_branch_children(node, nil, visit_cb) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+@(private = "file")
+nodes_need_coalesce :: proc(nodes: []Node) -> bool {
+	prev_txt := false
+	for node in nodes {
+		if txt, is_txt := node.derived.(^Node_Text); is_txt {
+			if len(txt.text.value) == 0 || prev_txt {
+				return true
+			}
+			prev_txt = true
+		} else {
+			prev_txt = false
+		}
+	}
+	return false
+}
+
+@(private = "file")
+append_coalesced_node :: proc(ctx: ^Compile_Context, out: ^[dynamic]Node, node: Node) {
+	if txt, is_txt := node.derived.(^Node_Text); is_txt {
+		if len(txt.text.value) == 0 {
+			return
+		}
+		if len(out^) > 0 {
+			if prev_txt, is_prev_txt := out^[len(out^) - 1].derived.(^Node_Text); is_prev_txt {
+				merged := alloc_ctx_node(ctx, Node_Text)
+				merged.derived = merged
+				merged.text = prev_txt.text
+				merged.text.value = strings.concatenate({prev_txt.text.value, txt.text.value}, ctx.allocator)
+				out^[len(out^) - 1] = merged
+				return
+			}
+		}
+	}
+	append(out, node)
 }
 
 splice_nodes :: proc(
 	ctx: ^Compile_Context,
 	nodes: []Node,
-	overrides: map[string]^Node_Block,
+	overrides: []^Node_Block,
+	flatten_blocks := false,
 ) -> [dynamic]Node {
-	overrides_copy := overrides
-	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
-		ovr := (cast(^map[string]^Node_Block)user_data)^
-		return splice_nodes(ctx, body, ovr)
+	if len(overrides) == 0 && (!nodes_contain_block(nodes) || !flatten_blocks) {
+		if !nodes_need_coalesce(nodes) {
+			out := make([dynamic]Node, len(nodes), ctx.allocator)
+			copy(out[:], nodes)
+			return out
+		}
+		return coalesce_adjacent_text_nodes(ctx, nodes)
 	}
 
-	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	Splice_State :: struct {
+		overrides:      []^Node_Block,
+		flatten_blocks: bool,
+	}
+	state := Splice_State{overrides, flatten_blocks}
+	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
+		s := cast(^Splice_State)user_data
+		return splice_nodes(ctx, body, s.overrides, s.flatten_blocks)
+	}
+
+	out := make([dynamic]Node, 0, len(nodes) + (4 if flatten_blocks else 0), ctx.allocator)
 	for node in nodes {
 		#partial switch d in node.derived {
 		case ^Node_Block:
-			if child_blk, has_override := overrides[d.name]; has_override {
-				inner_overrides := clone_overrides_without(ctx, overrides, d.name)
+			if child_blk := find_override_block(overrides, d.name); child_blk != nil {
+				parent_has_inner_blk := nodes_contain_block(d.body[:])
+				child_has_inner_blk := nodes_contain_block(child_blk.body[:])
+				if !parent_has_inner_blk && !child_has_inner_blk && !nodes_contain_super(child_blk.body[:]) {
+					if flatten_blocks {
+						for cn in child_blk.body {
+							append_coalesced_node(ctx, &out, cn)
+						}
+						continue
+					}
+					if !nodes_need_coalesce(child_blk.body[:]) {
+						append_coalesced_node(ctx, &out, child_blk)
+						continue
+					}
+				}
+				inner_overrides: []^Node_Block
+				if parent_has_inner_blk || child_has_inner_blk {
+					inner_overrides = clone_overrides_without(ctx, overrides, d.name)
+				}
 				// First splice any nested blocks inside the parent block body so `super()` gets them
-				spliced_parent_body := splice_nodes(ctx, d.body[:], inner_overrides)
-				// Splice any nested blocks declared inside the child override itself before substituting `super()`
-				spliced_child_body := splice_nodes(ctx, child_blk.body[:], inner_overrides)
+				spliced_parent_body := splice_nodes(ctx, d.body[:], inner_overrides, flatten_blocks) if (parent_has_inner_blk || flatten_blocks) else d.body
+				// Splice any nested blocks declared inside the child override itself before substituting `super()` (do not flatten yet so nested blocks do not inherit the outer block's `super()`)
+				spliced_child_body := splice_nodes(ctx, child_blk.body[:], inner_overrides, false) if child_has_inner_blk else child_blk.body
 				// Replace `Node_Super` inside the child block body with `spliced_parent_body`
-				final_body := substitute_super_nodes(ctx, spliced_child_body[:], spliced_parent_body[:])
+				final_body := substitute_super_nodes(ctx, spliced_child_body[:], spliced_parent_body[:], flatten_blocks)
 
-				new_blk := new(Node_Block, ctx.allocator)
-				new_blk^ = d^
-				new_blk.derived = new_blk
-				new_blk.body = final_body
-				append(&out, new_blk)
+				if flatten_blocks {
+					for fn in final_body {
+						append_coalesced_node(ctx, &out, fn)
+					}
+				} else {
+					child_blk.body = final_body
+					append_coalesced_node(ctx, &out, child_blk)
+				}
+			} else if !nodes_contain_block(d.body[:]) {
+				if flatten_blocks {
+					for dn in d.body {
+						append_coalesced_node(ctx, &out, dn)
+					}
+				} else if !nodes_need_coalesce(d.body[:]) {
+					append_coalesced_node(ctx, &out, d)
+				} else {
+					new_blk := alloc_ctx_node(ctx, Node_Block)
+					new_blk^ = d^
+					new_blk.derived = new_blk
+					new_blk.body = splice_nodes(ctx, d.body[:], overrides, false)
+					append_coalesced_node(ctx, &out, new_blk)
+				}
 			} else {
-				new_blk := new(Node_Block, ctx.allocator)
-				new_blk^ = d^
-				new_blk.derived = new_blk
-				new_blk.body = splice_nodes(ctx, d.body[:], overrides)
-				append(&out, new_blk)
+				spliced_body := splice_nodes(ctx, d.body[:], overrides, flatten_blocks)
+				if flatten_blocks {
+					for sn in spliced_body {
+						append_coalesced_node(ctx, &out, sn)
+					}
+				} else {
+					new_blk := alloc_ctx_node(ctx, Node_Block)
+					new_blk^ = d^
+					new_blk.derived = new_blk
+					new_blk.body = spliced_body
+					append_coalesced_node(ctx, &out, new_blk)
+				}
 			}
 		case:
-			if mapped, ok := map_branch_children(ctx, node, &overrides_copy, map_cb); ok {
-				append(&out, mapped)
+			if nodes_contain_block((&[1]Node{node})[:]) {
+				if mapped, ok := map_branch_children(ctx, node, &state, map_cb); ok {
+					append_coalesced_node(ctx, &out, mapped)
+				} else {
+					append_coalesced_node(ctx, &out, node)
+				}
 			} else {
-				append(&out, node)
+				append_coalesced_node(ctx, &out, node)
 			}
 		}
 	}
-	return coalesce_adjacent_text_nodes(ctx, out[:])
+	return out
 }
 
 coalesce_adjacent_text_nodes :: proc(ctx: ^Compile_Context, nodes: []Node) -> [dynamic]Node {
 	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
 	for node in nodes {
-		if txt, is_txt := node.derived.(^Node_Text); is_txt {
-			if len(txt.text.value) == 0 {
-				continue
-			}
-			if len(out) > 0 {
-				if prev_txt, is_prev_txt := out[len(out) - 1].derived.(^Node_Text); is_prev_txt {
-					merged := new(Node_Text, ctx.allocator)
-					merged.derived = merged
-					merged.text = prev_txt.text
-					merged.text.value = strings.concatenate({prev_txt.text.value, txt.text.value}, ctx.allocator)
-					out[len(out) - 1] = merged
-					continue
-				}
-			}
-		}
-		append(&out, node)
+		append_coalesced_node(ctx, &out, node)
 	}
 	return out
 }
@@ -2605,32 +3278,63 @@ substitute_super_nodes :: proc(
 	ctx: ^Compile_Context,
 	nodes: []Node,
 	parent_body: []Node,
+	flatten_blocks := false,
 ) -> [dynamic]Node {
-	parent_copy := parent_body
-	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
-		pb := (cast(^[]Node)user_data)^
-		return substitute_super_nodes(ctx, body, pb)
+	if !nodes_contain_super(nodes) && (!flatten_blocks || !nodes_contain_block(nodes)) {
+		if !nodes_need_coalesce(nodes) {
+			out := make([dynamic]Node, len(nodes), ctx.allocator)
+			copy(out[:], nodes)
+			return out
+		}
+		return coalesce_adjacent_text_nodes(ctx, nodes)
 	}
 
-	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	Sub_State :: struct {
+		parent_body:    []Node,
+		flatten_blocks: bool,
+	}
+	state := Sub_State{parent_body, flatten_blocks}
+	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
+		s := cast(^Sub_State)user_data
+		return substitute_super_nodes(ctx, body, s.parent_body, s.flatten_blocks)
+	}
+
+	out := make([dynamic]Node, 0, len(nodes) + len(parent_body), ctx.allocator)
 	for node in nodes {
 		#partial switch d in node.derived {
 		case ^Node_Super:
 			for pn in parent_body {
-				append(&out, pn)
+				append_coalesced_node(ctx, &out, pn)
 			}
 		case ^Node_Block:
 			// Do not substitute outer block's super inside an inner nested block
-			append(&out, node)
-		case:
-			if mapped, ok := map_branch_children(ctx, node, &parent_copy, map_cb); ok {
-				append(&out, mapped)
+			if flatten_blocks {
+				for bn in d.body {
+					if inner_blk, is_iblk := bn.derived.(^Node_Block); is_iblk {
+						flattened_inner := splice_nodes(ctx, (&[1]Node{inner_blk})[:], nil, true)
+						for fn in flattened_inner {
+							append_coalesced_node(ctx, &out, fn)
+						}
+					} else {
+						append_coalesced_node(ctx, &out, bn)
+					}
+				}
 			} else {
-				append(&out, node)
+				append_coalesced_node(ctx, &out, node)
+			}
+		case:
+			if nodes_contain_super((&[1]Node{node})[:]) || (flatten_blocks && nodes_contain_block((&[1]Node{node})[:])) {
+				if mapped, ok := map_branch_children(ctx, node, &state, map_cb); ok {
+					append_coalesced_node(ctx, &out, mapped)
+				} else {
+					append_coalesced_node(ctx, &out, node)
+				}
+			} else {
+				append_coalesced_node(ctx, &out, node)
 			}
 		}
 	}
-	return coalesce_adjacent_text_nodes(ctx, out[:])
+	return out
 }
 
 rewrite_embeds_relative_to_dir :: proc(
@@ -2667,11 +3371,17 @@ clone_block_with_resolved_embeds :: proc(
 	origin_file := "",
 	origin_src: []byte = nil,
 ) -> ^Node_Block {
-	new_blk := new(Node_Block, ctx.allocator)
+	if !nodes_need_embed_rewrite(blk.body[:]) && (len(blk.origin_file) == 0 || blk.origin_file == origin_file) {
+		apply_origin_fallback(&blk.origin_file, &blk.origin_src, origin_file, origin_src)
+		return blk
+	}
+	new_blk := alloc_ctx_node(ctx, Node_Block)
 	new_blk^ = blk^
 	new_blk.derived = new_blk
 	apply_origin_fallback(&new_blk.origin_file, &new_blk.origin_src, origin_file, origin_src)
-	new_blk.body = rewrite_nodes_embeds(ctx, blk.body[:], base_dir, origin_file, origin_src)
+	if nodes_need_embed_rewrite(blk.body[:]) {
+		new_blk.body = rewrite_nodes_embeds(ctx, blk.body[:], base_dir, origin_file, origin_src)
+	}
 	return new_blk
 }
 
@@ -2682,12 +3392,54 @@ clone_macro_with_resolved_embeds :: proc(
 	origin_file := "",
 	origin_src: []byte = nil,
 ) -> ^Node_Macro {
-	new_mac := new(Node_Macro, ctx.allocator)
+	if !nodes_need_embed_rewrite(mac.body[:]) && (len(mac.origin_file) == 0 || mac.origin_file == origin_file) {
+		apply_origin_fallback(&mac.origin_file, &mac.origin_src, origin_file, origin_src)
+		return mac
+	}
+	new_mac := alloc_ctx_node(ctx, Node_Macro)
 	new_mac^ = mac^
 	new_mac.derived = new_mac
 	apply_origin_fallback(&new_mac.origin_file, &new_mac.origin_src, origin_file, origin_src)
-	new_mac.body = rewrite_nodes_embeds(ctx, mac.body[:], base_dir, origin_file, origin_src)
+	if nodes_need_embed_rewrite(mac.body[:]) {
+		new_mac.body = rewrite_nodes_embeds(ctx, mac.body[:], base_dir, origin_file, origin_src)
+	}
 	return new_mac
+}
+
+@(private = "file")
+nodes_need_embed_rewrite :: proc(nodes: []Node) -> bool {
+	visit_cb :: proc(body: []Node, _: rawptr) -> bool {
+		return !nodes_need_embed_rewrite(body)
+	}
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Embed:
+			if len(d.resolved_path) == 0 || len(d.origin_file) == 0 {
+				return true
+			}
+		case ^Node_Super:
+			if len(d.origin_file) == 0 {
+				return true
+			}
+		case ^Node_Call:
+			if len(d.origin_file) == 0 {
+				return true
+			}
+		case ^Node_Block:
+			if nodes_need_embed_rewrite(d.body[:]) {
+				return true
+			}
+		case ^Node_Macro:
+			if nodes_need_embed_rewrite(d.body[:]) {
+				return true
+			}
+		case:
+			if !walk_branch_children(node, nil, visit_cb) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 rewrite_nodes_embeds :: proc(
@@ -2697,6 +3449,12 @@ rewrite_nodes_embeds :: proc(
 	origin_file := "",
 	origin_src: []byte = nil,
 ) -> [dynamic]Node {
+	if !nodes_need_embed_rewrite(nodes) {
+		out := make([dynamic]Node, len(nodes), ctx.allocator)
+		copy(out[:], nodes)
+		return out
+	}
+
 	Rewrite_State :: struct {
 		base_dir:    string,
 		origin_file: string,
@@ -2713,23 +3471,27 @@ rewrite_nodes_embeds :: proc(
 		#partial switch d in node.derived {
 		case ^Node_Embed:
 			rel := normalize_slash_path(d.path.value[1 : len(d.path.value)-1], ctx.allocator)
-			new_emb := new(Node_Embed, ctx.allocator)
+			new_emb := alloc_ctx_node(ctx, Node_Embed)
 			new_emb^ = d^
 			new_emb.derived = new_emb
 			apply_origin_fallback(&new_emb.origin_file, &new_emb.origin_src, origin_file, origin_src)
 			if len(new_emb.resolved_path) == 0 && !filepath.is_abs(rel) && len(base_dir) > 0 {
-				abs_path, _ := filepath.join({base_dir, rel}, ctx.allocator)
-				new_emb.resolved_path = normalize_slash_path(abs_path, ctx.allocator)
+				if len(origin_file) > 0 {
+					new_emb.resolved_path = join_relative_slash_path(origin_file, rel, ctx.allocator)
+				} else {
+					abs_path, _ := filepath.join({base_dir, rel}, ctx.allocator)
+					new_emb.resolved_path = normalize_slash_path(abs_path, ctx.allocator)
+				}
 			}
 			append(&out, new_emb)
 		case ^Node_Super:
-			new_sup := new(Node_Super, ctx.allocator)
+			new_sup := alloc_ctx_node(ctx, Node_Super)
 			new_sup^ = d^
 			new_sup.derived = new_sup
 			apply_origin_fallback(&new_sup.origin_file, &new_sup.origin_src, origin_file, origin_src)
 			append(&out, new_sup)
 		case ^Node_Call:
-			new_call := new(Node_Call, ctx.allocator)
+			new_call := alloc_ctx_node(ctx, Node_Call)
 			new_call^ = d^
 			new_call.derived = new_call
 			apply_origin_fallback(&new_call.origin_file, &new_call.origin_src, origin_file, origin_src)
@@ -2739,8 +3501,12 @@ rewrite_nodes_embeds :: proc(
 		case ^Node_Macro:
 			append(&out, clone_macro_with_resolved_embeds(ctx, d, base_dir, origin_file, origin_src))
 		case:
-			if mapped, ok := map_branch_children(ctx, node, &state, map_cb); ok {
-				append(&out, mapped)
+			if nodes_need_embed_rewrite((&[1]Node{node})[:]) {
+				if mapped, ok := map_branch_children(ctx, node, &state, map_cb); ok {
+					append(&out, mapped)
+				} else {
+					append(&out, node)
+				}
 			} else {
 				append(&out, node)
 			}
@@ -2775,8 +3541,7 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 	} else if filepath.is_abs(raw_path) {
 		fullpath = raw_path
 	} else {
-		joined_emb, _ := filepath.join({filepath.dir(embed_origin_file), raw_path}, ctx.allocator)
-		fullpath = normalize_slash_path(joined_emb, ctx.allocator)
+		fullpath = join_relative_slash_path(embed_origin_file, raw_path, ctx.allocator)
 	}
 
 	embed_pos := tokenizer.Pos{
@@ -2787,7 +3552,7 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 	}
 
 	// Cycle check across active stack
-	for frame in ctx.stack {
+	for frame in get_trace_frames(ctx) {
 		if frame.file == fullpath {
 			record_diagnostic(
 				ctx,
@@ -2809,14 +3574,13 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 		state.current_src = prev_src
 	}
 
-	append(&ctx.stack, Trace_Frame{
+	embed_frame_idx := push_trace_frame(ctx, Trace_Frame{
 		kind    = .Embed,
 		pos     = embed_pos,
 		file    = fullpath,
-		snippet = extract_line_snippet(embed_origin_src, embed_pos.line, ctx.allocator),
 		col_len = len(node.path.value),
 	})
-	defer pop(&ctx.stack)
+	defer pop_trace_frame(ctx)
 
 	templ, loaded_src, ok := load_and_resolve_template_file(
 		ctx,
@@ -2826,6 +3590,7 @@ embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawp
 		len(node.path.value),
 	)
 	if !ok {
+		set_trace_frame_snippet(ctx, embed_frame_idx, extract_line_snippet(embed_origin_src, embed_pos.line, ctx.allocator))
 		return false
 	}
 

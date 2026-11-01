@@ -490,14 +490,11 @@ test_three_level_inheritance_super_and_relative_embeds :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	testing.expect_value(t, len(ctx.diagnostics), 0)
 
-	// Verify all 3 levels and their relative embeds were spliced in the exact expected order
+	// Verify all 3 levels and their relative embeds were spliced and coalesced across block boundaries in the exact expected order
 	expected_fragments := []string{
-		`"<html>"`,
-		`"<meta>"`,
+		`"<html><meta>"`,
 		`"<link rel=\"icon\">"`,
-		`"<title>"`,
-		`"Home"`,
-		`"</title>"`,
+		`"<title>Home</title>"`,
 		`"<meta name=\"sec\">"`,
 		`"<main>BASE</main>"`,
 		`"<footer>foot</footer>"`,

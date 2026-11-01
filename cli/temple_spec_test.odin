@@ -31,12 +31,9 @@ spec_three_level_layout_inheritance_with_super_and_relative_embeds :: proc(t: ^t
 	upon_compiling_template(s, "/app/views/pages/home.html", relpath = "views/pages/home.html")
 
 	then_static_literals_render_in_order(s, {
-		"<html>",
-		"<meta>",
+		"<html><meta>",
 		`<link rel="icon">`,
-		"<title>",
-		"Home",
-		"</title>",
+		"<title>Home</title>",
 		`<meta name="sec">`,
 		"<main>BASE</main>",
 		"<footer>foot</footer>",
@@ -146,7 +143,7 @@ spec_output_expressions_and_pseudo_casts :: proc(t: ^testing.T) {
 		},
 		{
 			template      = "{{ len(this.items) }}",
-			expected_call = "__temple_io.write_int(__temple_w, len(this.items)) or_return",
+			expected_call = "__temple_write_int(__temple_w, len(this.items)) or_return",
 		},
 	}
 
@@ -170,6 +167,20 @@ spec_switch_approx_bytes_uses_largest_case_branch :: proc(t: ^testing.T) {
 
 	// 4 ("1234") + 25 (max case .B) + 6 ("123456") = 35
 	then_approx_bytes_is(s, 35)
+}
+
+@(test)
+spec_for_loop_approx_bytes_scales_by_loop_multiplier :: proc(t: ^testing.T) {
+	s := scenario_begin(t)
+	defer scenario_end(s)
+
+	upon_compiling_inline(
+		s,
+		`<ul>{% for item in this.items %}<li>{{ item }}</li>{% end %}</ul>`,
+	)
+
+	// 4 ("<ul>") + 8 * (4 ("<li>") + 10 ("{{ item }}") + 5 ("</li>")) + 5 ("</ul>") = 4 + 8 * 19 + 5 = 161
+	then_approx_bytes_is(s, 161)
 }
 
 @(test)
@@ -235,11 +246,15 @@ spec_ast_pipe_filters_and_fmt_expressions :: proc(t: ^testing.T) {
 		},
 		{
 			template      = `{{ this.items | len }}`,
-			expected_call = `__temple_io.write_int(__temple_w, len(this.items)) or_return`,
+			expected_call = `__temple_write_int(__temple_w, len(this.items)) or_return`,
 		},
 		{
 			template      = `{{ this.price | fmt("$%.2f") }}`,
-			expected_call = `__temple_write_fmt_escaped(__temple_w, "$%.2f", this.price) or_return`,
+			expected_call = `__temple_write_f64_prec(__temple_w, f64(this.price), 2) or_return`,
+		},
+		{
+			template      = `{{ this.price | fmt("$%6.2f") }}`,
+			expected_call = `__temple_write_fmt_escaped(__temple_w, "$%6.2f", this.price) or_return`,
 		},
 		{
 			template      = `{{ fmt("%s (%i)", this.name, this.count) }}`,
@@ -251,7 +266,7 @@ spec_ast_pipe_filters_and_fmt_expressions :: proc(t: ^testing.T) {
 		},
 		{
 			template      = `{{ (this.flags | 0x01) | int }}`,
-			expected_call = `__temple_io.write_int(__temple_w, int((this.flags | 0x01))) or_return`,
+			expected_call = `__temple_write_int(__temple_w, int((this.flags | 0x01))) or_return`,
 		},
 		{
 			template      = `{{ (this.a | this.b) | fmt("%x") }}`,
@@ -262,8 +277,20 @@ spec_ast_pipe_filters_and_fmt_expressions :: proc(t: ^testing.T) {
 			expected_call = `__temple_io.write_string(__temple_w, __temple_default(this.name, "Guest")) or_return`,
 		},
 		{
+			template      = `{{ raw(fmt("<b>%v</b>", this.name)) }}`,
+			expected_call = `__temple_write_fmt_raw(__temple_w, "<b>%v</b>", this.name) or_return`,
+		},
+		{
 			template      = `{{ raw(fmt("<b>%s</b>", this.name)) }}`,
-			expected_call = `__temple_write_fmt_raw(__temple_w, "<b>%s</b>", this.name) or_return`,
+			expected_call = `__temple_io.write_string(__temple_w, this.name) or_return`,
+		},
+		{
+			template      = `{{ len(this.items) | fmt("items=%i") }}`,
+			expected_call = `__temple_write_int(__temple_w, int(len(this.items))) or_return`,
+		},
+		{
+			template      = `{{ this.name | fmt("<%s>") }}`,
+			expected_call = `__temple_io.write_string(__temple_w, "&lt;") or_return`,
 		},
 	}
 
@@ -370,7 +397,11 @@ spec_valid_pipe_chains_and_trailing_comma_tolerance :: proc(t: ^testing.T) {
 	cases := []Valid_Case{
 		{
 			template      = `{{ this.price | fmt("<b>$%.2f</b>") | raw }}`,
-			expected_call = `__temple_write_fmt_raw(__temple_w, "<b>$%.2f</b>", this.price) or_return`,
+			expected_call = `__temple_write_f64_prec(__temple_w, f64(this.price), 2) or_return`,
+		},
+		{
+			template      = `{{ this.price | fmt("<b>$%v</b>") | raw }}`,
+			expected_call = `__temple_write_fmt_raw(__temple_w, "<b>$%v</b>", this.price) or_return`,
 		},
 		{
 			template      = `{{ this.bio | default("<i>None</i>") | raw }}`,
@@ -386,7 +417,11 @@ spec_valid_pipe_chains_and_trailing_comma_tolerance :: proc(t: ^testing.T) {
 		},
 		{
 			template      = `{{ this.price | fmt("$%.2f",) }}`,
-			expected_call = `__temple_write_fmt_escaped(__temple_w, "$%.2f", this.price) or_return`,
+			expected_call = `__temple_write_f64_prec(__temple_w, f64(this.price), 2) or_return`,
+		},
+		{
+			template      = `{{ this.price | fmt("$%v",) }}`,
+			expected_call = `__temple_write_fmt_escaped(__temple_w, "$%v", this.price) or_return`,
 		},
 		{
 			template      = `{{ fmt("%s: %i", this.name, this.count,) }}`,
@@ -721,7 +756,7 @@ spec_rejects_invalid_macro_and_call_declarations :: proc(t: ^testing.T) {
 
 @(test)
 spec_decoupled_codegen_qualifies_runtime_symbols_in_external_package :: proc(t: ^testing.T) {
-	template_src := `{{ this.title | default("Untitled") }}{{ this.headline | magic }}{{ this.price | fmt("$%.2f") }}{{ this.badge | fmt("<b>%s</b>") | raw }}{{ this.link | url }}{{ this.query | url_param }}{{ this.payload | js }}`
+	template_src := `{{ this.title | default("Untitled") }}{{ this.headline | magic }}{{ this.price | fmt("$%.2f") }}{{ this.price | fmt("$%6.2f") }}{{ this.badge | fmt("<b>%v</b>") | raw }}{{ this.link | url }}{{ this.query | url_param }}{{ this.payload | js }}`
 
 	// 1. Default `package temple` mode emits unqualified runtime calls and `Compiled(T)`
 	{
@@ -734,8 +769,9 @@ spec_decoupled_codegen_qualifies_runtime_symbols_in_external_package :: proc(t: 
 		then_generated_file_contains(s, "compiled :: proc \"contextless\" ($path: string, $T: typeid) -> Compiled(T) {")
 		then_emits_writer_call(s, `__temple_write_escaped_string(__temple_w, __temple_default(this.title, "Untitled")) or_return`)
 		then_emits_writer_call(s, `__temple_write_magic_string(__temple_w, this.headline) or_return`)
-		then_emits_writer_call(s, `__temple_write_fmt_escaped(__temple_w, "$%.2f", this.price) or_return`)
-		then_emits_writer_call(s, `__temple_write_fmt_raw(__temple_w, "<b>%s</b>", this.badge) or_return`)
+		then_emits_writer_call(s, `__temple_write_f64_prec(__temple_w, f64(this.price), 2) or_return`)
+		then_emits_writer_call(s, `__temple_write_fmt_escaped(__temple_w, "$%6.2f", this.price) or_return`)
+		then_emits_writer_call(s, `__temple_write_fmt_raw(__temple_w, "<b>%v</b>", this.badge) or_return`)
 		then_emits_writer_call(s, `__temple_write_safe_url(__temple_w, this.link) or_return`)
 		then_emits_writer_call(s, `__temple_write_url_param(__temple_w, this.query) or_return`)
 		then_emits_writer_call(s, `__temple_write_js_string(__temple_w, this.payload) or_return`)
@@ -755,8 +791,9 @@ spec_decoupled_codegen_qualifies_runtime_symbols_in_external_package :: proc(t: 
 		then_generated_file_contains(s, "compiled :: proc \"contextless\" ($path: string, $T: typeid) -> __temple.Compiled(T) {")
 		then_emits_writer_call(s, `__temple.__temple_write_escaped_string(__temple_w, __temple_default(this.title, "Untitled")) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_magic_string(__temple_w, this.headline) or_return`)
-		then_emits_writer_call(s, `__temple.__temple_write_fmt_escaped(__temple_w, "$%.2f", this.price) or_return`)
-		then_emits_writer_call(s, `__temple.__temple_write_fmt_raw(__temple_w, "<b>%s</b>", this.badge) or_return`)
+		then_emits_writer_call(s, `__temple.__temple_write_f64_prec(__temple_w, f64(this.price), 2) or_return`)
+		then_emits_writer_call(s, `__temple.__temple_write_fmt_escaped(__temple_w, "$%6.2f", this.price) or_return`)
+		then_emits_writer_call(s, `__temple.__temple_write_fmt_raw(__temple_w, "<b>%v</b>", this.badge) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_safe_url(__temple_w, this.link) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_url_param(__temple_w, this.query) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_js_string(__temple_w, this.payload) or_return`)

@@ -286,9 +286,9 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 		case:
 			t.type = .Text
 			if l.in_tag {
-				t.value = lexer_consume_tag_expr(l, "-}}", "}}", "-%}", "%}")
+				t.value = lexer_consume_tag_expr(l)
 			} else {
-				raw := lexer_consume_until(l, "{{", "{%", "{#", "{-#")
+				raw := lexer_consume_text_until_tag(l)
 				// Lookahead: if the next tag starts with `{{-`, `{%-`, `{#-`, or `{-#`, trim trailing whitespace
 				if (l.ch == '{' && lexer_peek(l) == '{' && lexer_peek(l, 2) == '-' && is_space_or_close(lexer_peek(l, 3))) ||
 				   (l.ch == '{' && lexer_peek(l) == '%' && lexer_peek(l, 2) == '-') ||
@@ -419,13 +419,58 @@ lexer_consume :: proc(l: ^Lexer, value: string) -> string {
 }
 
 @(private)
+lexer_consume_text_until_tag :: proc(l: ^Lexer) -> string {
+	start := l.cursor
+	src := l.source
+	n := len(src)
+
+	for l.ch != EOF {
+		// Advance at least 1 character from `start` before checking for a tag opener
+		lexer_read(l)
+		// Fast-forward through raw HTML text until `{` or EOF
+		for l.cursor < n && l.ch != '{' {
+			if l.ch == '\n' {
+				l.prev_ch = '\n'
+				l.cursor += 1
+				l.line += 1
+				l.bol = l.cursor
+				if l.cursor >= n {
+					l.ch = EOF
+					break
+				}
+				l.ch = src[l.cursor]
+			} else {
+				l.prev_ch = l.ch
+				l.cursor += 1
+				if l.cursor >= n {
+					l.ch = EOF
+					break
+				}
+				l.ch = src[l.cursor]
+			}
+		}
+		if l.ch == '{' {
+			next_b := lexer_peek(l, 1)
+			if next_b == '{' || next_b == '%' || next_b == '#' || (next_b == '-' && lexer_peek(l, 2) == '#') {
+				return string(src[start:l.cursor])
+			}
+		}
+	}
+
+	return string(src[start:])
+}
+
+@(private)
 lexer_consume_until :: proc(l: ^Lexer, terminators: ..string) -> string {
 	start := l.cursor
 	for l.ch != EOF {
 		lexer_read(l)
 
 		checks: for terminator in terminators {
-			for i in 0 ..< len(terminator) {
+			if l.ch != terminator[0] {
+				continue checks
+			}
+			for i in 1 ..< len(terminator) {
 				if terminator[i] != lexer_peek(l, i) {
 					// No match, check the next.
 					continue checks
@@ -441,8 +486,10 @@ lexer_consume_until :: proc(l: ^Lexer, terminators: ..string) -> string {
 }
 
 @(private)
-lexer_consume_tag_expr :: proc(l: ^Lexer, terminators: ..string) -> string {
+lexer_consume_tag_expr :: proc(l: ^Lexer) -> string {
 	start := l.cursor
+	src := l.source
+	n := len(src)
 	in_quote: byte = 0
 
 	for l.ch != EOF {
@@ -461,25 +508,41 @@ lexer_consume_tag_expr :: proc(l: ^Lexer, terminators: ..string) -> string {
 			continue
 		}
 
-		if l.ch == '"' || l.ch == '`' || l.ch == '\'' {
+		// Fast-forward unquoted expression characters that cannot close a tag or start a quote
+		for l.cursor < n {
+			c := l.ch
+			if c == '"' || c == '`' || c == '\'' || c == '-' || c == '}' || c == '%' || c == '\n' {
+				break
+			}
+			l.prev_ch = c
+			l.cursor += 1
+			if l.cursor >= n {
+				l.ch = EOF
+				return string(src[start:])
+			}
+			l.ch = src[l.cursor]
+		}
+
+		switch l.ch {
+		case '"', '`', '\'':
 			in_quote = l.ch
 			lexer_read(l)
 			continue
-		}
-
-		checks: for terminator in terminators {
-			for i in 0 ..< len(terminator) {
-				if terminator[i] != lexer_peek(l, i) {
-					continue checks
-				}
+		case '-':
+			next_b := lexer_peek(l, 1)
+			if (next_b == '}' || next_b == '%') && lexer_peek(l, 2) == '}' {
+				return string(src[start:l.cursor])
 			}
-			return string(l.source[start:l.cursor])
+		case '}', '%':
+			if lexer_peek(l, 1) == '}' {
+				return string(src[start:l.cursor])
+			}
 		}
 
 		lexer_read(l)
 	}
 
-	return string(l.source[start:])
+	return string(src[start:])
 }
 
 @(private)
@@ -494,18 +557,43 @@ lexer_peek :: proc(l: ^Lexer, offset: int = 1) -> byte {
 }
 
 lexer_skip_spaces :: proc(l: ^Lexer) {
-	for l.ch != EOF {
-		if l.ch != ' ' && l.ch != '\t' do return
-		lexer_read(l)
+	src := l.source
+	n := len(src)
+	for l.cursor < n && (l.ch == ' ' || l.ch == '\t') {
+		l.prev_ch = l.ch
+		l.cursor += 1
+		if l.cursor >= n {
+			l.ch = EOF
+			return
+		}
+		l.ch = src[l.cursor]
 	}
 }
 
 lexer_skip_all_whitespace :: proc(l: ^Lexer) {
-	for l.ch != EOF {
-		switch l.ch {
-		case ' ', '\t', '\n', '\r':
-			lexer_read(l)
-		case:
+	src := l.source
+	n := len(src)
+	for l.cursor < n {
+		c := l.ch
+		if c == ' ' || c == '\t' || c == '\r' {
+			l.prev_ch = c
+			l.cursor += 1
+			if l.cursor >= n {
+				l.ch = EOF
+				return
+			}
+			l.ch = src[l.cursor]
+		} else if c == '\n' {
+			l.prev_ch = '\n'
+			l.cursor += 1
+			l.line += 1
+			l.bol = l.cursor
+			if l.cursor >= n {
+				l.ch = EOF
+				return
+			}
+			l.ch = src[l.cursor]
+		} else {
 			return
 		}
 	}
