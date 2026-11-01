@@ -1,20 +1,24 @@
 package temple_cli
 
-import "core:bufio"
 import "core:fmt"
 import "core:io"
 import "core:mem"
 import "core:odin/ast"
-import "core:odin/parser"
+import odin_parser "core:odin/parser"
 import "core:odin/tokenizer"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
+import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 
 Compile_Call :: struct {
-	pos:  tokenizer.Pos,
-	type: Call_Type,
+	pos:        tokenizer.Pos,
+	identifier: string,
+	type:       Call_Type,
 }
 
 Call_Type :: union {
@@ -29,6 +33,56 @@ Call_Inline :: struct {
 Call_Path :: struct {
 	fullpath: string,
 	relpath:  string,
+}
+
+Temple_Proc_Kind :: enum {
+	None,
+	Compiled,
+	Compiled_Inline,
+}
+
+Trace_Kind :: enum {
+	Call_Site, // temple.compiled(...) in .odin code
+	Embed,     // embed "..." in a template
+	Extends,   // extends "..." in a template
+}
+
+Trace_Frame :: struct {
+	kind:    Trace_Kind,
+	pos:     tokenizer.Pos, // Where the call/embed/extends occurred
+	file:    string,        // Resolved target file being loaded
+	snippet: string,        // Optional source line where the tag occurred
+	col_len: int,           // Length of token to underline
+}
+
+Diagnostic :: struct {
+	pos:       tokenizer.Pos, // Exact location of the error in the leaf template
+	message:   string,
+	snippet:   string,
+	caret_col: int,
+	col_len:   int,
+	trace:     []Trace_Frame, // Cloned snapshot of Compile_Context.stack
+}
+
+Cached_Template :: struct {
+	source:   []byte,
+	template: Template,
+}
+
+Compile_Context :: struct {
+	stack:       [dynamic]Trace_Frame,
+	diagnostics: [dynamic]Diagnostic,
+	raw_cache:   map[string]Cached_Template,
+	allocator:   mem.Allocator,
+	inline_file: string,
+	inline_pos:  tokenizer.Pos,
+}
+
+Transpiled_Template :: struct {
+	identifier:  string,
+	code:        string,
+	diagnostics: [dynamic]Diagnostic,
+	ok:          bool,
 }
 
 main :: proc() {
@@ -65,107 +119,129 @@ error :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) -> ! {
 	os.exit(1)
 }
 
+print_diagnostic :: proc(d: Diagnostic) {
+	fmt.eprintf("\x1b[1;31merror\x1b[0m: %s\n", d.message)
+	if len(d.pos.file) > 0 {
+		fmt.eprintf("  \x1b[1;34m-->\x1b[0m %s:%i:%i\n", d.pos.file, d.pos.line, d.pos.column)
+	}
+	if len(d.snippet) > 0 && d.pos.line > 0 {
+		line_str := fmt.tprintf("%i", d.pos.line)
+		pad := strings.repeat(" ", len(line_str), context.temp_allocator)
+		fmt.eprintf("   %s \x1b[1;34m|\x1b[0m\n", pad)
+		fmt.eprintf("   \x1b[1;34m%s |\x1b[0m %s\n", line_str, d.snippet)
+		col := d.caret_col if d.caret_col > 0 else d.pos.column
+		caret_offset := max(col - 1, 0)
+		caret_pad := strings.repeat(" ", caret_offset, context.temp_allocator)
+		caret_len := max(d.col_len, 1)
+		carets := strings.repeat("^", caret_len, context.temp_allocator)
+		fmt.eprintf("   %s \x1b[1;34m|\x1b[0m %s\x1b[1;31m%s\x1b[0m\n", pad, caret_pad, carets)
+	}
+
+	// Walk trace in reverse from leaf back to root Odin call site
+	#reverse for frame in d.trace {
+		switch frame.kind {
+		case .Embed:
+			fmt.eprintf("  \x1b[1;34m=\x1b[0m embedded from %s:%i:%i\n", frame.pos.file, frame.pos.line, frame.pos.column)
+		case .Extends:
+			fmt.eprintf("  \x1b[1;34m=\x1b[0m extended from %s:%i:%i\n", frame.pos.file, frame.pos.line, frame.pos.column)
+		case .Call_Site:
+			fmt.eprintf("  \x1b[1;34m=\x1b[0m required by `temple.compiled` at %s:%i:%i\n", frame.pos.file, frame.pos.line, frame.pos.column)
+		}
+	}
+}
+
+extract_line_snippet :: proc(source: []byte, one_based_line: int, allocator := context.temp_allocator) -> string {
+	if len(source) == 0 || one_based_line <= 0 {
+		return ""
+	}
+	curr_line := 1
+	for i := 0; i < len(source); i += 1 {
+		if curr_line == one_based_line {
+			line_end := i
+			for line_end < len(source) && source[line_end] != '\n' && source[line_end] != '\r' {
+				line_end += 1
+			}
+			// Replace tabs with single spaces so column alignment matches
+			raw_line := string(source[i:line_end])
+			res, _ := strings.replace_all(raw_line, "\t", " ", allocator)
+			return res
+		}
+		if source[i] == '\n' {
+			curr_line += 1
+		}
+	}
+	return ""
+}
+
+record_diagnostic :: proc(
+	ctx: ^Compile_Context,
+	pos: tokenizer.Pos,
+	source: []byte,
+	col_len: int,
+	msg: string,
+	args: ..any,
+	snippet_line := 0,
+	snippet_col := 0,
+) {
+	context.allocator = ctx.allocator
+	d: Diagnostic
+	d.pos = pos
+	target_line := snippet_line if snippet_line > 0 else pos.line
+	target_col := snippet_col if snippet_col > 0 else pos.column
+	if len(ctx.inline_file) > 0 && pos.file == ctx.inline_file && snippet_line == 0 {
+		// Map 1-based inline template coordinates to the Odin call site's file coordinates
+		zero_line := max(pos.line - 1, 0)
+		zero_col := max(pos.column - 1, 0)
+		d.pos.line = ctx.inline_pos.line + zero_line
+		d.pos.column = (ctx.inline_pos.column + zero_col) if zero_line == 0 else (zero_col + 1)
+		target_line = pos.line
+		target_col = pos.column
+	}
+	d.pos.file = strings.clone(d.pos.file, ctx.allocator)
+	d.message = fmt.aprintf(msg, ..args)
+	d.snippet = extract_line_snippet(source, target_line, ctx.allocator)
+	d.caret_col = target_col
+	d.col_len = max(col_len, 1)
+
+	frames := make([]Trace_Frame, len(ctx.stack), ctx.allocator)
+	for f, i in ctx.stack {
+		frames[i] = f
+		if len(ctx.inline_file) > 0 && f.pos.file == ctx.inline_file && f.kind != .Call_Site {
+			zero_line := max(f.pos.line - 1, 0)
+			zero_col := max(f.pos.column - 1, 0)
+			frames[i].pos.line = ctx.inline_pos.line + zero_line
+			frames[i].pos.column = (ctx.inline_pos.column + zero_col) if zero_line == 0 else (zero_col + 1)
+		}
+		frames[i].pos.file = strings.clone(f.pos.file, ctx.allocator)
+		frames[i].file = strings.clone(f.file, ctx.allocator)
+		frames[i].snippet = strings.clone(f.snippet, ctx.allocator)
+	}
+	d.trace = frames
+	append(&ctx.diagnostics, d)
+}
+
+// ============================================================================
+// Stage 1: Collect `compiled` and `compiled_inline` Calls
+// ============================================================================
+
 collect_compile_calls :: proc(
 	root: string,
 	allocator := context.allocator,
+	out_errors: ^[dynamic]string = nil,
 ) -> (
 	calls: [dynamic]Compile_Call,
 ) {
-	Collect_State :: struct {
-		allocator: mem.Allocator,
-		pkg:       ^ast.Package,
-		calls:     ^[dynamic]Compile_Call,
-	}
+	calls.allocator = allocator
+	seen_identifiers := make(map[string]string, context.temp_allocator)
 
-	s: Collect_State
-	s.calls = &calls
-	s.calls.allocator = allocator
-	s.allocator = allocator
-
-	// All stuff having to do with collection can be on the temp_allocator,
-	// only the returning calls are allocated on the allocator that is given.
 	context.allocator = context.temp_allocator
 
 	fmt.printf("looking for compile calls in %q\n", root)
 
-	visit_dir :: proc(dir_path: string, s: ^Collect_State) {
-		pkg, ok := parser.parse_package_from_path(dir_path)
-		if !ok || len(pkg.files) == 0 {
-			return
-		}
+	// TODO: does not support symbolic links, communicate it to users.
 
-		s.pkg = pkg
-
-		v := ast.Visitor {
-			data = s,
-			visit = proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
-				if node == nil do return nil
-
-				#partial switch n in node.derived {
-				case ^ast.Call_Expr:
-					selector, ok := n.expr.derived_expr.(^ast.Selector_Expr)
-					if !ok do return nil
-
-					ident, iok := selector.expr.derived_expr.(^ast.Ident)
-					if !iok do return nil
-
-					if ident.name != "temple" {
-						return nil
-					}
-
-					if selector.field.name != "compiled" && selector.field.name != "compiled_inline" {
-						return nil
-					}
-
-					s := cast(^Collect_State)visitor.data
-
-					if len(n.args) != 2 {
-						error(
-							n.pos,
-							"calls to `temple.compiled` and `temple.compiled_inline` expect 2 arguments, got %i",
-							len(n.args),
-						)
-					}
-
-					path, pok := n.args[0].derived_expr.(^ast.Basic_Lit)
-					if !pok || path.tok.kind != .String {
-						error(
-							n.pos,
-							"the path/template argument of `temple.compiled` and `temple.compiled_inline` only accepts string literals",
-						)
-					}
-
-					c: Compile_Call
-					c.pos = path.pos
-					c.pos.file = strings.clone(c.pos.file, s.allocator)
-
-					switch selector.field.name {
-					case "compiled":
-						cp: Call_Path
-						defer c.type = cp
-
-						unquoted_path := strings.trim(path.tok.text, "\"`")
-
-						cp.relpath = strings.clone(unquoted_path, s.allocator)
-						cp.fullpath, _ = filepath.join({s.pkg.fullpath, unquoted_path}, s.allocator)
-
-					case "compiled_inline":
-						cp: Call_Inline
-						cp.template = strings.clone(strings.trim(path.tok.text, "\"`"), s.allocator)
-						c.type = cp
-					}
-
-					append(s.calls, c)
-				}
-
-				return visitor
-			},
-		}
-
-		ast.walk(&v, pkg)
-	}
-
-	visit_dir(root, &s)
+	dirs := make([dynamic]string, context.temp_allocator)
+	append(&dirs, root)
 
 	w := filepath.walker_create(root)
 	defer filepath.walker_destroy(&w)
@@ -185,15 +261,821 @@ collect_compile_calls :: proc(
 			continue
 		}
 
-		visit_dir(info.fullpath, &s)
+		append(&dirs, strings.clone(info.fullpath, context.temp_allocator))
+	}
+
+	if path, err := filepath.walker_error(&w); err != nil {
+		warn(nil, "%q error: %v", path, err)
+	}
+
+	slice.sort(dirs[1:])
+	for dir_path in dirs {
+		collect_from_dir(dir_path, &calls, &seen_identifiers, allocator, out_errors)
 	}
 
 	return
 }
 
+Odin_Candidate_File :: struct {
+	fullpath: string,
+	src:      string,
+	ast_file: ^ast.File,
+}
+
+collect_from_dir :: proc(
+	dir_path: string,
+	calls: ^[dynamic]Compile_Call,
+	seen_identifiers: ^map[string]string,
+	out_allocator: mem.Allocator,
+	out_errors: ^[dynamic]string = nil,
+) {
+	pkg_path, pkg_path_err := os.get_absolute_path(dir_path, context.temp_allocator)
+	if pkg_path_err != nil {
+		return
+	}
+
+	dir_handle, open_err := os.open(pkg_path)
+	if open_err != nil {
+		return
+	}
+	entries, read_err := os.read_dir(dir_handle, -1, context.temp_allocator)
+	os.close(dir_handle)
+	if read_err != nil || len(entries) == 0 {
+		return
+	}
+
+	matches := make([dynamic]string, context.temp_allocator)
+	for entry in entries {
+		if entry.type != .Directory && strings.has_suffix(entry.name, ".odin") {
+			append(&matches, entry.fullpath)
+		}
+	}
+	if len(matches) == 0 {
+		return
+	}
+	slice.sort(matches[:])
+
+	// Read files in this package; check if any file in the package mentions "temple"
+	raw_files := make([dynamic]Odin_Candidate_File, context.temp_allocator)
+	pkg_mentions_temple := false
+
+	for match in matches {
+		fullpath, fp_err := os.get_absolute_path(match, context.temp_allocator)
+		if fp_err != nil {
+			continue
+		}
+		// Skip generated templates.odin itself
+		if filepath.base(fullpath) == "templates.odin" {
+			continue
+		}
+
+		src_bytes, rerr := os.read_entire_file(fullpath, context.temp_allocator)
+		if rerr != nil {
+			continue
+		}
+		src := string(src_bytes)
+		if strings.trim_space(src) == "" {
+			continue
+		}
+		if strings.contains(src, "temple") {
+			pkg_mentions_temple = true
+		}
+		append(&raw_files, Odin_Candidate_File{fullpath = fullpath, src = src})
+	}
+
+	// Fast pre-filter: if no file in this package mentions "temple", skip AST parsing completely
+	if !pkg_mentions_temple {
+		return
+	}
+
+	NO_POS :: tokenizer.Pos{}
+	pkg := ast.new(ast.Package, NO_POS, NO_POS)
+	pkg.fullpath = pkg_path
+
+	p := odin_parser.default_parser()
+	p.err = odin_silent_err_handler
+	p.warn = odin_silent_warn_handler
+
+	// Parse files in the package that either mention "temple" or define constants
+	parsed_files := make([dynamic]^ast.File, context.temp_allocator)
+	for &rf in raw_files {
+		file := ast.new(ast.File, NO_POS, NO_POS)
+		file.pkg = pkg
+		file.src = rf.src
+		file.fullpath = rf.fullpath
+		if odin_parser.parse_file(&p, file) {
+			append(&parsed_files, file)
+		}
+	}
+
+	if len(parsed_files) == 0 {
+		return
+	}
+
+	// Pass 1: Build per-file temple import alias table and package-level constant tables
+	file_temple_pkgs := make(map[^ast.File][dynamic]string, context.temp_allocator)
+	pkg_string_consts := make(map[string]^ast.Expr, context.temp_allocator)
+	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, context.temp_allocator)
+
+	has_any_temple_import := false
+
+	for file in parsed_files {
+		import_names := make([dynamic]string, context.temp_allocator)
+		for imp in file.imports {
+			trimmed_path := strings.trim(imp.fullpath, "\"`")
+			// Match `import "temple"`, `import ".../temple"`, `import "collection:temple"`, or relative `import temple "../"`
+			is_temple := trimmed_path == "temple" ||
+				strings.has_suffix(trimmed_path, "/temple") ||
+				strings.has_suffix(trimmed_path, ":temple") ||
+				imp.name.text == "temple"
+			if is_temple {
+				has_any_temple_import = true
+				alias := imp.name.text if len(imp.name.text) > 0 else "temple"
+				append(&import_names, alias)
+			}
+		}
+		file_temple_pkgs[file] = import_names
+
+		// Collect top-level constant declarations
+		for decl in file.decls {
+			collect_top_level_consts(decl, &pkg_string_consts)
+		}
+	}
+
+	// If no file in this package imports temple, fallback to allowing "temple" identifier
+	// in case the user is in a sub-file or test setup without standard import path suffix
+	if !has_any_temple_import {
+		for file in parsed_files {
+			if strings.contains(file.src, "temple") {
+				append(&file_temple_pkgs[file], "temple")
+			}
+		}
+	}
+
+	// Resolve constant procedure aliases (e.g. `c :: temple.compiled` or `ci :: t.compiled_inline`)
+	// Iteratively resolve aliases in case of chained aliases `c1 :: temple.compiled; c2 :: c1`
+	for _ in 0 ..< 3 {
+		for file in parsed_files {
+			temple_names := file_temple_pkgs[file]
+			for decl in file.decls {
+				collect_proc_aliases(decl, temple_names[:], &pkg_proc_aliases)
+			}
+		}
+	}
+
+	// Evaluate package-level string constants
+	resolved_consts := make(map[string]string, context.temp_allocator)
+	for name, expr in pkg_string_consts {
+		visited := make(map[string]bool, context.temp_allocator)
+		if val, ok := eval_const_string_from_ast(expr, pkg_string_consts, &visited); ok {
+			resolved_consts[name] = val
+		}
+	}
+
+	// Pass 2: Walk only files that import temple or reference a package-level temple alias
+	for file in parsed_files {
+		temple_names := file_temple_pkgs[file]
+		if len(temple_names) == 0 && len(pkg_proc_aliases) == 0 {
+			continue
+		}
+
+		// Clone maps per file/scope so procedure-local constants or shadowing variables do not mutate package-wide tables
+		file_proc_aliases := clone_proc_aliases(pkg_proc_aliases, context.temp_allocator)
+		file_string_consts := clone_string_consts(resolved_consts, context.temp_allocator)
+
+		walk_ctx := File_Collect_Ctx {
+			pkg_fullpath    = pkg.fullpath,
+			file            = file,
+			temple_names    = temple_names[:],
+			proc_aliases    = file_proc_aliases,
+			string_consts   = file_string_consts,
+			raw_const_exprs = pkg_string_consts,
+			calls           = calls,
+			seen            = seen_identifiers,
+			out_allocator   = out_allocator,
+			out_errors      = out_errors,
+		}
+
+		v := ast.Visitor {
+			data  = &walk_ctx,
+			visit = visit_odin_node,
+		}
+		for decl in file.decls {
+			ast.walk(&v, decl)
+		}
+	}
+}
+
+clone_proc_aliases :: proc(src: map[string]Temple_Proc_Kind, allocator := context.temp_allocator) -> map[string]Temple_Proc_Kind {
+	res := make(map[string]Temple_Proc_Kind, len(src), allocator)
+	for k, v in src {
+		res[k] = v
+	}
+	return res
+}
+
+clone_string_consts :: proc(src: map[string]string, allocator := context.temp_allocator) -> map[string]string {
+	res := make(map[string]string, len(src), allocator)
+	for k, v in src {
+		res[k] = v
+	}
+	return res
+}
+
+collect_top_level_consts :: proc(stmt: ^ast.Stmt, out_consts: ^map[string]^ast.Expr) {
+	if stmt == nil do return
+	#partial switch d in stmt.derived_stmt {
+	case ^ast.Value_Decl:
+		if d.is_mutable do return
+		for name_expr, i in d.names {
+			if i >= len(d.values) do break
+			if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+				out_consts[ident.name] = d.values[i]
+			}
+		}
+	case ^ast.When_Stmt:
+		if d.body != nil {
+			if blk, ok := d.body.derived_stmt.(^ast.Block_Stmt); ok {
+				for s in blk.stmts {
+					collect_top_level_consts(s, out_consts)
+				}
+			}
+		}
+		if d.else_stmt != nil {
+			if blk, ok := d.else_stmt.derived_stmt.(^ast.Block_Stmt); ok {
+				for s in blk.stmts {
+					collect_top_level_consts(s, out_consts)
+				}
+			} else {
+				collect_top_level_consts(d.else_stmt, out_consts)
+			}
+		}
+	}
+}
+
+collect_proc_aliases :: proc(
+	stmt: ^ast.Stmt,
+	temple_names: []string,
+	proc_aliases: ^map[string]Temple_Proc_Kind,
+) {
+	if stmt == nil do return
+	#partial switch d in stmt.derived_stmt {
+	case ^ast.Value_Decl:
+		if d.is_mutable do return
+		for name_expr, i in d.names {
+			if i >= len(d.values) do break
+			ident, ok := name_expr.derived_expr.(^ast.Ident)
+			if !ok do continue
+			val := ast.unparen_expr(d.values[i])
+			kind := resolve_temple_proc_expr(val, temple_names, proc_aliases^)
+			if kind != .None {
+				proc_aliases[ident.name] = kind
+			}
+		}
+	}
+}
+
+resolve_temple_proc_expr :: proc(
+	expr: ^ast.Expr,
+	temple_names: []string,
+	proc_aliases: map[string]Temple_Proc_Kind,
+) -> Temple_Proc_Kind {
+	if expr == nil do return .None
+	expr := ast.unparen_expr(expr)
+
+	#partial switch e in expr.derived_expr {
+	case ^ast.Selector_Expr:
+		ident, iok := e.expr.derived_expr.(^ast.Ident)
+		if !iok do return .None
+		is_temple_pkg := false
+		for tn in temple_names {
+			if ident.name == tn {
+				is_temple_pkg = true
+				break
+			}
+		}
+		if !is_temple_pkg do return .None
+		switch e.field.name {
+		case "compiled":
+			return .Compiled
+		case "compiled_inline":
+			return .Compiled_Inline
+		}
+	case ^ast.Ident:
+		if kind, found := proc_aliases[e.name]; found {
+			return kind
+		}
+	}
+	return .None
+}
+
+eval_const_string_from_ast :: proc(
+	expr: ^ast.Expr,
+	const_exprs: map[string]^ast.Expr,
+	visited: ^map[string]bool,
+) -> (string, bool) {
+	if expr == nil do return "", false
+	expr := ast.unparen_expr(expr)
+
+	#partial switch e in expr.derived_expr {
+	case ^ast.Basic_Lit:
+		if e.tok.kind == .String {
+			return unquote_odin_string(e.tok.text)
+		}
+	case ^ast.Binary_Expr:
+		if e.op.kind == .Add {
+			lhs, lok := eval_const_string_from_ast(e.left, const_exprs, visited)
+			if !lok do return "", false
+			rhs, rok := eval_const_string_from_ast(e.right, const_exprs, visited)
+			if !rok do return "", false
+			return strings.concatenate({lhs, rhs}, context.temp_allocator), true
+		}
+	case ^ast.Ident:
+		if visited[e.name] {
+			return "", false
+		}
+		if target, ok := const_exprs[e.name]; ok {
+			visited[e.name] = true
+			defer delete_key(visited, e.name)
+			return eval_const_string_from_ast(target, const_exprs, visited)
+		}
+	}
+	return "", false
+}
+
+eval_const_string :: proc(
+	expr: ^ast.Expr,
+	consts: map[string]string,
+	const_exprs: map[string]^ast.Expr,
+) -> (string, bool) {
+	if expr == nil do return "", false
+	expr := ast.unparen_expr(expr)
+
+	#partial switch e in expr.derived_expr {
+	case ^ast.Basic_Lit:
+		if e.tok.kind == .String {
+			return unquote_odin_string(e.tok.text)
+		}
+	case ^ast.Binary_Expr:
+		if e.op.kind == .Add {
+			lhs, lok := eval_const_string(e.left, consts, const_exprs)
+			if !lok do return "", false
+			rhs, rok := eval_const_string(e.right, consts, const_exprs)
+			if !rok do return "", false
+			return strings.concatenate({lhs, rhs}, context.temp_allocator), true
+		}
+	case ^ast.Ident:
+		if val, found := consts[e.name]; found {
+			return val, true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+unquote_odin_string :: proc(lit: string) -> (string, bool) {
+	if len(lit) < 2 {
+		return "", false
+	}
+	if lit[0] == '`' && lit[len(lit)-1] == '`' {
+		return lit[1 : len(lit)-1], true
+	}
+	if lit[0] == '"' && lit[len(lit)-1] == '"' {
+		res, allocated, ok := strconv.unquote_string(lit, context.temp_allocator)
+		_ = allocated
+		return res, ok
+	}
+	return "", false
+}
+
+File_Collect_Ctx :: struct {
+	pkg_fullpath:    string,
+	file:            ^ast.File,
+	temple_names:    []string,
+	proc_aliases:    map[string]Temple_Proc_Kind,
+	string_consts:   map[string]string,
+	raw_const_exprs: map[string]^ast.Expr,
+	calls:           ^[dynamic]Compile_Call,
+	seen:            ^map[string]string,
+	out_allocator:   mem.Allocator,
+	out_errors:      ^[dynamic]string,
+}
+
+collect_error :: proc(ctx: ^File_Collect_Ctx, pos: tokenizer.Pos, msg: string, args: ..any) {
+	if ctx.out_errors != nil {
+		prev_alloc := context.allocator
+		context.allocator = ctx.out_allocator
+		defer context.allocator = prev_alloc
+		append(ctx.out_errors, fmt.aprintf(msg, ..args))
+		return
+	}
+	error(pos, msg, ..args)
+}
+
+precollect_scope_consts :: proc(stmts: []^ast.Stmt, ctx: ^File_Collect_Ctx) {
+	for _ in 0 ..< 2 {
+		for stmt in stmts {
+			if stmt == nil do continue
+			if vdecl, ok := stmt.derived_stmt.(^ast.Value_Decl); ok && !vdecl.is_mutable {
+				for name_expr, i in vdecl.names {
+					if i >= len(vdecl.values) do break
+					if ident, iok := name_expr.derived_expr.(^ast.Ident); iok {
+						val_expr := vdecl.values[i]
+						if kind := resolve_temple_proc_expr(val_expr, ctx.temple_names, ctx.proc_aliases); kind != .None {
+							ctx.proc_aliases[ident.name] = kind
+							delete_key(&ctx.string_consts, ident.name)
+						} else if str_val, sok := eval_const_string(val_expr, ctx.string_consts, ctx.raw_const_exprs); sok {
+							ctx.string_consts[ident.name] = str_val
+							delete_key(&ctx.proc_aliases, ident.name)
+						} else {
+							delete_key(&ctx.string_consts, ident.name)
+							delete_key(&ctx.proc_aliases, ident.name)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor {
+	if node == nil do return nil
+
+	ctx := cast(^File_Collect_Ctx)visitor.data
+
+	#partial switch n in node.derived {
+	case ^ast.Proc_Lit:
+		// Isolate procedure-local constants and shadowing variables to this procedure's scope
+		scoped_ctx := ctx^
+		scoped_ctx.proc_aliases = clone_proc_aliases(ctx.proc_aliases, context.temp_allocator)
+		scoped_ctx.string_consts = clone_string_consts(ctx.string_consts, context.temp_allocator)
+		if n.type != nil {
+			if n.type.params != nil {
+				for field in n.type.params.list {
+					for name_expr in field.names {
+						if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+							delete_key(&scoped_ctx.string_consts, ident.name)
+							delete_key(&scoped_ctx.proc_aliases, ident.name)
+						}
+					}
+				}
+			}
+			if n.type.results != nil {
+				for field in n.type.results.list {
+					for name_expr in field.names {
+						if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+							delete_key(&scoped_ctx.string_consts, ident.name)
+							delete_key(&scoped_ctx.proc_aliases, ident.name)
+						}
+					}
+				}
+			}
+		}
+		scoped_v := ast.Visitor{
+			data  = &scoped_ctx,
+			visit = visit_odin_node,
+		}
+		if n.body != nil {
+			ast.walk(&scoped_v, n.body)
+		}
+		return nil
+
+	case ^ast.Block_Stmt:
+		// Isolate block-local constants and shadowing variables to this block's scope
+		scoped_ctx := ctx^
+		scoped_ctx.proc_aliases = clone_proc_aliases(ctx.proc_aliases, context.temp_allocator)
+		scoped_ctx.string_consts = clone_string_consts(ctx.string_consts, context.temp_allocator)
+		// Pre-collect non-mutable constant declarations in this block so order-independent constants resolve
+		precollect_scope_consts(n.stmts, &scoped_ctx)
+		scoped_v := ast.Visitor{
+			data  = &scoped_ctx,
+			visit = visit_odin_node,
+		}
+		for stmt in n.stmts {
+			ast.walk(&scoped_v, stmt)
+		}
+		return nil
+
+	case ^ast.Value_Decl:
+		// Support local constant declarations inside procedures/blocks, and handle shadowing by mutable variables
+		if !n.is_mutable {
+			for name_expr, i in n.names {
+				if i >= len(n.values) do break
+				if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+					val_expr := n.values[i]
+					if kind := resolve_temple_proc_expr(val_expr, ctx.temple_names, ctx.proc_aliases); kind != .None {
+						ctx.proc_aliases[ident.name] = kind
+						delete_key(&ctx.string_consts, ident.name)
+					} else if str_val, sok := eval_const_string(val_expr, ctx.string_consts, ctx.raw_const_exprs); sok {
+						ctx.string_consts[ident.name] = str_val
+						delete_key(&ctx.proc_aliases, ident.name)
+					} else {
+						delete_key(&ctx.string_consts, ident.name)
+						delete_key(&ctx.proc_aliases, ident.name)
+					}
+				}
+			}
+		} else {
+			for name_expr in n.names {
+				if ident, ok := name_expr.derived_expr.(^ast.Ident); ok {
+					delete_key(&ctx.string_consts, ident.name)
+					delete_key(&ctx.proc_aliases, ident.name)
+				}
+			}
+		}
+
+	case ^ast.Call_Expr:
+		kind := resolve_temple_proc_expr(n.expr, ctx.temple_names, ctx.proc_aliases)
+		if kind == .None {
+			return visitor
+		}
+
+		if len(n.args) != 2 {
+			collect_error(
+				ctx,
+				n.pos,
+				"calls to `temple.compiled` and `temple.compiled_inline` expect 2 arguments, got %i",
+				len(n.args),
+			)
+			return nil
+		}
+
+		// Support positional or named arguments: `temple.compiled(path = "...", T = ...)`
+		path_arg: ^ast.Expr
+		has_path := false
+		has_T := false
+		seen_named := false
+		had_arg_err := false
+		for arg, idx in n.args {
+			if fv, is_fv := arg.derived_expr.(^ast.Field_Value); is_fv {
+				seen_named = true
+				if field_ident, fok := fv.field.derived_expr.(^ast.Ident); fok {
+					if field_ident.name == "path" {
+						if has_path {
+							collect_error(
+								ctx,
+								fv.pos,
+								"duplicate parameter `path` in call to `temple.compiled`",
+							)
+							had_arg_err = true
+						}
+						has_path = true
+						path_arg = fv.value
+					} else if field_ident.name == "T" {
+						if has_T {
+							collect_error(
+								ctx,
+								fv.pos,
+								"duplicate parameter `T` in call to `temple.compiled`",
+							)
+							had_arg_err = true
+						}
+						has_T = true
+					} else {
+						collect_error(
+							ctx,
+							fv.pos,
+							"unknown named parameter %q in call to `temple.compiled` (expected `path` or `T`)",
+							field_ident.name,
+						)
+						had_arg_err = true
+					}
+				}
+			} else {
+				if seen_named {
+					collect_error(
+						ctx,
+						arg.pos,
+						"positional argument cannot follow named argument in call to `temple.compiled`",
+					)
+					had_arg_err = true
+				} else if idx == 0 {
+					has_path = true
+					path_arg = arg
+				} else if idx == 1 {
+					has_T = true
+				}
+			}
+		}
+
+		if had_arg_err {
+			return nil
+		}
+
+		if !has_path || path_arg == nil {
+			collect_error(
+				ctx,
+				n.pos,
+				"missing `path` argument in call to `temple.compiled`",
+			)
+			return nil
+		}
+
+		if !has_T {
+			collect_error(
+				ctx,
+				n.pos,
+				"missing `T` argument in call to `temple.compiled`",
+			)
+			return nil
+		}
+
+		resolved_str, ok := eval_const_string(path_arg, ctx.string_consts, ctx.raw_const_exprs)
+		if !ok {
+			collect_error(
+				ctx,
+				path_arg.pos,
+				"the path/template argument of `temple.compiled` and `temple.compiled_inline` must be a compile-time constant string expression",
+			)
+			return nil
+		}
+
+		target_fullpath := resolved_str
+		if kind == .Compiled && !filepath.is_abs(resolved_str) {
+			target_fullpath, _ = filepath.join({ctx.pkg_fullpath, resolved_str}, context.temp_allocator)
+		}
+
+		// Deduplicate calls with identical template identifier, erroring on cross-package collisions
+		if existing_fullpath, found := ctx.seen[resolved_str]; found {
+			if existing_fullpath != target_fullpath {
+				collect_error(
+					ctx,
+					path_arg.pos,
+					"duplicate template path identifier %q resolves to two different files: %q and %q",
+					resolved_str,
+					existing_fullpath,
+					target_fullpath,
+				)
+			}
+			return nil
+		}
+		ctx.seen[strings.clone(resolved_str, context.temp_allocator)] = strings.clone(target_fullpath, context.temp_allocator)
+
+		c: Compile_Call
+		c.pos = path_arg.pos
+		c.pos.file = strings.clone(c.pos.file, ctx.out_allocator)
+		c.identifier = strings.clone(resolved_str, ctx.out_allocator)
+
+		switch kind {
+		case .Compiled:
+			cp: Call_Path
+			cp.relpath = c.identifier
+			cp.fullpath = strings.clone(target_fullpath, ctx.out_allocator)
+			c.type = cp
+
+		case .Compiled_Inline:
+			cp: Call_Inline
+			cp.template = c.identifier
+			c.type = cp
+
+		case .None:
+		}
+
+		append(ctx.calls, c)
+		return nil
+	}
+
+	return visitor
+}
+
+// ============================================================================
+// Stage 2 & 3: Parallel Validation, Layout Splicing, & Transpilation -> Emit
+// ============================================================================
+
+Worker_Batch :: struct {
+	calls:      []Compile_Call,
+	results:    []Transpiled_Template,
+	heap_alloc: mem.Allocator,
+	heap_mutex: ^sync.Mutex,
+}
+
 transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
+	// Sort calls deterministically by identifier before compiling
+	slice.sort_by(calls, proc(a, b: Compile_Call) -> bool {
+		return a.identifier < b.identifier
+	})
+
+	results := make([]Transpiled_Template, len(calls))
+
+	if len(calls) > 0 {
+		heap_mutex: sync.Mutex
+		heap_alloc := context.allocator
+
+		// Use parallel worker threads when there are enough templates to amortize thread creation
+		num_workers := min(len(calls), 8) if len(calls) >= 8 else 1
+		if num_workers <= 1 {
+			batch := Worker_Batch{
+				calls      = calls,
+				results    = results,
+				heap_alloc = heap_alloc,
+				heap_mutex = &heap_mutex,
+			}
+			compile_batch_worker(&batch)
+		} else {
+			pool: thread.Pool
+			thread.pool_init(&pool, heap_alloc, num_workers)
+			defer thread.pool_destroy(&pool)
+			thread.pool_start(&pool)
+
+			chunk_size := (len(calls) + num_workers - 1) / num_workers
+			batches := make([dynamic]^Worker_Batch, 0, num_workers)
+			defer delete(batches)
+
+			for start := 0; start < len(calls); start += chunk_size {
+				end := min(start + chunk_size, len(calls))
+				b := new(Worker_Batch)
+				b.calls = calls[start:end]
+				b.results = results[start:end]
+				b.heap_alloc = heap_alloc
+				b.heap_mutex = &heap_mutex
+				append(&batches, b)
+				thread.pool_add_task(
+					&pool,
+					heap_alloc,
+					proc(task: thread.Task) {
+						batch := cast(^Worker_Batch)task.data
+						compile_batch_worker(batch)
+					},
+					b,
+				)
+			}
+
+			thread.pool_finish(&pool)
+			for b in batches {
+				free(b)
+			}
+		}
+	}
+
+	// Check for any diagnostics across all compiled calls
+	total_errors := 0
+	good_calls := 0
+	for res in results {
+		if len(res.diagnostics) > 0 {
+			for d in res.diagnostics {
+				print_diagnostic(d)
+				total_errors += 1
+			}
+		}
+		if res.ok {
+			good_calls += 1
+		}
+	}
+
+	if total_errors > 0 {
+		fmt.eprintf(
+			"\x1b[1;31mTemple Error:\x1b[0m failed to compile %i template(s) due to %i error(s); `templates.odin` was not modified\n",
+			len(calls) - good_calls,
+			total_errors,
+		)
+		os.exit(1)
+	}
+
+	// Stage 3: Emit to in-memory buffer and compare with existing `templates.odin`
 	compiled_path, _ := filepath.join({temple_path, "templates.odin"})
 	defer delete(compiled_path)
+
+	body_builder := strings.builder_make()
+	defer strings.builder_destroy(&body_builder)
+	bw := strings.to_writer(&body_builder)
+
+	write_generated_file_header_body(bw)
+
+	written := 0
+	for res in results {
+		if !res.ok do continue
+		if written > 0 {
+			io.write_string(bw, " else")
+		}
+		io.write_string(bw, res.code)
+		written += 1
+	}
+
+	write_generated_file_footer(bw, written > 0)
+	new_body := strings.to_string(body_builder)
+
+	// Skip disk write if existing `templates.odin` has identical body content
+	if existing_bytes, rerr := os.read_entire_file(compiled_path, context.temp_allocator); rerr == nil {
+		existing_body := strip_generated_timestamp_header(string(existing_bytes))
+		if existing_body == new_body {
+			fmt.printf("found %i compile calls of which %i were up-to-date (skipped writing unchanged templates.odin)\n", len(calls), good_calls)
+			return
+		}
+	}
+
+	// Build final file buffer with timestamp header (when calls > 0)
+	final_builder := strings.builder_make()
+	defer strings.builder_destroy(&final_builder)
+	fw := strings.to_writer(&final_builder)
+
+	if written > 0 {
+		fmt.wprintf(
+			fw,
+			"/* This file was generated by temple on %v - DO NOT EDIT! */\n",
+			time.now(),
+		)
+	}
+	io.write_string(fw, new_body)
 
 	handle, err := os.open(compiled_path, {.Write, .Create, .Trunc})
 	if err != nil {
@@ -201,44 +1083,868 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call) {
 	}
 	defer os.close(handle)
 
-	s := os.to_stream(handle)
-
-	bw: bufio.Writer
-	bufio.writer_init(&bw, s)
-	defer bufio.writer_destroy(&bw)
-	defer bufio.writer_flush(&bw)
-
-	w := bufio.writer_to_writer(&bw)
-
-	good_calls := len(calls)
-
-	write_generated_file_header(w, good_calls > 0)
-
-	for c, i in calls {
-		if !write_transpiled_call(w, c) {
-			good_calls -= 1
-			continue
-		}
-
-		if i != len(calls)-1 {
-			io.write_string(w, "else")
-		}
+	_, werr := os.write(handle, final_builder.buf[:])
+	if werr != nil {
+		error(nil, "%q: unable to write generated templates (%v)", compiled_path, werr)
 	}
 
-	write_generated_file_footer(w, good_calls > 0)
-
-	fmt.printf("found %i compile calls of which %i where successfully compiled\n", len(calls), good_calls)
+	fmt.printf("found %i compile calls of which %i were successfully compiled\n", len(calls), good_calls)
 }
 
-write_generated_file_header :: proc(w: io.Writer, has_calls: bool) {
-	if has_calls {
-		fmt.wprintf(
-			w,
-			"/* This file was generated by temple on %v - DO NOT EDIT! */\n",
-			time.now(),
-		)
+strip_generated_timestamp_header :: proc(content: string) -> string {
+	PREFIX :: "/* This file was generated by temple on "
+	if strings.has_prefix(content, PREFIX) {
+		if nl := strings.index_byte(content, '\n'); nl != -1 {
+			return content[nl+1:]
+		}
+	}
+	return content
+}
+
+compile_batch_worker :: proc(batch: ^Worker_Batch) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+
+	arena_alloc := mem.dynamic_arena_allocator(&arena)
+	context.allocator = arena_alloc
+	context.temp_allocator = arena_alloc
+
+	ctx: Compile_Context
+	ctx.allocator = arena_alloc
+	ctx.stack = make([dynamic]Trace_Frame, arena_alloc)
+	ctx.raw_cache = make(map[string]Cached_Template, arena_alloc)
+
+	for call, i in batch.calls {
+		clear(&ctx.stack)
+		ctx.diagnostics = make([dynamic]Diagnostic, arena_alloc)
+
+		code, ok := compile_single_call(&ctx, call)
+
+		sync.guard(batch.heap_mutex)
+		cloned_diags := make([dynamic]Diagnostic, 0, len(ctx.diagnostics), batch.heap_alloc)
+		for d in ctx.diagnostics {
+			cd := d
+			cd.pos.file = strings.clone(d.pos.file, batch.heap_alloc)
+			cd.message = strings.clone(d.message, batch.heap_alloc)
+			cd.snippet = strings.clone(d.snippet, batch.heap_alloc)
+			frames := make([]Trace_Frame, len(d.trace), batch.heap_alloc)
+			for f, fi in d.trace {
+				frames[fi] = f
+				frames[fi].pos.file = strings.clone(f.pos.file, batch.heap_alloc)
+				frames[fi].file = strings.clone(f.file, batch.heap_alloc)
+				frames[fi].snippet = strings.clone(f.snippet, batch.heap_alloc)
+			}
+			cd.trace = frames
+			append(&cloned_diags, cd)
+		}
+
+		batch.results[i] = Transpiled_Template {
+			identifier  = call.identifier,
+			code        = strings.clone(code, batch.heap_alloc) if ok else "",
+			diagnostics = cloned_diags,
+			ok          = ok && len(ctx.diagnostics) == 0,
+		}
+	}
+}
+
+compile_single_call :: proc(ctx: ^Compile_Context, call: Compile_Call) -> (code: string, ok: bool) {
+	context.allocator = ctx.allocator
+	context.temp_allocator = ctx.allocator
+
+	identifier: string
+	file: string
+	source: []byte
+	templ: Template
+
+	switch t in call.type {
+	case Call_Path:
+		identifier = t.relpath
+		file = t.fullpath
+
+		append(&ctx.stack, Trace_Frame{
+			kind = .Call_Site,
+			pos  = call.pos,
+			file = t.fullpath,
+		})
+		defer pop(&ctx.stack)
+
+		loaded_templ, loaded_src, load_ok := load_and_resolve_template_file(ctx, t.fullpath, call.pos, nil, 0)
+		if !load_ok {
+			return "", false
+		}
+		templ = loaded_templ
+		source = loaded_src
+
+		sb := strings.builder_make(ctx.allocator)
+		w := strings.to_writer(&sb)
+
+		embed_state := Embed_Callback_State {
+			ctx          = ctx,
+			current_file = file,
+			current_src  = source,
+		}
+
+		transpile(w, identifier, templ, embed_parser_with_ctx, &embed_state, ctx.allocator)
+		if len(ctx.diagnostics) > 0 {
+			return "", false
+		}
+
+		return strings.to_string(sb), true
+
+	case Call_Inline:
+		identifier = t.template
+		file = call.pos.file
+		source = transmute([]byte)t.template
+		ctx.inline_file = call.pos.file
+		ctx.inline_pos = call.pos
+		defer {
+			ctx.inline_file = ""
+			ctx.inline_pos = {}
+		}
+
+		append(&ctx.stack, Trace_Frame{
+			kind = .Call_Site,
+			pos  = call.pos,
+			file = call.pos.file,
+		})
+		defer pop(&ctx.stack)
+
+		p: Parser
+		parser_init(&p, source, ctx.allocator)
+		raw_templ := parse(&p)
+		if err, has_err := raw_templ.err.?; has_err {
+			pos := tokenizer.Pos{
+				offset = err.pos.offset,
+				line   = call.pos.line + err.pos.line,
+				column = (call.pos.column + err.pos.col) if err.pos.line == 0 else (err.pos.col + 1),
+				file   = call.pos.file,
+			}
+			record_diagnostic(
+				ctx,
+				pos,
+				source,
+				1,
+				"%s",
+				err.msg,
+				snippet_line = err.pos.line + 1,
+				snippet_col  = err.pos.col + 1,
+			)
+			return "", false
+		}
+
+		resolved_templ, res_ok := resolve_template_inheritance(ctx, raw_templ, source, file)
+		if !res_ok {
+			return "", false
+		}
+		templ = resolved_templ
+
+		sb := strings.builder_make(ctx.allocator)
+		w := strings.to_writer(&sb)
+
+		embed_state := Embed_Callback_State {
+			ctx          = ctx,
+			current_file = file,
+			current_src  = source,
+		}
+
+		transpile(w, identifier, templ, embed_parser_with_ctx, &embed_state, ctx.allocator)
+		if len(ctx.diagnostics) > 0 {
+			return "", false
+		}
+
+		return strings.to_string(sb), true
 	}
 
+	return "", false
+}
+
+load_raw_template :: proc(
+	ctx: ^Compile_Context,
+	fullpath: string,
+	req_pos: tokenizer.Pos,
+	req_src: []byte,
+	req_col_len: int,
+) -> (
+	templ: Template,
+	source: []byte,
+	ok: bool,
+) {
+	if cached, found := ctx.raw_cache[fullpath]; found {
+		return cached.template, cached.source, true
+	}
+
+	data, rerr := os.read_entire_file(fullpath, ctx.allocator)
+	if rerr != nil {
+		record_diagnostic(
+			ctx,
+			req_pos,
+			req_src,
+			req_col_len,
+			"unable to read template file %q (%v)",
+			fullpath,
+			rerr,
+		)
+		return {}, nil, false
+	}
+
+	p: Parser
+	parser_init(&p, data, ctx.allocator)
+	parsed := parse(&p)
+	if err, has_err := parsed.err.?; has_err {
+		pos := tokenizer.Pos{
+			offset = err.pos.offset,
+			line   = err.pos.line + 1,
+			column = err.pos.col + 1,
+			file   = fullpath,
+		}
+		record_diagnostic(ctx, pos, data, 1, "%s", err.msg)
+		return {}, nil, false
+	}
+
+	cloned_path := strings.clone(fullpath, ctx.allocator)
+	ctx.raw_cache[cloned_path] = Cached_Template{
+		source   = data,
+		template = parsed,
+	}
+	return parsed, data, true
+}
+
+load_and_resolve_template_file :: proc(
+	ctx: ^Compile_Context,
+	fullpath: string,
+	req_pos: tokenizer.Pos,
+	req_src: []byte,
+	req_col_len: int,
+) -> (
+	templ: Template,
+	source: []byte,
+	ok: bool,
+) {
+	raw_templ, raw_src, raw_ok := load_raw_template(ctx, fullpath, req_pos, req_src, req_col_len)
+	if !raw_ok {
+		return {}, nil, false
+	}
+
+	resolved, res_ok := resolve_template_inheritance(ctx, raw_templ, raw_src, fullpath)
+	if !res_ok {
+		return {}, nil, false
+	}
+	return resolved, raw_src, true
+}
+
+// ============================================================================
+// Goal 4: Layout Inheritance (`extends`, `block`, `super`)
+// ============================================================================
+
+find_extends_node :: proc(templ: Template) -> (^Node_Extends, bool) {
+	for node in templ.content {
+		if ext, is_ext := node.derived.(^Node_Extends); is_ext {
+			return ext, true
+		}
+	}
+	return nil, false
+}
+
+walk_branch_children :: proc(
+	node: Node,
+	user_data: rawptr,
+	visit_body: proc(body: []Node, user_data: rawptr) -> bool,
+) -> bool {
+	#partial switch d in node.derived {
+	case ^Node_If:
+		if !visit_body(d._if.body[:], user_data) do return false
+		for ef in d.elseifs {
+			if !visit_body(ef.body[:], user_data) do return false
+		}
+		if els, ok := d._else.?; ok {
+			if !visit_body(els.body[:], user_data) do return false
+		}
+	case ^Node_For:
+		if !visit_body(d.body[:], user_data) do return false
+	case ^Node_Switch:
+		for c in d.cases {
+			if !visit_body(c.body[:], user_data) do return false
+		}
+	}
+	return true
+}
+
+map_branch_children :: proc(
+	ctx: ^Compile_Context,
+	node: Node,
+	user_data: rawptr,
+	map_body: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node,
+) -> (
+	mapped: Node,
+	handled: bool,
+) {
+	#partial switch d in node.derived {
+	case ^Node_If:
+		new_if := new(Node_If, ctx.allocator)
+		new_if^ = d^
+		new_if.derived = new_if
+		new_if._if.body = map_body(ctx, d._if.body[:], user_data)
+		new_if.elseifs = make([dynamic]^Node_If_Part, 0, len(d.elseifs), ctx.allocator)
+		for ef in d.elseifs {
+			new_ef := new(Node_If_Part, ctx.allocator)
+			new_ef^ = ef^
+			new_ef.body = map_body(ctx, ef.body[:], user_data)
+			append(&new_if.elseifs, new_ef)
+		}
+		if els, has_els := d._else.?; has_els {
+			new_els := new(Node_If_Part, ctx.allocator)
+			new_els^ = els^
+			new_els.body = map_body(ctx, els.body[:], user_data)
+			new_if._else = new_els
+		}
+		return new_if, true
+	case ^Node_For:
+		new_for := new(Node_For, ctx.allocator)
+		new_for^ = d^
+		new_for.derived = new_for
+		new_for.body = map_body(ctx, d.body[:], user_data)
+		return new_for, true
+	case ^Node_Switch:
+		new_sw := new(Node_Switch, ctx.allocator)
+		new_sw^ = d^
+		new_sw.derived = new_sw
+		new_sw.cases = make([dynamic]^Node_Case, 0, len(d.cases), ctx.allocator)
+		for c in d.cases {
+			new_c := new(Node_Case, ctx.allocator)
+			new_c^ = c^
+			new_c.body = map_body(ctx, c.body[:], user_data)
+			append(&new_sw.cases, new_c)
+		}
+		return new_sw, true
+	}
+	return node, false
+}
+
+validate_unique_blocks_in_nodes :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	seen: ^map[string]^Node_Block,
+	fallback_src: []byte,
+	fallback_file: string,
+) -> bool {
+	Walk_State :: struct {
+		ctx:           ^Compile_Context,
+		seen:          ^map[string]^Node_Block,
+		fallback_src:  []byte,
+		fallback_file: string,
+	}
+	state := Walk_State{ctx, seen, fallback_src, fallback_file}
+
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		s := cast(^Walk_State)user_data
+		return validate_unique_blocks_in_nodes(s.ctx, body, s.seen, s.fallback_src, s.fallback_file)
+	}
+
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Block:
+			if _, exists := seen[d.name]; exists {
+				file := d.origin_file if len(d.origin_file) > 0 else fallback_file
+				src := d.origin_src if d.origin_src != nil else fallback_src
+				blk_pos := tokenizer.Pos{
+					offset = d.name_tok.pos.offset,
+					line   = d.name_tok.pos.line + 1,
+					column = d.name_tok.pos.col + 1,
+					file   = file,
+				}
+				record_diagnostic(
+					ctx,
+					blk_pos,
+					src,
+					len(d.name),
+					"duplicate block definition %q in template",
+					d.name,
+				)
+				return false
+			}
+			seen[d.name] = d
+			if !validate_unique_blocks_in_nodes(ctx, d.body[:], seen, fallback_src, fallback_file) {
+				return false
+			}
+		case:
+			if !walk_branch_children(node, &state, visit_cb) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+resolve_template_inheritance :: proc(
+	ctx: ^Compile_Context,
+	child_templ: Template,
+	child_src: []byte,
+	child_file: string,
+) -> (
+	resolved: Template,
+	ok: bool,
+) {
+	// Validate that all blocks defined in this template (top-level or nested) have unique names
+	seen_local_blocks := make(map[string]^Node_Block, ctx.allocator)
+	if !validate_unique_blocks_in_nodes(ctx, child_templ.content[:], &seen_local_blocks, child_src, child_file) {
+		return {}, false
+	}
+
+	ext, has_ext := find_extends_node(child_templ)
+	if !has_ext {
+		// Still validate that blocks in a non-extending template don't call `super()`
+		if !validate_no_orphan_super_in_nodes(ctx, child_templ.content[:], child_src, child_file) {
+			return {}, false
+		}
+		base_dir := "" if child_file == ctx.inline_file else filepath.dir(child_file)
+		return rewrite_embeds_relative_to_dir(ctx, child_templ, base_dir, child_file, child_src), true
+	}
+
+	relpath := ext.path.value[1 : len(ext.path.value)-1]
+	parent_fullpath, _ := filepath.join({filepath.dir(child_file), relpath}, ctx.allocator)
+
+	ext_pos := tokenizer.Pos{
+		offset = ext.path.pos.offset,
+		line   = ext.path.pos.line + 1,
+		column = ext.path.pos.col + 1,
+		file   = child_file,
+	}
+
+	// Cycle check across active stack
+	for frame in ctx.stack {
+		if frame.file == parent_fullpath {
+			record_diagnostic(
+				ctx,
+				ext_pos,
+				child_src,
+				len(ext.path.value),
+				"circular layout inheritance detected: %q extends %q which is already in the inheritance chain",
+				child_file,
+				parent_fullpath,
+			)
+			return {}, false
+		}
+	}
+
+	// Collect child blocks (top-level overrides) and normalize relative embeds/origins inside them
+	child_blocks := make(map[string]^Node_Block, ctx.allocator)
+	for node in child_templ.content {
+		if blk, is_blk := node.derived.(^Node_Block); is_blk {
+			normalized_blk := clone_block_with_resolved_embeds(ctx, blk, filepath.dir(child_file), child_file, child_src)
+			child_blocks[blk.name] = normalized_blk
+		}
+	}
+
+	// Push extends frame and load/resolve parent layout (supports multi-level inheritance)
+	append(&ctx.stack, Trace_Frame{
+		kind    = .Extends,
+		pos     = ext_pos,
+		file    = parent_fullpath,
+		snippet = extract_line_snippet(child_src, ext_pos.line, ctx.allocator),
+		col_len = len(ext.path.value),
+	})
+	defer pop(&ctx.stack)
+
+	parent_templ, _, parent_ok := load_and_resolve_template_file(
+		ctx,
+		parent_fullpath,
+		ext_pos,
+		child_src,
+		len(ext.path.value),
+	)
+	if !parent_ok {
+		return {}, false
+	}
+
+	// Collect all valid block names available in the resolved parent layout
+	parent_blocks := make(map[string]^Node_Block, ctx.allocator)
+	collect_layout_blocks(parent_templ.content[:], &parent_blocks)
+
+	// Validate that every child block exists in the parent layout
+	for blk_name, child_blk in child_blocks {
+		if _, exists := parent_blocks[blk_name]; !exists {
+			valid_names := make([dynamic]string, ctx.allocator)
+			for k in parent_blocks {
+				append(&valid_names, k)
+			}
+			slice.sort(valid_names[:])
+			valid_list := strings.join(valid_names[:], ", ", ctx.allocator) if len(valid_names) > 0 else "(none)"
+
+			blk_pos := tokenizer.Pos{
+				offset = child_blk.name_tok.pos.offset,
+				line   = child_blk.name_tok.pos.line + 1,
+				column = child_blk.name_tok.pos.col + 1,
+				file   = child_file,
+			}
+			record_diagnostic(
+				ctx,
+				blk_pos,
+				child_src,
+				len(child_blk.name),
+				"unknown block %q in child template (available blocks in parent layout: %s)",
+				blk_name,
+				valid_list,
+			)
+			return {}, false
+		}
+	}
+
+	// Splice child blocks into parent layout AST (handling `super()` recursively)
+	spliced: Template
+	spliced.content = splice_nodes(ctx, parent_templ.content[:], child_blocks)
+	if !validate_no_orphan_super_in_nodes(ctx, spliced.content[:], child_src, child_file) {
+		return {}, false
+	}
+	return spliced, true
+}
+
+validate_no_orphan_super_in_nodes :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	src: []byte,
+	file: string,
+) -> bool {
+	Walk_State :: struct {
+		ctx:  ^Compile_Context,
+		src:  []byte,
+		file: string,
+	}
+	state := Walk_State{ctx, src, file}
+
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		s := cast(^Walk_State)user_data
+		return validate_no_orphan_super_in_nodes(s.ctx, body, s.src, s.file)
+	}
+
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Super:
+			actual_file := d.origin_file if len(d.origin_file) > 0 else file
+			actual_src := d.origin_src if d.origin_src != nil else src
+			pos := tokenizer.Pos{
+				offset = d.open.pos.offset,
+				line   = d.open.pos.line + 1,
+				column = d.open.pos.col + 1,
+				file   = actual_file,
+			}
+			record_diagnostic(
+				ctx,
+				pos,
+				actual_src,
+				len(d.super_tok.value),
+				"\"super\" cannot be used in a root template that does not extend a parent layout",
+			)
+			return false
+		case ^Node_Block:
+			blk_file := d.origin_file if len(d.origin_file) > 0 else file
+			blk_src := d.origin_src if d.origin_src != nil else src
+			if !validate_no_orphan_super_in_nodes(ctx, d.body[:], blk_src, blk_file) {
+				return false
+			}
+		case:
+			if !walk_branch_children(node, &state, visit_cb) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+collect_layout_blocks :: proc(nodes: []Node, out: ^map[string]^Node_Block) {
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		collect_layout_blocks(body, cast(^map[string]^Node_Block)user_data)
+		return true
+	}
+
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Block:
+			out[d.name] = d
+			collect_layout_blocks(d.body[:], out)
+		case:
+			_ = walk_branch_children(node, out, visit_cb)
+		}
+	}
+}
+
+clone_overrides_without :: proc(
+	ctx: ^Compile_Context,
+	overrides: map[string]^Node_Block,
+	exclude_name: string,
+) -> map[string]^Node_Block {
+	res := make(map[string]^Node_Block, len(overrides), ctx.allocator)
+	for k, v in overrides {
+		if k != exclude_name {
+			res[k] = v
+		}
+	}
+	return res
+}
+
+splice_nodes :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	overrides: map[string]^Node_Block,
+) -> [dynamic]Node {
+	overrides_copy := overrides
+	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
+		ovr := (cast(^map[string]^Node_Block)user_data)^
+		return splice_nodes(ctx, body, ovr)
+	}
+
+	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Block:
+			if child_blk, has_override := overrides[d.name]; has_override {
+				inner_overrides := clone_overrides_without(ctx, overrides, d.name)
+				// First splice any nested blocks inside the parent block body so `super()` gets them
+				spliced_parent_body := splice_nodes(ctx, d.body[:], inner_overrides)
+				// Splice any nested blocks declared inside the child override itself before substituting `super()`
+				spliced_child_body := splice_nodes(ctx, child_blk.body[:], inner_overrides)
+				// Replace `Node_Super` inside the child block body with `spliced_parent_body`
+				final_body := substitute_super_nodes(ctx, spliced_child_body[:], spliced_parent_body[:])
+
+				new_blk := new(Node_Block, ctx.allocator)
+				new_blk^ = d^
+				new_blk.derived = new_blk
+				new_blk.body = final_body
+				append(&out, new_blk)
+			} else {
+				new_blk := new(Node_Block, ctx.allocator)
+				new_blk^ = d^
+				new_blk.derived = new_blk
+				new_blk.body = splice_nodes(ctx, d.body[:], overrides)
+				append(&out, new_blk)
+			}
+		case:
+			if mapped, ok := map_branch_children(ctx, node, &overrides_copy, map_cb); ok {
+				append(&out, mapped)
+			} else {
+				append(&out, node)
+			}
+		}
+	}
+	return out
+}
+
+substitute_super_nodes :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	parent_body: []Node,
+) -> [dynamic]Node {
+	parent_copy := parent_body
+	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
+		pb := (cast(^[]Node)user_data)^
+		return substitute_super_nodes(ctx, body, pb)
+	}
+
+	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Super:
+			for pn in parent_body {
+				append(&out, pn)
+			}
+		case ^Node_Block:
+			// Do not substitute outer block's super inside an inner nested block
+			append(&out, node)
+		case:
+			if mapped, ok := map_branch_children(ctx, node, &parent_copy, map_cb); ok {
+				append(&out, mapped)
+			} else {
+				append(&out, node)
+			}
+		}
+	}
+	return out
+}
+
+rewrite_embeds_relative_to_dir :: proc(
+	ctx: ^Compile_Context,
+	templ: Template,
+	base_dir: string,
+	origin_file := "",
+	origin_src: []byte = nil,
+) -> Template {
+	out: Template
+	out.content = rewrite_nodes_embeds(ctx, templ.content[:], base_dir, origin_file, origin_src)
+	return out
+}
+
+clone_block_with_resolved_embeds :: proc(
+	ctx: ^Compile_Context,
+	blk: ^Node_Block,
+	base_dir: string,
+	origin_file := "",
+	origin_src: []byte = nil,
+) -> ^Node_Block {
+	new_blk := new(Node_Block, ctx.allocator)
+	new_blk^ = blk^
+	new_blk.derived = new_blk
+	if len(new_blk.origin_file) == 0 && len(origin_file) > 0 {
+		new_blk.origin_file = origin_file
+	}
+	if new_blk.origin_src == nil && origin_src != nil {
+		new_blk.origin_src = origin_src
+	}
+	new_blk.body = rewrite_nodes_embeds(ctx, blk.body[:], base_dir, origin_file, origin_src)
+	return new_blk
+}
+
+rewrite_nodes_embeds :: proc(
+	ctx: ^Compile_Context,
+	nodes: []Node,
+	base_dir: string,
+	origin_file := "",
+	origin_src: []byte = nil,
+) -> [dynamic]Node {
+	Rewrite_State :: struct {
+		base_dir:    string,
+		origin_file: string,
+		origin_src:  []byte,
+	}
+	state := Rewrite_State{base_dir, origin_file, origin_src}
+	map_cb :: proc(ctx: ^Compile_Context, body: []Node, user_data: rawptr) -> [dynamic]Node {
+		s := cast(^Rewrite_State)user_data
+		return rewrite_nodes_embeds(ctx, body, s.base_dir, s.origin_file, s.origin_src)
+	}
+
+	out := make([dynamic]Node, 0, len(nodes), ctx.allocator)
+	for node in nodes {
+		#partial switch d in node.derived {
+		case ^Node_Embed:
+			rel := d.path.value[1 : len(d.path.value)-1]
+			new_emb := new(Node_Embed, ctx.allocator)
+			new_emb^ = d^
+			new_emb.derived = new_emb
+			if len(new_emb.origin_file) == 0 && len(origin_file) > 0 {
+				new_emb.origin_file = origin_file
+			}
+			if new_emb.origin_src == nil && origin_src != nil {
+				new_emb.origin_src = origin_src
+			}
+			if len(new_emb.resolved_path) == 0 && !filepath.is_abs(rel) && len(base_dir) > 0 {
+				abs_path, _ := filepath.join({base_dir, rel}, ctx.allocator)
+				new_emb.resolved_path = abs_path
+			}
+			append(&out, new_emb)
+		case ^Node_Super:
+			new_sup := new(Node_Super, ctx.allocator)
+			new_sup^ = d^
+			new_sup.derived = new_sup
+			if len(new_sup.origin_file) == 0 && len(origin_file) > 0 {
+				new_sup.origin_file = origin_file
+			}
+			if new_sup.origin_src == nil && origin_src != nil {
+				new_sup.origin_src = origin_src
+			}
+			append(&out, new_sup)
+		case ^Node_Block:
+			append(&out, clone_block_with_resolved_embeds(ctx, d, base_dir, origin_file, origin_src))
+		case:
+			if mapped, ok := map_branch_children(ctx, node, &state, map_cb); ok {
+				append(&out, mapped)
+			} else {
+				append(&out, node)
+			}
+		}
+	}
+	return out
+}
+
+// ============================================================================
+// Goal 5: Embed Resolution with Full Trace Stack & Cycle Detection
+// ============================================================================
+
+Embed_Callback_State :: struct {
+	ctx:          ^Compile_Context,
+	current_file: string,
+	current_src:  []byte,
+}
+
+embed_parser_with_ctx :: proc(t: ^Transpiler, node: ^Node_Embed, user_data: rawptr) -> bool {
+	state := cast(^Embed_Callback_State)user_data
+	ctx := state.ctx
+	context.allocator = ctx.allocator
+	context.temp_allocator = ctx.allocator
+
+	embed_origin_file := node.origin_file if len(node.origin_file) > 0 else state.current_file
+	embed_origin_src := node.origin_src if node.origin_src != nil else state.current_src
+
+	raw_path := node.path.value[1 : len(node.path.value)-1]
+	fullpath: string
+	if len(node.resolved_path) > 0 {
+		fullpath = node.resolved_path
+	} else if filepath.is_abs(raw_path) {
+		fullpath = raw_path
+	} else {
+		fullpath, _ = filepath.join({filepath.dir(embed_origin_file), raw_path}, ctx.allocator)
+	}
+
+	embed_pos := tokenizer.Pos{
+		offset = node.path.pos.offset,
+		line   = node.path.pos.line + 1,
+		column = node.path.pos.col + 1,
+		file   = embed_origin_file,
+	}
+
+	// Cycle check across active stack
+	for frame in ctx.stack {
+		if frame.file == fullpath {
+			record_diagnostic(
+				ctx,
+				embed_pos,
+				embed_origin_src,
+				len(node.path.value),
+				"circular embed detected: %q embeds %q which is already being embedded",
+				embed_origin_file,
+				fullpath,
+			)
+			return false
+		}
+	}
+
+	prev_file := state.current_file
+	prev_src := state.current_src
+	defer {
+		state.current_file = prev_file
+		state.current_src = prev_src
+	}
+
+	append(&ctx.stack, Trace_Frame{
+		kind    = .Embed,
+		pos     = embed_pos,
+		file    = fullpath,
+		snippet = extract_line_snippet(embed_origin_src, embed_pos.line, ctx.allocator),
+		col_len = len(node.path.value),
+	})
+	defer pop(&ctx.stack)
+
+	templ, loaded_src, ok := load_and_resolve_template_file(
+		ctx,
+		fullpath,
+		embed_pos,
+		embed_origin_src,
+		len(node.path.value),
+	)
+	if !ok {
+		return false
+	}
+
+	state.current_file = fullpath
+	state.current_src = loaded_src
+
+	for n in templ.content {
+		transpile_node(t, n)
+		write_newline(t)
+	}
+
+	return true
+}
+
+write_generated_file_header_body :: proc(w: io.Writer) {
 	io.write_string(
 		w,
 		`/* This file is generated by temple - DO NOT EDIT! */
@@ -262,51 +1968,6 @@ compiled :: proc "contextless" ($path: string, $T: typeid) -> Compiled(T) {
 	)
 }
 
-// NOTE: we should not use `error` in this scope, because that would close the file in a bad state.
-write_transpiled_call :: proc(w: io.Writer, call: Compile_Call) -> (ok: bool) {
-	// Anything allocated is not needed anymore when we return.
-	context.allocator = context.temp_allocator
-
-	data: []byte
-	identifier: string
-	file: string
-
-	switch t in call.type {
-	case Call_Path:
-		identifier = t.relpath
-		file = t.fullpath
-		d, rerr := os.read_entire_file(t.fullpath, context.temp_allocator)
-		if rerr != nil {
-			warn(nil, "unable to read template file at %q, skipping", t.fullpath)
-			return
-		}
-		data = d
-	case Call_Inline:
-		identifier = t.template
-		data = transmute([]byte)t.template
-		file = call.pos.file
-	}
-
-	parser: Parser
-	parser_init(&parser, data)
-	templ := parse(&parser)
-	if err, has_err := templ.err.?; has_err {
-		pos := tokenizer.Pos{
-			offset = err.pos.offset,
-			line   = err.pos.line + 1,
-			column = err.pos.col + 1,
-			file   = file,
-		}
-		warn(pos, "skipping template because of the error: %s", err.msg)
-		return
-	}
-
-	transpile(w, identifier, templ, embed_parser, &file)
-
-	ok = true
-	return
-}
-
 write_generated_file_footer :: proc(w: io.Writer, has_calls: bool) {
 	if has_calls {
 		io.write_string(w, ` else {
@@ -317,40 +1978,4 @@ write_generated_file_footer :: proc(w: io.Writer, has_calls: bool) {
 		io.write_string(w, `	#panic("undefined template \"" + path + "\" did you run the temple transpiler?")
 }`)
 	}
-}
-
-embed_parser :: proc(node: ^Node_Embed, parent_path_: rawptr) -> (Template, bool) {
-	parent_path := (cast(^string)parent_path_)^
-	relpath := node.path.value[1:len(node.path.value)-1]
-	fullpath, _ := filepath.join({filepath.dir(parent_path), relpath}, context.temp_allocator)
-
-	data, rerr := os.read_entire_file(fullpath, context.temp_allocator)
-	if rerr != nil {
-		pos := tokenizer.Pos{
-			offset = node.path.pos.offset,
-			line   = node.path.pos.line + 1,
-			column = node.path.pos.col + 1,
-			file   = parent_path,
-		}
-		warn(pos, "unable to read embedded template file at %q, skipping", fullpath)
-		return {}, false
-	}
-
-	// TODO: better error handling.
-
-	parser: Parser
-	parser_init(&parser, data)
-	templ := parse(&parser)
-	if err, has_err := templ.err.?; has_err {
-		pos := tokenizer.Pos{
-			offset = err.pos.offset,
-			line   = err.pos.line + 1,
-			column = err.pos.col + 1,
-			file   = fullpath,
-		}
-		warn(pos, "skipping template because of the error: %s", err.msg)
-		return {}, false
-	}
-
-	return templ, templ.err == nil
 }

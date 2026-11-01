@@ -24,7 +24,7 @@ Transpiler :: struct {
 	embed_data:   rawptr,
 }
 
-Embed_Parser :: #type proc(embed: ^Node_Embed, user_data: rawptr) -> (Template, bool)
+Embed_Parser :: #type proc(t: ^Transpiler, embed: ^Node_Embed, user_data: rawptr) -> bool
 
 indent :: proc(t: ^Transpiler) {
 	t.indented += 1
@@ -47,6 +47,7 @@ write_indent :: proc(t: ^Transpiler) {
 
 transpile :: proc(w: io.Writer, identifier: string, templ: Template, embed_parser: Embed_Parser, embed_data: rawptr, allocator := context.allocator) {
 	t: Transpiler
+	t.allocator = allocator
 	t.embed_parser = embed_parser
 	t.embed_data = embed_data
 	t.indent = "\t"
@@ -104,9 +105,93 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 		transpile_if(t, d)
 	case ^Node_For:
 		transpile_for(t, d)
+	case ^Node_Switch:
+		transpile_switch(t, d)
+	case ^Node_Let:
+		transpile_let(t, d)
 	case ^Node_Embed:
 		transpile_embed(t, d)
+	case ^Node_Block:
+		transpile_block(t, d)
+	case ^Node_Extends:
+		// Resolved during layout splicing before transpilation.
+	case ^Node_Super:
+		// Resolved during layout splicing before transpilation.
 	}
+}
+
+transpile_block :: proc(t: ^Transpiler, node: ^Node_Block) {
+	for n, i in node.body {
+		transpile_node(t, n)
+		if i != len(node.body) - 1 {
+			write_newline(t)
+		}
+	}
+}
+
+transpile_let :: proc(t: ^Transpiler, node: ^Node_Let) {
+	raw := strings.trim_space(node.assignment.value)
+	eq_idx := find_assignment_equals(raw)
+
+	lhs := strings.trim_space(raw[:eq_idx])
+	rhs := strings.trim_space(raw[eq_idx + 1:])
+
+	// If the user wrote `{% let x := 5 %}`, `lhs` ends with `:` -> emit `lhs= rhs` (`x := 5`).
+	// If the user wrote `{% let x: int = 5 %}`, `node.has_type_decl` is true -> emit `lhs = rhs` (`x: int = 5`).
+	// If the user wrote `{% let x = 5 %}`, emit `lhs := rhs` (`x := 5`).
+	if strings.has_suffix(lhs, ":") {
+		ident_part := strings.trim_space(lhs[:len(lhs)-1])
+		fmt.wprintf(t.w, "%s := %s", ident_part, rhs)
+	} else if node.has_type_decl {
+		fmt.wprintf(t.w, "%s = %s", lhs, rhs)
+	} else {
+		fmt.wprintf(t.w, "%s := %s", lhs, rhs)
+	}
+	transpile_loc(t, node.open.pos)
+}
+
+transpile_switch :: proc(t: ^Transpiler, node: ^Node_Switch) {
+	if node.is_partial {
+		ws(t.w, "#partial switch ")
+	} else {
+		ws(t.w, "switch ")
+	}
+
+	if expr, has_expr := node.expression.?; has_expr {
+		ws(t.w, strings.trim_space(expr.value))
+		ws(t.w, " ")
+	}
+
+	ws(t.w, "{")
+	transpile_loc(t, node.open.pos)
+	write_newline(t)
+
+	approx_start := t.approx_bytes
+	max_case_bytes: int
+
+	for c in node.cases {
+		if expr, has_expr := c.expression.?; has_expr {
+			fmt.wprintf(t.w, "case %s:", strings.trim_space(expr.value))
+		} else {
+			ws(t.w, "case:")
+		}
+		transpile_loc(t, c.open.pos)
+
+		indent(t)
+		for child in c.body {
+			write_newline(t)
+			transpile_node(t, child)
+		}
+		dedent(t)
+		write_newline(t)
+
+		case_bytes := t.approx_bytes - approx_start
+		t.approx_bytes = approx_start
+		max_case_bytes = max(max_case_bytes, case_bytes)
+	}
+
+	ws(t.w, "}")
+	t.approx_bytes += max_case_bytes
 }
 
 transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
@@ -124,34 +209,34 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	ws(t.w, RET_N)
 	ws(t.w, " += ")
 
-	v := strings.trim_space(node.expression.value)
-	// Users can force a specific write call by wrapping the expression in a "cast".
-	switch {
-	case strings.has_prefix(v, "raw("):
-		fmt.wprintf(t.w, "%s.write_string(%s, %s) or_return", PKG_IO, ARG_W, strings.trim_suffix(strings.trim_prefix(v, "raw("), ")"))
-		transpile_loc(t, node.open.pos)
-		return
-	case strings.has_prefix(v, "byte("):
+	v := node.inner_expr if len(node.inner_expr) > 0 else strings.trim_space(node.expression.value)
+
+	switch node.write_kind {
+	case .Raw_String:
+		fmt.wprintf(t.w, "%s.write_string(", PKG_IO)
+	case .Magic_String:
+		ws(t.w, "__temple_write_magic_string(")
+	case .Byte:
 		fmt.wprintf(t.w, "%s.write_byte(", PKG_IO)
-	case strings.has_prefix(v, "rune("):
+	case .Rune:
 		fmt.wprintf(t.w, "%s.write_rune(", PKG_IO)
-	case strings.has_prefix(v, "int("), strings.has_prefix(v, "len("):
+	case .Int:
 		fmt.wprintf(t.w, "%s.write_int(", PKG_IO)
-	case strings.has_prefix(v, "uint("):
+	case .Uint:
 		fmt.wprintf(t.w, "%s.write_uint(", PKG_IO)
-	case strings.has_prefix(v, "i128("):
+	case .I128:
 		fmt.wprintf(t.w, "%s.write_i128(", PKG_IO)
-	case strings.has_prefix(v, "u128("):
+	case .U128:
 		fmt.wprintf(t.w, "%s.write_u128(", PKG_IO)
-	case strings.has_prefix(v, "u64("):
+	case .U64:
 		fmt.wprintf(t.w, "%s.write_u64(", PKG_IO)
-	case strings.has_prefix(v, "i64("):
+	case .I64:
 		fmt.wprintf(t.w, "%s.write_i64(", PKG_IO)
-	case strings.has_prefix(v, "f32("):
+	case .F32:
 		fmt.wprintf(t.w, "%s.write_f32(", PKG_IO)
-	case strings.has_prefix(v, "f64("):
+	case .F64:
 		fmt.wprintf(t.w, "%s.write_f64(", PKG_IO)
-	case:
+	case .Escaped_String:
 		ws(t.w, "__temple_write_escaped_string(")
 	}
 
@@ -278,11 +363,8 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 		write_newline(t)
 	}
 
-	if templ, ok := t.embed_parser(node, t.embed_data); ok {
-		for node in templ.content {
-			transpile_node(t, node)
-			write_newline(t)
-		}
+	if t.embed_parser != nil {
+		_ = t.embed_parser(t, node, t.embed_data)
 	}
 
 	dedent(t)
