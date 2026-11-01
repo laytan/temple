@@ -85,24 +85,57 @@ __temple_write_magic_string :: proc(w: io.Writer, str: string) -> (n: int, err: 
 }
 
 @(private = "file")
-__temple_format_buf_or_temp :: #force_inline proc(buf: []byte, fmt_str: string, args: ..any) -> string {
-	formatted := fmt.bprintf(buf, fmt_str, ..args)
-	if len(formatted) >= len(buf) - 4 {
-		return fmt.tprintf(fmt_str, ..args)
+__Temple_Fmt_Writer :: struct {
+	inner:  io.Writer,
+	escape: bool,
+	n:      int,
+	err:    io.Error,
+}
+
+@(private = "file")
+__temple_fmt_stream_proc :: proc(
+	stream_data: rawptr,
+	mode: io.Stream_Mode,
+	p: []byte,
+	offset: i64,
+	whence: io.Seek_From,
+) -> (
+	n: i64,
+	err: io.Error,
+) {
+	state := (^__Temple_Fmt_Writer)(stream_data)
+	#partial switch mode {
+	case .Write:
+		if state.err != nil {
+			return 0, state.err
+		}
+		written: int
+		if state.escape {
+			written, state.err = __temple_write_escaped_string(state.inner, string(p))
+		} else {
+			written, state.err = io.write(state.inner, p)
+		}
+		state.n += written
+		if state.err != nil {
+			return i64(written), state.err
+		}
+		return i64(len(p)), nil
+	case .Query:
+		return io.query_utility({.Write, .Query})
 	}
-	return formatted
+	return 0, .Unsupported
 }
 
 __temple_write_fmt_escaped :: proc(w: io.Writer, fmt_str: string, args: ..any) -> (n: int, err: io.Error) {
-	buf: [512]byte
-	formatted := __temple_format_buf_or_temp(buf[:], fmt_str, ..args)
-	return __temple_write_escaped_string(w, formatted)
+	state := __Temple_Fmt_Writer{inner = w, escape = true}
+	fmt.wprintf(io.Writer{procedure = __temple_fmt_stream_proc, data = &state}, fmt_str, ..args, flush = false)
+	return state.n, state.err
 }
 
 __temple_write_fmt_raw :: proc(w: io.Writer, fmt_str: string, args: ..any) -> (n: int, err: io.Error) {
-	buf: [512]byte
-	formatted := __temple_format_buf_or_temp(buf[:], fmt_str, ..args)
-	return io.write_string(w, formatted)
+	state := __Temple_Fmt_Writer{inner = w, escape = false}
+	fmt.wprintf(io.Writer{procedure = __temple_fmt_stream_proc, data = &state}, fmt_str, ..args, flush = false)
+	return state.n, state.err
 }
 
 __temple_default_string :: proc(val, fallback: string) -> string {

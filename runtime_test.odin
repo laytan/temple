@@ -1,5 +1,7 @@
 package temple
 
+import "core:io"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -61,28 +63,56 @@ test_write_fmt_escaped_and_raw :: proc(t: ^testing.T) {
 @(test)
 test_write_fmt_utf8_boundary_overflow :: proc(t: ^testing.T) {
 	// 510 ASCII bytes + 4-byte UTF-8 rune ("🚀") = 514 bytes.
-	// A 512-byte stack buffer cannot fit the 4-byte rune at index 510, so `fmt.bprintf`
-	// returns a 510-byte slice (`len(formatted) == 510`). Verify fallback to `fmt.tprintf`
-	// preserves the multi-byte UTF-8 rune without truncation.
+	// Verify streaming adapter handles arbitrary lengths with zero `context.temp_allocator` usage.
 	prefix := strings.repeat("a", 510, context.temp_allocator)
+	expected_esc := strings.concatenate({prefix, "🚀&lt;&gt;"}, context.temp_allocator)
+	expected_raw := strings.concatenate({prefix, "🚀<b>ok</b>"}, context.temp_allocator)
 
 	{
-		sb := strings.builder_make(context.temp_allocator)
+		sb := strings.builder_make(0, 1024, context.temp_allocator)
+		prev_temp := context.temp_allocator
+		context.temp_allocator = mem.panic_allocator()
 		n, err := __temple_write_fmt_escaped(strings.to_writer(&sb), "%s%s", prefix, "🚀<>")
+		context.temp_allocator = prev_temp
+
 		testing.expect_value(t, err, nil)
-		expected := strings.concatenate({prefix, "🚀&lt;&gt;"}, context.temp_allocator)
-		testing.expect_value(t, strings.to_string(sb), expected)
-		testing.expect_value(t, n, len(expected))
+		testing.expect_value(t, strings.to_string(sb), expected_esc)
+		testing.expect_value(t, n, len(expected_esc))
 	}
 
 	{
-		sb := strings.builder_make(context.temp_allocator)
+		sb := strings.builder_make(0, 1024, context.temp_allocator)
+		prev_temp := context.temp_allocator
+		context.temp_allocator = mem.panic_allocator()
 		n, err := __temple_write_fmt_raw(strings.to_writer(&sb), "%s%s", prefix, "🚀<b>ok</b>")
+		context.temp_allocator = prev_temp
+
 		testing.expect_value(t, err, nil)
-		expected := strings.concatenate({prefix, "🚀<b>ok</b>"}, context.temp_allocator)
-		testing.expect_value(t, strings.to_string(sb), expected)
-		testing.expect_value(t, n, len(expected))
+		testing.expect_value(t, strings.to_string(sb), expected_raw)
+		testing.expect_value(t, n, len(expected_raw))
 	}
+
+	// Verify underlying writer io.Error is propagated cleanly
+	failing_proc :: proc(
+		stream_data: rawptr,
+		mode: io.Stream_Mode,
+		p: []byte,
+		offset: i64,
+		whence: io.Seek_From,
+	) -> (
+		n: i64,
+		err: io.Error,
+	) {
+		if mode == .Write {
+			return 0, .Short_Write
+		}
+		return 0, .Unsupported
+	}
+	failing_writer := io.Writer{procedure = failing_proc}
+	_, esc_err := __temple_write_fmt_escaped(failing_writer, "hello %s", "<world>")
+	testing.expect_value(t, esc_err, io.Error.Short_Write)
+	_, raw_err := __temple_write_fmt_raw(failing_writer, "hello %s", "<world>")
+	testing.expect_value(t, raw_err, io.Error.Short_Write)
 }
 
 @(test)
