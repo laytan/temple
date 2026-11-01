@@ -1140,6 +1140,49 @@ parse_call :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node
 }
 
 @(private = "file")
+parse_prefixed_odin_expr :: proc(
+	p: ^Parser,
+	tok: Token,
+	raw_src: string,
+	prefix: string,
+	err_context := "",
+	raw_offset := 0,
+) -> (
+	expr: ^ast.Expr,
+	synthetic: string,
+	ok: bool,
+) {
+	part := raw_src[raw_offset:]
+	synthetic = strings.concatenate({prefix, part}, p.allocator) if len(prefix) > 0 else part
+
+	op: odin_parser.Parser
+	file: ast.File
+	init_odin_snippet_parser(&op, &file, synthetic, false)
+
+	expr = odin_parser.parse_expr(&op, false)
+	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
+		if len(err_context) > 0 {
+			rel_offset := raw_offset + max(tl_odin_diag.pos.offset - len(prefix), 0)
+			err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+			msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else fmt.tprintf("invalid %s", err_context)
+			_ = error(p, err_pos, "invalid %s: %s", err_context, msg)
+		}
+		return nil, synthetic, false
+	}
+
+	if op.curr_tok.kind != .EOF {
+		if len(err_context) > 0 {
+			rel_offset := raw_offset + max(op.curr_tok.pos.offset - len(prefix), 0)
+			err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+			_ = error(p, err_pos, "unexpected trailing token %q in %s", op.curr_tok.text, err_context)
+		}
+		return nil, synthetic, false
+	}
+
+	return expr, synthetic, true
+}
+
+@(private = "file")
 validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) -> bool {
 	raw_src := strings.trim_right_space(tok.value)
 	context.allocator = p.allocator
@@ -1169,27 +1212,15 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		return error(p, name_pos, "duplicate macro definition %q in template", name)
 	}
 
-	params_part := raw_src[open_paren:]
 	prefix :: "proc"
-	synthetic := strings.concatenate({prefix, params_part}, p.allocator)
-
-	op: odin_parser.Parser
-	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic, false)
-
-	expr := odin_parser.parse_expr(&op, false)
-	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
-		rel_offset := open_paren + max(tl_odin_diag.pos.offset - len(prefix), 0)
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
-		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid parameter list"
-		return error(p, err_pos, "invalid macro parameter list: %s", msg)
-	}
-
-	if op.curr_tok.kind != .EOF {
-		rel_offset := open_paren + max(op.curr_tok.pos.offset - len(prefix), 0)
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
-		return error(p, err_pos, "unexpected trailing token %q after macro parameter list", op.curr_tok.text)
-	}
+	expr, synthetic := parse_prefixed_odin_expr(
+		p,
+		tok,
+		raw_src,
+		prefix,
+		"macro parameter list",
+		open_paren,
+	) or_return
 
 	proc_type, is_proc := expr.derived_expr.(^ast.Proc_Type)
 	if !is_proc {
@@ -1253,21 +1284,7 @@ validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool
 	raw_src := strings.trim_right_space(tok.value)
 	context.allocator = p.allocator
 
-	op: odin_parser.Parser
-	file: ast.File
-	init_odin_snippet_parser(&op, &file, raw_src, false)
-
-	expr := odin_parser.parse_expr(&op, false)
-	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, tl_odin_diag.pos.offset)
-		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid macro call"
-		return error(p, err_pos, "invalid \"call\" expression: %s", msg)
-	}
-
-	if op.curr_tok.kind != .EOF {
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, op.curr_tok.pos.offset)
-		return error(p, err_pos, "unexpected trailing token %q in \"call\" tag", op.curr_tok.text)
-	}
+	expr, _ := parse_prefixed_odin_expr(p, tok, raw_src, "", "\"call\" tag") or_return
 
 	call, is_call := expr.derived_expr.(^ast.Call_Expr)
 	if !is_call {
@@ -1475,14 +1492,8 @@ try_parse_embed_props :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embed
 	context.allocator = p.allocator
 
 	prefix :: "__component"
-	synthetic := strings.concatenate({prefix, raw_src}, p.allocator)
-
-	op: odin_parser.Parser
-	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic, false)
-
-	expr := odin_parser.parse_expr(&op, false)
-	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 || op.curr_tok.kind != .EOF {
+	expr, _, parse_ok := parse_prefixed_odin_expr(p, tok, raw_src, prefix)
+	if !parse_ok {
 		return false, false
 	}
 	call, is_call := expr.derived_expr.(^ast.Call_Expr)
@@ -1504,25 +1515,7 @@ parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embe
 	context.allocator = p.allocator
 
 	prefix :: "__component"
-	synthetic := strings.concatenate({prefix, raw_src}, p.allocator)
-
-	op: odin_parser.Parser
-	file: ast.File
-	init_odin_snippet_parser(&op, &file, synthetic, false)
-
-	expr := odin_parser.parse_expr(&op, false)
-	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
-		rel_offset := max(tl_odin_diag.pos.offset - len(prefix), 0)
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
-		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid component props"
-		return error(p, err_pos, "invalid embed props: %s", msg)
-	}
-
-	if op.curr_tok.kind != .EOF {
-		rel_offset := max(op.curr_tok.pos.offset - len(prefix), 0)
-		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
-		return error(p, err_pos, "unexpected trailing token %q after embed props", op.curr_tok.text)
-	}
+	expr, synthetic := parse_prefixed_odin_expr(p, tok, raw_src, prefix, "embed props") or_return
 
 	call, is_call := expr.derived_expr.(^ast.Call_Expr)
 	if !is_call || len(call.args) == 0 {

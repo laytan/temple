@@ -556,7 +556,7 @@ spec_rejects_invalid_macro_and_call_declarations :: proc(t: ^testing.T) {
 		{
 			template     = `{% macro badge(label: string) extra %}{% end %}`,
 			col          = 31,
-			expected_err = `unexpected trailing token "extra" after macro parameter list`,
+			expected_err = `unexpected trailing token "extra" in macro parameter list`,
 		},
 		{
 			template     = `{% macro badge(x: string) %}{% end %}{% macro badge(y: string) %}{% end %}`,
@@ -646,14 +646,121 @@ spec_decoupled_codegen_qualifies_runtime_symbols_in_external_package :: proc(t: 
 
 		then_generated_file_contains(s, "package views\n")
 		then_generated_file_contains(s, `import __temple "shared:temple"`)
+		then_generated_file_contains(s, "__temple_default :: __temple.__temple_default")
 		then_generated_file_contains(s, "compiled :: proc \"contextless\" ($path: string, $T: typeid) -> __temple.Compiled(T) {")
-		then_emits_writer_call(s, `__temple.__temple_write_escaped_string(__temple_w, __temple.__temple_default(this.title, "Untitled")) or_return`)
+		then_emits_writer_call(s, `__temple.__temple_write_escaped_string(__temple_w, __temple_default(this.title, "Untitled")) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_magic_string(__temple_w, this.headline) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_fmt_escaped(__temple_w, "$%.2f", this.price) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_fmt_raw(__temple_w, "<b>%s</b>", this.badge) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_safe_url(__temple_w, this.link) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_url_param(__temple_w, this.query) or_return`)
 		then_emits_writer_call(s, `__temple.__temple_write_js_string(__temple_w, this.payload) or_return`)
+	}
+
+	// 3. String literal containing `"__temple_default("` is never corrupted in external package mode
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		given_target_package(s, "views", "shared:temple")
+		upon_compiling_inline(s, `{{ this.label | default("call __temple_default(x, y)") }}`)
+
+		then_emits_writer_call(
+			s,
+			`__temple.__temple_write_escaped_string(__temple_w, __temple_default(this.label, "call __temple_default(x, y)")) or_return`,
+		)
+	}
+}
+
+@(test)
+spec_same_package_and_aliased_compile_call_discovery_without_false_positives :: proc(t: ^testing.T) {
+	// 1. Unqualified same-package `compiled` / `compiled_inline` and local aliases without importing `temple`
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package views
+
+Page_Ctx :: struct { title: string }
+
+HOME_TPL :: "home.temple.twig"
+local_inline :: compiled_inline
+
+home_view := compiled(HOME_TPL, Page_Ctx)
+badge_view := local_inline("<span>{{ this.title }}</span>", Page_Ctx)
+`)
+
+		then_collected_templates_are(s, {
+			"home.temple.twig",
+			"<span>{{ this.title }}</span>",
+		})
+	}
+
+	// 2. Imported external views package (`import v "../views"`) alongside `import "shared:temple"`
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package app
+import "shared:temple"
+import v "../views"
+
+Ctx :: struct { name: string }
+
+a := temple.compiled("a.html", Ctx)
+b := v.compiled("b.html", Ctx)
+c := v.compiled_inline("<p>{{ this.name }}</p>", Ctx)
+`)
+
+		then_collected_templates_are(s, {
+			"a.html",
+			"b.html",
+			"<p>{{ this.name }}</p>",
+		})
+	}
+
+	// 3. User-defined unrelated `compiled :: proc(...)` shadows default unqualified `compiled` without false errors
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package custom
+
+compiled :: proc(x: int) -> int {
+	return x + 1
+}
+
+main :: proc() {
+	_ = compiled(42)
+}
+`)
+
+		then_collected_templates_are(s, {})
+		testing.expect_value(t, len(s.collect_errors), 0)
+	}
+
+	// 4. Unrelated third-party package selector `shader.compiled(runtime_var, flags)` or `regex.compiled(pat)`
+	// must NOT emit false-positive constant string errors
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package app
+import "shared:temple"
+import shader "../gfx/shader"
+import regex "../util/regex"
+
+Ctx :: struct { name: string }
+
+compile_assets :: proc(runtime_src: string, flags: u32) {
+	_ = shader.compiled(runtime_src, flags)
+	_ = regex.compiled(runtime_src)
+	_ = temple.compiled("valid_page.html", Ctx)
+}
+`)
+
+		then_collected_templates_are(s, {"valid_page.html"})
+		testing.expect_value(t, len(s.collect_errors), 0)
 	}
 }
 
@@ -1050,6 +1157,12 @@ property_lexer_strictly_advances_and_parser_never_panics_on_arbitrary_inputs :: 
 		// Invariant 2: Parser never panics or slices out-of-bounds
 		p: Parser
 		parser_init(&p, fuzz_src, alloc)
-		_ = parse(&p)
+		templ := parse(&p)
+
+		// Invariant 3: Whenever `parse(&p)` succeeds, `transpile` never panics or slices out-of-bounds
+		if templ.err == nil {
+			out_sb := strings.builder_make(alloc)
+			transpile(strings.to_writer(&out_sb), "fuzz", templ, nil, nil, alloc)
+		}
 	}
 }

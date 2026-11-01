@@ -146,75 +146,15 @@ driver_collect_calls_from_source :: proc(d: ^Spec_Driver, pkg_dir, filename, odi
 	parsed_ok := odin_parser.parse_file(&op, file)
 	testing.expect(d.t, parsed_ok, "test Odin source failed to parse")
 
-	pkg_string_consts := make(map[string]^ast.Expr, d.alloc)
-	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, d.alloc)
-	pkg_proc_aliases["compiled"] = .Compiled
-	pkg_proc_aliases["compiled_inline"] = .Compiled_Inline
-	temple_names := make([dynamic]string, d.alloc)
-	strict_names := make([dynamic]string, d.alloc)
-	append(&temple_names, "temple")
-	append(&strict_names, "temple")
-	for imp in file.imports {
-		trimmed_path := strings.trim(imp.fullpath, "\"`")
-		if strings.has_prefix(trimmed_path, "core:") ||
-			strings.has_prefix(trimmed_path, "base:") ||
-			strings.has_prefix(trimmed_path, "vendor:") {
-			continue
-		}
-		base_pkg := trimmed_path
-		if colon_idx := strings.last_index_byte(base_pkg, ':'); colon_idx != -1 {
-			base_pkg = base_pkg[colon_idx+1:]
-		}
-		base_pkg = strings.trim_right(base_pkg, "/\\")
-		if slash_idx := strings.last_index_any(base_pkg, "/\\"); slash_idx != -1 {
-			base_pkg = base_pkg[slash_idx+1:]
-		}
-		alias := imp.name.text if len(imp.name.text) > 0 else base_pkg
-		if len(alias) > 0 && alias != "." && alias != ".." {
-			append(&temple_names, alias)
-			if base_pkg == "temple" || alias == "temple" {
-				append(&strict_names, alias)
-			}
-		}
-	}
-
-	for decl in file.decls {
-		collect_top_level_consts(decl, &pkg_string_consts)
-	}
-	for _ in 0 ..< 3 {
-		for decl in file.decls {
-			collect_proc_aliases(decl, strict_names[:], &pkg_proc_aliases)
-		}
-	}
-
-	resolved_consts := make(map[string]string, d.alloc)
-	for name, expr in pkg_string_consts {
-		visited := make(map[string]bool, d.alloc)
-		if val, ok := eval_const_string_from_ast(expr, pkg_string_consts, &visited); ok {
-			resolved_consts[name] = val
-		}
-	}
-
 	seen := make(map[string]string, d.alloc)
-	walk_ctx := File_Collect_Ctx{
-		pkg_fullpath        = pkg.fullpath,
-		file                = file,
-		temple_names        = temple_names[:],
-		strict_temple_names = strict_names[:],
-		proc_aliases        = pkg_proc_aliases,
-		string_consts       = resolved_consts,
-		raw_const_exprs     = pkg_string_consts,
-		calls               = &d.collected,
-		seen                = &seen,
-		out_allocator       = d.alloc,
-		out_errors          = &d.collect_errors,
-	}
-
-	v := ast.Visitor{
-		data  = &walk_ctx,
-		visit = visit_odin_node,
-	}
-	for decl in file.decls {
-		ast.walk(&v, decl)
-	}
+	parsed_files := []^ast.File{file}
+	collect_calls_from_parsed_files(
+		pkg.fullpath,
+		parsed_files,
+		&d.collected,
+		&seen,
+		d.alloc,
+		&d.collect_errors,
+		d.alloc,
+	)
 }

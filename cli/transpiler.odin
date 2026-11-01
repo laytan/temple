@@ -284,9 +284,6 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 
 	v := node.inner_expr if len(node.inner_expr) > 0 else strings.trim_space(node.expression.value)
 	rt_prefix := "__temple." if t.external_pkg else ""
-	if t.external_pkg && strings.contains(v, "__temple_default(") {
-		v, _ = strings.replace_all(v, "__temple_default(", "__temple.__temple_default(", t.allocator)
-	}
 
 	switch node.write_kind {
 	case .Fmt_Escaped:

@@ -84,21 +84,24 @@ __temple_write_magic_string :: proc(w: io.Writer, str: string) -> (n: int, err: 
 	return
 }
 
+@(private = "file")
+__temple_format_buf_or_temp :: #force_inline proc(buf: []byte, fmt_str: string, args: ..any) -> string {
+	formatted := fmt.bprintf(buf, fmt_str, ..args)
+	if len(formatted) >= len(buf) - 4 {
+		return fmt.tprintf(fmt_str, ..args)
+	}
+	return formatted
+}
+
 __temple_write_fmt_escaped :: proc(w: io.Writer, fmt_str: string, args: ..any) -> (n: int, err: io.Error) {
 	buf: [512]byte
-	formatted := fmt.bprintf(buf[:], fmt_str, ..args)
-	if len(formatted) >= len(buf) - 4 {
-		formatted = fmt.tprintf(fmt_str, ..args)
-	}
+	formatted := __temple_format_buf_or_temp(buf[:], fmt_str, ..args)
 	return __temple_write_escaped_string(w, formatted)
 }
 
 __temple_write_fmt_raw :: proc(w: io.Writer, fmt_str: string, args: ..any) -> (n: int, err: io.Error) {
 	buf: [512]byte
-	formatted := fmt.bprintf(buf[:], fmt_str, ..args)
-	if len(formatted) >= len(buf) - 4 {
-		formatted = fmt.tprintf(fmt_str, ..args)
-	}
+	formatted := __temple_format_buf_or_temp(buf[:], fmt_str, ..args)
 	return io.write_string(w, formatted)
 }
 

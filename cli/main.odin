@@ -429,6 +429,34 @@ extract_line_snippet :: proc(source: []byte, one_based_line: int, allocator := c
 	return ""
 }
 
+clone_diagnostic :: proc(d: Diagnostic, allocator: mem.Allocator) -> Diagnostic {
+	cd := d
+	cd.pos.file = strings.clone(d.pos.file, allocator)
+	cd.message = strings.clone(d.message, allocator)
+	cd.snippet = strings.clone(d.snippet, allocator)
+	frames := make([]Trace_Frame, len(d.trace), allocator)
+	for f, i in d.trace {
+		frames[i] = f
+		frames[i].pos.file = strings.clone(f.pos.file, allocator)
+		frames[i].file = strings.clone(f.file, allocator)
+		frames[i].snippet = strings.clone(f.snippet, allocator)
+	}
+	cd.trace = frames
+	return cd
+}
+
+destroy_diagnostic :: proc(d: Diagnostic, allocator := context.allocator) {
+	delete(d.pos.file, allocator)
+	delete(d.message, allocator)
+	delete(d.snippet, allocator)
+	for f in d.trace {
+		delete(f.pos.file, allocator)
+		delete(f.file, allocator)
+		delete(f.snippet, allocator)
+	}
+	delete(d.trace, allocator)
+}
+
 record_diagnostic :: proc(
 	ctx: ^Compile_Context,
 	pos: tokenizer.Pos,
@@ -628,19 +656,39 @@ collect_from_dir :: proc(
 		return
 	}
 
+	collect_calls_from_parsed_files(
+		pkg_path,
+		parsed_files[:],
+		calls,
+		seen_identifiers,
+		out_allocator,
+		out_errors,
+		context.temp_allocator,
+	)
+}
+
+collect_calls_from_parsed_files :: proc(
+	pkg_fullpath: string,
+	parsed_files: []^ast.File,
+	calls: ^[dynamic]Compile_Call,
+	seen_identifiers: ^map[string]string,
+	out_allocator: mem.Allocator,
+	out_errors: ^[dynamic]string = nil,
+	allocator := context.temp_allocator,
+) {
 	// Pass 1: Build per-file temple import alias table and package-level constant tables
-	file_temple_pkgs := make(map[^ast.File][dynamic]string, context.temp_allocator)
-	file_strict_temple_pkgs := make(map[^ast.File][dynamic]string, context.temp_allocator)
-	pkg_string_consts := make(map[string]^ast.Expr, context.temp_allocator)
-	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, context.temp_allocator)
+	file_temple_pkgs := make(map[^ast.File][dynamic]string, allocator)
+	file_strict_temple_pkgs := make(map[^ast.File][dynamic]string, allocator)
+	pkg_string_consts := make(map[string]^ast.Expr, allocator)
+	pkg_proc_aliases := make(map[string]Temple_Proc_Kind, allocator)
 	pkg_proc_aliases["compiled"] = .Compiled
 	pkg_proc_aliases["compiled_inline"] = .Compiled_Inline
 
 	has_any_temple_import := false
 
 	for file in parsed_files {
-		import_names := make([dynamic]string, context.temp_allocator)
-		strict_names := make([dynamic]string, context.temp_allocator)
+		import_names := make([dynamic]string, allocator)
+		strict_names := make([dynamic]string, allocator)
 		append(&strict_names, "temple")
 		for imp in file.imports {
 			trimmed_path := strings.trim(imp.fullpath, "\"`")
@@ -697,9 +745,9 @@ collect_from_dir :: proc(
 	}
 
 	// Evaluate package-level string constants
-	resolved_consts := make(map[string]string, context.temp_allocator)
+	resolved_consts := make(map[string]string, allocator)
 	for name, expr in pkg_string_consts {
-		visited := make(map[string]bool, context.temp_allocator)
+		visited := make(map[string]bool, allocator)
 		if val, ok := eval_const_string_from_ast(expr, pkg_string_consts, &visited); ok {
 			resolved_consts[name] = val
 		}
@@ -714,11 +762,11 @@ collect_from_dir :: proc(
 		}
 
 		// Clone maps per file/scope so procedure-local constants or shadowing variables do not mutate package-wide tables
-		file_proc_aliases := clone_proc_aliases(pkg_proc_aliases, context.temp_allocator)
-		file_string_consts := clone_string_consts(resolved_consts, context.temp_allocator)
+		file_proc_aliases := clone_proc_aliases(pkg_proc_aliases, allocator)
+		file_string_consts := clone_string_consts(resolved_consts, allocator)
 
 		walk_ctx := File_Collect_Ctx {
-			pkg_fullpath        = pkg.fullpath,
+			pkg_fullpath        = pkg_fullpath,
 			file                = file,
 			temple_names        = temple_names[:],
 			strict_temple_names = strict_names[:],
@@ -1300,15 +1348,7 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 		for res in results {
 			delete(res.code)
 			for d in res.diagnostics {
-				delete(d.pos.file)
-				delete(d.message)
-				delete(d.snippet)
-				for f in d.trace {
-					delete(f.pos.file)
-					delete(f.file)
-					delete(f.snippet)
-				}
-				delete(d.trace)
+				destroy_diagnostic(d)
 			}
 			delete(res.diagnostics)
 		}
@@ -1507,6 +1547,9 @@ is_generated_output_up_to_date :: proc(existing_content: string, new_body: strin
 	return strip_generated_timestamp_header(existing_content) == strip_generated_timestamp_header(new_body)
 }
 
+// Intentional distinction from `is_watched_workspace_file`: `--warn-unused` only checks
+// explicit template suffixes (`.temple.twig`, `.temple.html`, `.twig`) and ignores plain
+// `.html` files so static HTML assets in the repository are not flagged as orphan templates.
 is_template_candidate_file :: proc(path: string) -> bool {
 	return strings.has_suffix(path, ".temple.twig") ||
 		strings.has_suffix(path, ".temple.html") ||
@@ -1559,10 +1602,17 @@ discover_project_template_files :: proc(root_dir: string, allocator := context.a
 	return files
 }
 
-Workspace_Snapshot :: map[string]i64
+File_Stamp :: struct {
+	mtime_nsec: i64,
+	size:       i64,
+}
+
+Workspace_Snapshot :: map[string]File_Stamp
 
 is_watched_workspace_file :: proc(name: string) -> bool {
 	return strings.has_suffix(name, ".odin") ||
+		strings.has_suffix(name, ".temple.twig") ||
+		strings.has_suffix(name, ".temple.html") ||
 		strings.has_suffix(name, ".twig") ||
 		strings.has_suffix(name, ".html")
 }
@@ -1605,7 +1655,10 @@ capture_workspace_snapshot :: proc(
 		if len(abs_exclude) > 0 && abs_path == abs_exclude {
 			continue
 		}
-		snap[strings.clone(abs_path, allocator)] = info.modification_time._nsec + info.size
+		snap[strings.clone(abs_path, allocator)] = File_Stamp{
+			mtime_nsec = info.modification_time._nsec,
+			size       = info.size,
+		}
 	}
 	return snap
 }
@@ -1698,19 +1751,7 @@ compile_batch_worker :: proc(batch: ^Worker_Batch) {
 		}
 		cloned_diags := make([dynamic]Diagnostic, 0, len(ctx.diagnostics), batch.heap_alloc)
 		for d in ctx.diagnostics {
-			cd := d
-			cd.pos.file = strings.clone(d.pos.file, batch.heap_alloc)
-			cd.message = strings.clone(d.message, batch.heap_alloc)
-			cd.snippet = strings.clone(d.snippet, batch.heap_alloc)
-			frames := make([]Trace_Frame, len(d.trace), batch.heap_alloc)
-			for f, fi in d.trace {
-				frames[fi] = f
-				frames[fi].pos.file = strings.clone(f.pos.file, batch.heap_alloc)
-				frames[fi].file = strings.clone(f.file, batch.heap_alloc)
-				frames[fi].snippet = strings.clone(f.snippet, batch.heap_alloc)
-			}
-			cd.trace = frames
-			append(&cloned_diags, cd)
+			append(&cloned_diags, clone_diagnostic(d, batch.heap_alloc))
 		}
 
 		batch.results[i] = Transpiled_Template {
@@ -2403,6 +2444,21 @@ rewrite_embeds_relative_to_dir :: proc(
 	return out
 }
 
+@(private = "file")
+apply_origin_fallback :: proc(
+	origin_file: ^string,
+	origin_src: ^[]byte,
+	fallback_file: string,
+	fallback_src: []byte,
+) {
+	if len(origin_file^) == 0 && len(fallback_file) > 0 {
+		origin_file^ = fallback_file
+	}
+	if origin_src^ == nil && fallback_src != nil {
+		origin_src^ = fallback_src
+	}
+}
+
 clone_block_with_resolved_embeds :: proc(
 	ctx: ^Compile_Context,
 	blk: ^Node_Block,
@@ -2413,12 +2469,7 @@ clone_block_with_resolved_embeds :: proc(
 	new_blk := new(Node_Block, ctx.allocator)
 	new_blk^ = blk^
 	new_blk.derived = new_blk
-	if len(new_blk.origin_file) == 0 && len(origin_file) > 0 {
-		new_blk.origin_file = origin_file
-	}
-	if new_blk.origin_src == nil && origin_src != nil {
-		new_blk.origin_src = origin_src
-	}
+	apply_origin_fallback(&new_blk.origin_file, &new_blk.origin_src, origin_file, origin_src)
 	new_blk.body = rewrite_nodes_embeds(ctx, blk.body[:], base_dir, origin_file, origin_src)
 	return new_blk
 }
@@ -2433,12 +2484,7 @@ clone_macro_with_resolved_embeds :: proc(
 	new_mac := new(Node_Macro, ctx.allocator)
 	new_mac^ = mac^
 	new_mac.derived = new_mac
-	if len(new_mac.origin_file) == 0 && len(origin_file) > 0 {
-		new_mac.origin_file = origin_file
-	}
-	if new_mac.origin_src == nil && origin_src != nil {
-		new_mac.origin_src = origin_src
-	}
+	apply_origin_fallback(&new_mac.origin_file, &new_mac.origin_src, origin_file, origin_src)
 	new_mac.body = rewrite_nodes_embeds(ctx, mac.body[:], base_dir, origin_file, origin_src)
 	return new_mac
 }
@@ -2469,12 +2515,7 @@ rewrite_nodes_embeds :: proc(
 			new_emb := new(Node_Embed, ctx.allocator)
 			new_emb^ = d^
 			new_emb.derived = new_emb
-			if len(new_emb.origin_file) == 0 && len(origin_file) > 0 {
-				new_emb.origin_file = origin_file
-			}
-			if new_emb.origin_src == nil && origin_src != nil {
-				new_emb.origin_src = origin_src
-			}
+			apply_origin_fallback(&new_emb.origin_file, &new_emb.origin_src, origin_file, origin_src)
 			if len(new_emb.resolved_path) == 0 && !filepath.is_abs(rel) && len(base_dir) > 0 {
 				abs_path, _ := filepath.join({base_dir, rel}, ctx.allocator)
 				new_emb.resolved_path = normalize_slash_path(abs_path, ctx.allocator)
@@ -2484,12 +2525,7 @@ rewrite_nodes_embeds :: proc(
 			new_sup := new(Node_Super, ctx.allocator)
 			new_sup^ = d^
 			new_sup.derived = new_sup
-			if len(new_sup.origin_file) == 0 && len(origin_file) > 0 {
-				new_sup.origin_file = origin_file
-			}
-			if new_sup.origin_src == nil && origin_src != nil {
-				new_sup.origin_src = origin_src
-			}
+			apply_origin_fallback(&new_sup.origin_file, &new_sup.origin_src, origin_file, origin_src)
 			append(&out, new_sup)
 		case ^Node_Block:
 			append(&out, clone_block_with_resolved_embeds(ctx, d, base_dir, origin_file, origin_src))
@@ -2629,6 +2665,8 @@ import __temple_io "core:io"
 import __temple %q
 
 compiled_inline :: compiled
+@(private = "file")
+__temple_default :: __temple.__temple_default
 
 /*
 Returns the compiled template for the template file at the given path.
