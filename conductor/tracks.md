@@ -24,5 +24,5 @@ This file tracks all major tracks for the project toward the `1.0.0` release. Ea
 
 ---
 
-- [ ] **Track: Cross-Platform Path Normalization & GitHub Actions CI Pipeline**
+- [x] **Track: Cross-Platform Path Normalization & GitHub Actions CI Pipeline**
   *Link: [./tracks/cross_platform_ci_20261101/](./tracks/cross_platform_ci_20261101/)*

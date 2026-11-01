@@ -922,6 +922,76 @@ spec_check_mode_verifies_up_to_date_and_rejects_stale_or_missing_generated_file 
 	}
 }
 
+@(test)
+spec_cross_platform_backslash_paths_normalize_in_codegen_embeds_and_diagnostics :: proc(t: ^testing.T) {
+	// 1. Backslashes in `relpath`, `extends`, and `embed` normalize to `/` in generated code and comments
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		given_template(s, "/app/layouts/base.html", `<main>{% block body %}{% end %}</main>`)
+		given_template(s, "/app/partials/card.html", `<section>Card</section>`)
+		given_template(
+			s,
+			"/app/views/home.html",
+			`{% extends "..\\layouts\\base.html" %}{% block body %}{% embed "..\\partials\\card.html" %}{% end %}`,
+		)
+
+		upon_compiling_template(s, "/app/views/home.html", relpath = `views\home.html`)
+
+		then_generated_file_contains(s, `when path == "views/home.html"`)
+		then_emits_writer_call(s, `embedding "../partials/card.html"`)
+		then_static_literals_render_in_order(s, {
+			"<main>",
+			"<section>Card</section>",
+			"</main>",
+		})
+	}
+
+	// 2. Backslashes in `temple.compiled` call sites normalize to `/` during call collection
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package sample
+import "temple"
+
+view := temple.compiled("views\\dashboard\\index.temple.twig", int)
+`)
+
+		then_collected_templates_are(s, {"views/dashboard/index.temple.twig"})
+	}
+
+	// 3. Diagnostic coordinates and trace stack normalize `\` to `/`
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		given_template(s, "/app/views/page.html", `{% embed "sub\\missing.html" %}`)
+
+		upon_compiling_template(
+			s,
+			`/\app\views\page.html`,
+			relpath     = `views\page.html`,
+			called_from = `\app\routes.odin`,
+			line        = 15,
+			col         = 4,
+		)
+
+		then_diagnostic_is_reported(
+			s,
+			file             = "/app/views/page.html",
+			line             = 1,
+			col              = 10,
+			message_contains = "unable to read template file",
+			trace            = {
+				{kind = .Call_Site, file = "/app/routes.odin",     line = 15, col = 4},
+				{kind = .Embed,     file = "/app/views/page.html", line = 1,  col = 10},
+			},
+		)
+	}
+}
+
 // ============================================================================
 // Pattern D: Property-Based Invariants (Lexer Progress & Parser Crash-Freedom)
 // ============================================================================

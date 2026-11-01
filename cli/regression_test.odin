@@ -878,3 +878,15 @@ test_cli_dx_flags_and_modes :: proc(t: ^testing.T) {
 		testing.expect(t, has_workspace_snapshot_changed(snap1, snap_removed))
 	}
 }
+
+@(test)
+test_cross_platform_path_normalization :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	alloc := mem.dynamic_arena_allocator(&arena)
+
+	testing.expect_value(t, normalize_slash_path(`views\pages\home.temple.twig`, alloc), "views/pages/home.temple.twig")
+	testing.expect_value(t, normalize_slash_path(`a/b\c\\d/e.html`, alloc), "a/b/c/d/e.html")
+	testing.expect_value(t, normalize_slash_path(`already/normalized.html`, alloc), "already/normalized.html")
+}

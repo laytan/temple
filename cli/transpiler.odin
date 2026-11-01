@@ -444,7 +444,8 @@ transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
 
 transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	ws(t.w, "{")
-	transpile_loc(t, node.open.pos, fmt.tprintf("embedding %s ", node.path.value))
+	norm_path := normalize_slash_path(node.path.value, t.allocator)
+	transpile_loc(t, node.open.pos, fmt.tprintf("embedding %s ", norm_path))
 	indent(t)
 	write_newline(t)
 
