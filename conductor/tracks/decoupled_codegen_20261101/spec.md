@@ -11,7 +11,7 @@ Currently, `temple_cli` writes `templates.odin` directly into the `temple/` libr
    - Support `-pkg:<package_name>` (or automatically infer the package declaration from `.odin` files in the output directory) and `-temple-import:<import_path>` (defaulting to `"shared:temple"` or a configurable relative path when generating outside `package temple`).
    - Preserve backwards compatibility when invoked as `temple_cli <project_dir> <temple_dir>` with no flags.
 2. **Generated Code Qualification:**
-   - When generating into a user package (`package <pkg>`), import the `temple` runtime as `import __temple "<import_path>"` and qualify runtime types and helpers (`__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`).
+   - When generating into a user package (`package <pkg>`), import the `temple` runtime as `import __temple "<import_path>"` and qualify runtime types and helpers (`__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_fmt_escaped`, `__temple.__temple_write_fmt_raw`).
 3. **Call Collection Support:**
    - Update `collect_compile_calls` in `cli/main.odin` to recognize `compiled` and `compiled_inline` calls targeting either the `temple` import or the local package's generated `compiled` / `compiled_inline` procedures.
 

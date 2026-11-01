@@ -19,6 +19,8 @@ Transpiler :: struct {
 	indent:       string,
 	indented:     int,
 	approx_bytes: int,
+	macro_approx: map[string]int,
+	external_pkg: bool,
 
 	embed_parser: Embed_Parser,
 	embed_data:   rawptr,
@@ -45,9 +47,19 @@ write_indent :: proc(t: ^Transpiler) {
 	}
 }
 
-transpile :: proc(w: io.Writer, identifier: string, templ: Template, embed_parser: Embed_Parser, embed_data: rawptr, allocator := context.allocator) {
+transpile :: proc(
+	w: io.Writer,
+	identifier: string,
+	templ: Template,
+	embed_parser: Embed_Parser,
+	embed_data: rawptr,
+	allocator := context.allocator,
+	external_pkg := false,
+) {
 	t: Transpiler
 	t.allocator = allocator
+	t.macro_approx = make(map[string]int, allocator)
+	t.external_pkg = external_pkg
 	t.embed_parser = embed_parser
 	t.embed_data = embed_data
 	t.indent = "\t"
@@ -113,6 +125,10 @@ transpile_node :: proc(t: ^Transpiler, node: Node) {
 		transpile_embed(t, d)
 	case ^Node_Block:
 		transpile_block(t, d)
+	case ^Node_Macro:
+		transpile_macro(t, d)
+	case ^Node_Call:
+		transpile_call(t, d)
 	case ^Node_Extends:
 		// Resolved during layout splicing before transpilation.
 	case ^Node_Super:
@@ -127,6 +143,63 @@ transpile_block :: proc(t: ^Transpiler, node: ^Node_Block) {
 			write_newline(t)
 		}
 	}
+}
+
+transpile_macro :: proc(t: ^Transpiler, node: ^Node_Macro) {
+	if len(node.params_src) > 0 {
+		fmt.wprintf(
+			t.w,
+			"__temple_macro_%s :: proc(%s: %s.Writer, %s) -> (%s: int, %s: %s.Error) {{",
+			node.name,
+			ARG_W,
+			PKG_IO,
+			node.params_src,
+			RET_N,
+			RET_ERR,
+			PKG_IO,
+		)
+	} else {
+		fmt.wprintf(
+			t.w,
+			"__temple_macro_%s :: proc(%s: %s.Writer) -> (%s: int, %s: %s.Error) {{",
+			node.name,
+			ARG_W,
+			PKG_IO,
+			RET_N,
+			RET_ERR,
+			PKG_IO,
+		)
+	}
+	transpile_loc(t, node.open.pos)
+	indent(t)
+	write_newline(t)
+
+	approx_start := t.approx_bytes
+	for n in node.body {
+		transpile_node(t, n)
+		write_newline(t)
+	}
+	t.macro_approx[node.name] = t.approx_bytes - approx_start
+	t.approx_bytes = approx_start
+
+	ws(t.w, "return")
+	dedent(t)
+	write_newline(t)
+	ws(t.w, "}")
+}
+
+transpile_call :: proc(t: ^Transpiler, node: ^Node_Call) {
+	if macro_bytes, found := t.macro_approx[node.name]; found {
+		t.approx_bytes += macro_bytes
+	} else {
+		t.approx_bytes += 10
+	}
+	if len(node.args_src) > 0 {
+		fmt.wprintf(t.w, "%s += __temple_macro_%s(%s, %s) or_return", RET_N, node.name, ARG_W, node.args_src)
+	} else {
+		fmt.wprintf(t.w, "%s += __temple_macro_%s(%s) or_return", RET_N, node.name, ARG_W)
+	}
+	transpile_loc(t, node.open.pos)
 }
 
 transpile_let :: proc(t: ^Transpiler, node: ^Node_Let) {
@@ -210,12 +283,30 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	ws(t.w, " += ")
 
 	v := node.inner_expr if len(node.inner_expr) > 0 else strings.trim_space(node.expression.value)
+	rt_prefix := "__temple." if t.external_pkg else ""
+	if t.external_pkg && strings.contains(v, "__temple_default(") {
+		v, _ = strings.replace_all(v, "__temple_default(", "__temple.__temple_default(", t.allocator)
+	}
 
 	switch node.write_kind {
+	case .Fmt_Escaped:
+		fmt.wprintf(t.w, "%s__temple_write_fmt_escaped(%s, %s, %s) or_return", rt_prefix, ARG_W, node.fmt_str, v)
+		transpile_loc(t, node.open.pos)
+		return
+	case .Fmt_Raw:
+		fmt.wprintf(t.w, "%s__temple_write_fmt_raw(%s, %s, %s) or_return", rt_prefix, ARG_W, node.fmt_str, v)
+		transpile_loc(t, node.open.pos)
+		return
 	case .Raw_String:
 		fmt.wprintf(t.w, "%s.write_string(", PKG_IO)
 	case .Magic_String:
-		ws(t.w, "__temple_write_magic_string(")
+		fmt.wprintf(t.w, "%s__temple_write_magic_string(", rt_prefix)
+	case .Url_String:
+		fmt.wprintf(t.w, "%s__temple_write_safe_url(", rt_prefix)
+	case .Url_Param_String:
+		fmt.wprintf(t.w, "%s__temple_write_url_param(", rt_prefix)
+	case .Js_String:
+		fmt.wprintf(t.w, "%s__temple_write_js_string(", rt_prefix)
 	case .Byte:
 		fmt.wprintf(t.w, "%s.write_byte(", PKG_IO)
 	case .Rune:
@@ -237,7 +328,7 @@ transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	case .F64:
 		fmt.wprintf(t.w, "%s.write_f64(", PKG_IO)
 	case .Escaped_String:
-		ws(t.w, "__temple_write_escaped_string(")
+		fmt.wprintf(t.w, "%s__temple_write_escaped_string(", rt_prefix)
 	}
 
 	ws(t.w, ARG_W)
@@ -357,7 +448,24 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	indent(t)
 	write_newline(t)
 
-	if with, ok := node.with.?; ok {
+	if len(node.props) > 0 {
+		for prop, i in node.props {
+			fmt.wprintf(t.w, "__temple_prop_%i := %s", i, prop.val_expr)
+			write_newline(t)
+		}
+		ws(t.w, "this := struct { ")
+		for prop, i in node.props {
+			if i > 0 do ws(t.w, ", ")
+			fmt.wprintf(t.w, "%s: type_of(__temple_prop_%i)", prop.name, i)
+		}
+		ws(t.w, " }{ ")
+		for prop, i in node.props {
+			if i > 0 do ws(t.w, ", ")
+			fmt.wprintf(t.w, "%s = __temple_prop_%i", prop.name, i)
+		}
+		ws(t.w, " }")
+		write_newline(t)
+	} else if with, ok := node.with.?; ok {
 		ws(t.w, "this := ")
 		ws(t.w, strings.trim_space(with.expr.value))
 		write_newline(t)

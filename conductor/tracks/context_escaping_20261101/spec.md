@@ -12,7 +12,7 @@ HTML entity escaping (`__temple_write_escaped_string`) protects HTML text nodes 
 2. **JavaScript String Escaping (`runtime.odin`):**
    - `__temple_write_js_string(w, str)`: Escapes `\`, `"`, `'`, `\n`, `\r`, `\t`, `<`, `>`, `&`, `/`, and U+2028/U+2029 so strings can be safely interpolated inside `<script>` string literals without `</script>` breakout.
 3. **Parser & Transpiler Classification (`cli/parser.odin`, `cli/transpiler.odin`):**
-   - Extend `Output_Write_Kind` and `validate_and_classify_output_expr` to recognize `url(expr)`, `url_param(expr)`, and `js(expr)` with 1-argument validation and delimiter-preserving inner expression slicing.
+   - Extend `Output_Write_Kind` and `classify_output_ast` to recognize `url`, `url_param`, and `js` in both pipe syntax (`{{ this.link | url }}`, `{{ this.q | url_param }}`, `{{ this.payload | js }}`) and call syntax (`{{ url(this.link) }}`, `{{ url_param(this.q) }}`, `{{ js(this.payload) }}`) with 1-argument validation and delimiter-preserving inner expression slicing.
 
 ## Acceptance Criteria
 

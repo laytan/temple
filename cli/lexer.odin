@@ -38,6 +38,8 @@ Token_Type :: enum {
 	Extends,
 	Block,
 	Super,
+	Macro,
+	Call,
 	End,
 }
 
@@ -248,6 +250,16 @@ lexer_next :: proc(l: ^Lexer) -> (t: Token) {
 			case lexer_match_keyword(l, "super", true):
 				t.type  = .Super
 				t.value = lexer_consume(l, "super")
+				lexer_skip_all_whitespace(l)
+
+			case lexer_match_keyword(l, "macro", true):
+				t.type  = .Macro
+				t.value = lexer_consume(l, "macro")
+				lexer_skip_all_whitespace(l)
+
+			case lexer_match_keyword(l, "call", true):
+				t.type  = .Call
+				t.value = lexer_consume(l, "call")
 				lexer_skip_all_whitespace(l)
 
 			case:

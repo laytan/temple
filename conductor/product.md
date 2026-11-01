@@ -13,12 +13,13 @@ Temple provides Odin web and application developers with an ergonomic, safe-by-d
 - Odin backend and full-stack web developers building server-rendered HTML, hypermedia (HTMX/Datastar), email, or text views.
 - Library and framework authors seeking a type-safe, zero-allocation/buffered `io.Writer` template layer compatible with Odin's `shared:` collection.
 
-## Core Capabilities (v0.2.0 Baseline)
+## Core Capabilities (v0.2.0+ Baseline)
 
 - Mustache/Twig-inspired output (`{{ ... }}`), conditionals (`if` / `else if` / `else`), loops (`for`), pattern matching (`switch` / `#partial switch` / `case`), and local bindings (`let`).
-- Layout inheritance (`extends`, `block`, `super()`), sub-template embedding (`embed ... with`), comments (`{# ... #}`), and whitespace trimming (`{{-`, `-}}`, `{%-`, `-%}`).
+- AST-powered pipe filter DSL (`|`), stack-buffered `fmt(...)` formatting, and `default(...)` fallbacks inside `{{ ... }}` tags.
+- Layout inheritance (`extends`, `block`, `super()`), sub-template embedding (`embed ... with` and component-style named props `embed "card.html"(this.title, active = true)`), comments (`{# ... #}`), and whitespace trimming (`{{-`, `-}}`, `{%-`, `-%}`).
 - Compile-time Odin AST expression validation (`core:odin/parser`) and Rust/Odin-style diagnostics with full `Call_Site -> Extends -> Embed` trace stacks.
-- Batched HTML entity escaping by default with `raw(...)`, `magic(...)`, and explicit numeric/rune type-cast writers.
+- Batched HTML entity escaping by default with `raw(...)` / `| raw`, `magic(...)` / `| magic`, and explicit numeric/rune type-cast writers.
 
 ## 1.0.0 Roadmap Goals
 

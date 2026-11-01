@@ -14,6 +14,7 @@ Parser :: struct {
 	last_txt_node: Maybe(^Node_Text),
 	in_block:      int,
 	body_depth:    int,
+	seen_macros:   map[string]bool,
 }
 
 Parser_Error :: struct {
@@ -41,6 +42,8 @@ Any_Node :: union {
 	^Node_Extends,
 	^Node_Block,
 	^Node_Super,
+	^Node_Macro,
+	^Node_Call,
 }
 
 Node_Text :: struct {
@@ -52,6 +55,11 @@ Output_Write_Kind :: enum {
 	Escaped_String,
 	Raw_String,
 	Magic_String,
+	Url_String,
+	Url_Param_String,
+	Js_String,
+	Fmt_Escaped,
+	Fmt_Raw,
 	Byte,
 	Rune,
 	Int,
@@ -71,6 +79,7 @@ Node_Output :: struct {
 	close:      Token,
 	write_kind: Output_Write_Kind,
 	inner_expr: string,
+	fmt_str:    string, // Populated when write_kind is .Fmt_Escaped or .Fmt_Raw
 }
 
 Node_If :: struct {
@@ -109,6 +118,12 @@ Node_Let :: struct {
 	close:         Token,
 }
 
+Embed_Prop :: struct {
+	name:     string,
+	val_expr: string,
+	pos:      Pos,
+}
+
 Node_Embed :: struct {
 	using node:    Node,
 	open:          Token,
@@ -118,6 +133,7 @@ Node_Embed :: struct {
 	origin_file:   string,
 	origin_src:    []byte,
 	with:          Maybe(^Node_Embed_With),
+	props:         [dynamic]Embed_Prop, // Populated for `{% embed "x.html"(a = 1, b = 2) %}`
 	close:         Token,
 }
 
@@ -156,6 +172,30 @@ Node_Super :: struct {
 	close:       Token,
 }
 
+Node_Macro :: struct {
+	using node:  Node,
+	open:        Token,
+	macro_tok:   Token,
+	signature:   Token,
+	name:        string,
+	params_src:  string,
+	origin_file: string,
+	origin_src:  []byte,
+	close:       Token,
+	body:        [dynamic]Node,
+	end:         Node_End,
+}
+
+Node_Call :: struct {
+	using node: Node,
+	open:       Token,
+	call_tok:   Token,
+	call_expr:  Token,
+	name:       string,
+	args_src:   string,
+	close:      Token,
+}
+
 Node_If_Part :: struct {
 	start: struct {
 		open:  Token,
@@ -189,6 +229,7 @@ parser_init_bytes :: proc(p: ^Parser, source: []byte, allocator := context.alloc
 
 	p.allocator = allocator
 	p.template.content = make([dynamic]Node, allocator)
+	p.seen_macros = make(map[string]bool, allocator)
 }
 
 parser_init_str :: proc(p: ^Parser, source: string, allocator := context.allocator) {
@@ -240,7 +281,7 @@ parse :: proc(p: ^Parser) -> Template {
 		case .EOF:
 			break parse_loop
 
-		case .Output_Close, .Illegal, .Process_Close, .If, .End, .For, .Else, .ElseIf, .Switch, .Partial_Switch, .Case, .Let, .Embed_With, .Embed_Path, .Embed, .Extends, .Block, .Super:
+		case .Output_Close, .Illegal, .Process_Close, .If, .End, .For, .Else, .ElseIf, .Switch, .Partial_Switch, .Case, .Let, .Embed_With, .Embed_Path, .Embed, .Extends, .Block, .Super, .Macro, .Call:
 			fallthrough
 
 		case:
@@ -275,7 +316,7 @@ validate_extends_structure :: proc(p: ^Parser) {
 		return
 	}
 
-	// Ensure extends is the first non-whitespace node, and only blocks/whitespace appear after it.
+	// Ensure extends is the first non-whitespace node, and only blocks/macros/whitespace appear after it.
 	for node, i in p.template.content {
 		if i < extends_index {
 			if txt, is_txt := node.derived.(^Node_Text); is_txt {
@@ -290,34 +331,40 @@ validate_extends_structure :: proc(p: ^Parser) {
 			continue
 		} else {
 			#partial switch d in node.derived {
-			case ^Node_Block:
+			case ^Node_Block, ^Node_Macro:
 				continue
+			case ^Node_Call:
+				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"call\" tags outside of \"block\" or \"macro\" tags")
+				return
 			case ^Node_Text:
 				if strings.trim_space(d.text.value) == "" {
 					continue
 				}
-				_ = error(p, d.text.pos, "child template extending a layout cannot contain content outside of \"block\" tags")
+				_ = error(p, d.text.pos, "child template extending a layout can only contain \"block\" or \"macro\" tags at the top level")
 				return
 			case ^Node_Output:
-				_ = error(p, d.open.pos, "child template extending a layout cannot contain output tags outside of \"block\" tags")
+				_ = error(p, d.open.pos, "child template extending a layout cannot contain output tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_If:
-				_ = error(p, d._if.start.open.pos, "child template extending a layout cannot contain \"if\" tags outside of \"block\" tags")
+				_ = error(p, d._if.start.open.pos, "child template extending a layout cannot contain \"if\" tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_For:
-				_ = error(p, d.start.open.pos, "child template extending a layout cannot contain \"for\" tags outside of \"block\" tags")
+				_ = error(p, d.start.open.pos, "child template extending a layout cannot contain \"for\" tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_Switch:
-				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"switch\" tags outside of \"block\" tags")
+				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"switch\" tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_Let:
-				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"let\" tags outside of \"block\" tags")
+				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"let\" tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_Embed:
-				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"embed\" tags outside of \"block\" tags")
+				_ = error(p, d.open.pos, "child template extending a layout cannot contain \"embed\" tags outside of \"block\" or \"macro\" tags")
 				return
 			case ^Node_Super:
 				_ = error(p, d.open.pos, "\"super\" cannot be used outside of a \"block\" tag")
+				return
+			case:
+				_ = error(p, {}, "child template extending a layout can only contain \"block\" or \"macro\" tags at the top level")
 				return
 			}
 		}
@@ -404,6 +451,10 @@ parse_process :: proc(p: ^Parser, process: Token, process_type_: Maybe(Token) = 
 		return parse_block(p, process, process_type) or_return, true
 	case .Super:
 		return parse_super(p, process, process_type) or_return, true
+	case .Macro:
+		return parse_macro(p, process, process_type) or_return, true
+	case .Call:
+		return parse_call(p, process, process_type) or_return, true
 	case .Case:
 		error(
 			p,
@@ -992,6 +1043,284 @@ parse_super :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 	return
 }
 
+parse_macro :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Macro, ok: bool) {
+	assert(process_type.type == .Macro)
+
+	if p.body_depth > 0 {
+		error(p, process.pos, "\"macro\" must be declared at the top level of a template") or_return
+	}
+
+	t = new(Node_Macro, p.allocator)
+	t.derived = t
+	t.body.allocator = p.allocator
+	t.open = process
+	t.macro_tok = process_type
+
+	sig_tok := lexer_next(&p.lexer)
+	if sig_tok.type != .Text || len(strings.trim_space(sig_tok.value)) == 0 {
+		error(
+			p,
+			sig_tok.pos,
+			"missing macro signature after \"macro\", expected \"name(params...)\"",
+		) or_return
+	}
+
+	validate_macro_signature(p, sig_tok, t) or_return
+
+	t.signature = sig_tok
+	t.close = lexer_next(&p.lexer)
+	if t.close.type != .Process_Close {
+		error(
+			p,
+			t.close.pos,
+			"invalid token following macro signature %q, expected \"%%}\", got: %q",
+			t.name,
+			t.close.value,
+		) or_return
+	}
+
+	prev_in_block := p.in_block
+	p.in_block = 0
+	defer p.in_block = prev_in_block
+
+	t.end.open, t.end.end = parse_body(
+		p,
+		&t.body,
+		proc(tok: Token) -> bool { return tok.type == .End },
+		"macro",
+		process.pos,
+	) or_return
+
+	t.end.close = lexer_next(&p.lexer)
+	if t.end.close.type != .Process_Close {
+		error(
+			p,
+			t.end.close.pos,
+			"invalid token after \"end\", expected \"%%}\", got: %q",
+			t.end.close.value,
+		) or_return
+	}
+
+	ok = true
+	return
+}
+
+parse_call :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Node_Call, ok: bool) {
+	assert(process_type.type == .Call)
+
+	t = new(Node_Call, p.allocator)
+	t.derived = t
+	t.open = process
+	t.call_tok = process_type
+
+	expr_tok := lexer_next(&p.lexer)
+	if expr_tok.type != .Text || len(strings.trim_space(expr_tok.value)) == 0 {
+		error(
+			p,
+			expr_tok.pos,
+			"missing macro call expression after \"call\", expected \"name(args...)\"",
+		) or_return
+	}
+
+	validate_call_expr(p, expr_tok, t) or_return
+
+	t.call_expr = expr_tok
+	t.close = lexer_next(&p.lexer)
+	if t.close.type != .Process_Close {
+		error(
+			p,
+			t.close.pos,
+			"invalid token following \"call\" expression, expected \"%%}\", got: %q",
+			t.close.value,
+		) or_return
+	}
+
+	ok = true
+	return
+}
+
+@(private = "file")
+validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) -> bool {
+	raw_src := strings.trim_right_space(tok.value)
+	context.allocator = p.allocator
+
+	open_paren := strings.index_byte(raw_src, '(')
+	if open_paren == -1 {
+		return error(
+			p,
+			tok.pos,
+			"invalid macro signature %q: expected parameter list in parentheses, e.g. \"name(param: string)\"",
+			strings.trim_space(raw_src),
+		)
+	}
+
+	name_raw := raw_src[:open_paren]
+	name_lead := 0
+	for name_lead < len(name_raw) && is_ws(name_raw[name_lead]) {
+		name_lead += 1
+	}
+	name_pos := advance_pos_by_offset(tok.pos, raw_src, name_lead)
+	name := strings.trim_space(name_raw)
+	if !is_valid_block_ident(name) {
+		return error(p, name_pos, "invalid macro name %q, expected a valid identifier", name)
+	}
+
+	if p.seen_macros[name] {
+		return error(p, name_pos, "duplicate macro definition %q in template", name)
+	}
+
+	params_part := raw_src[open_paren:]
+	prefix :: "proc"
+	synthetic := strings.concatenate({prefix, params_part}, p.allocator)
+
+	op: odin_parser.Parser
+	file: ast.File
+	init_odin_snippet_parser(&op, &file, synthetic, false)
+
+	expr := odin_parser.parse_expr(&op, false)
+	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
+		rel_offset := open_paren + max(tl_odin_diag.pos.offset - len(prefix), 0)
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid parameter list"
+		return error(p, err_pos, "invalid macro parameter list: %s", msg)
+	}
+
+	if op.curr_tok.kind != .EOF {
+		rel_offset := open_paren + max(op.curr_tok.pos.offset - len(prefix), 0)
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+		return error(p, err_pos, "unexpected trailing token %q after macro parameter list", op.curr_tok.text)
+	}
+
+	proc_type, is_proc := expr.derived_expr.(^ast.Proc_Type)
+	if !is_proc {
+		return error(p, tok.pos, "invalid macro signature %q", strings.trim_space(raw_src))
+	}
+	if proc_type.results != nil {
+		return error(p, tok.pos, "invalid macro signature: macros cannot declare a return type")
+	}
+
+	if proc_type.params != nil {
+		seen_params := make(map[string]bool, p.allocator)
+		for field in proc_type.params.list {
+			field_syn_off := field.pos.offset
+			if field_syn_off <= 0 && field.type != nil {
+				field_syn_off = field.type.pos.offset
+			}
+			rel_field_offset := open_paren + max(field_syn_off - len(prefix), 0)
+			field_pos := advance_pos_by_offset(tok.pos, raw_src, rel_field_offset)
+
+			is_unnamed_type_only := field.type != nil && (len(field.names) == 0 || field.names[0].pos.offset >= field.type.pos.offset)
+			if len(field.names) == 0 || is_unnamed_type_only || (field.type == nil && field.default_value == nil) {
+				return error(
+					p,
+					field_pos,
+					"macro parameter in %q must have an explicit type or default value (e.g. \"param: string\" or \"active := false\")",
+					name,
+				)
+			}
+
+			for name_expr in field.names {
+				rel_name_offset := open_paren + max(name_expr.pos.offset - len(prefix), 0)
+				param_pos := advance_pos_by_offset(tok.pos, raw_src, rel_name_offset)
+				ident, is_ident := name_expr.derived_expr.(^ast.Ident)
+				if !is_ident {
+					return error(p, param_pos, "invalid parameter name in macro %q", name)
+				}
+				if seen_params[ident.name] {
+					return error(p, param_pos, "duplicate parameter %q in macro %q", ident.name, name)
+				}
+				seen_params[ident.name] = true
+			}
+		}
+	}
+
+	p.seen_macros[name] = true
+	out_node.name = name
+	if proc_type.params != nil && len(proc_type.params.list) > 0 {
+		close_paren_off := proc_type.end.offset - 1
+		if close_paren_off > len(prefix) + 1 && close_paren_off <= len(synthetic) {
+			inner_params := strip_trailing_comma_and_comments(
+				synthetic[len(prefix) + 1 : close_paren_off],
+			)
+			out_node.params_src = inner_params
+		}
+	}
+	return true
+}
+
+@(private = "file")
+validate_call_expr :: proc(p: ^Parser, tok: Token, out_node: ^Node_Call) -> bool {
+	raw_src := strings.trim_right_space(tok.value)
+	context.allocator = p.allocator
+
+	op: odin_parser.Parser
+	file: ast.File
+	init_odin_snippet_parser(&op, &file, raw_src, false)
+
+	expr := odin_parser.parse_expr(&op, false)
+	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, tl_odin_diag.pos.offset)
+		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid macro call"
+		return error(p, err_pos, "invalid \"call\" expression: %s", msg)
+	}
+
+	if op.curr_tok.kind != .EOF {
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, op.curr_tok.pos.offset)
+		return error(p, err_pos, "unexpected trailing token %q in \"call\" tag", op.curr_tok.text)
+	}
+
+	call, is_call := expr.derived_expr.(^ast.Call_Expr)
+	if !is_call {
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, expr.pos.offset)
+		return error(
+			p,
+			err_pos,
+			"invalid \"call\" syntax %q: expected a macro call like \"name(args...)\"",
+			strings.trim_space(raw_src),
+		)
+	}
+
+	ident, is_ident := call.expr.derived_expr.(^ast.Ident)
+	if !is_ident {
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, call.expr.pos.offset)
+		return error(p, err_pos, "invalid macro call target: expected a macro identifier")
+	}
+
+	out_node.name = ident.name
+	inner_args := raw_src[call.open.offset + 1 : call.close.offset]
+	out_node.args_src = strip_trailing_comma_and_comments(inner_args)
+	return true
+}
+
+@(private = "file")
+strip_trailing_comma_and_comments :: proc(s: string) -> string {
+	t: tokenizer.Tokenizer
+	tokenizer.init(&t, s, "snippet", odin_silent_err_handler)
+	t.flags += {.Insert_Semicolon}
+
+	last_non_comma_end := 0
+	for {
+		tok := tokenizer.scan(&t)
+		if tok.kind == .EOF {
+			break
+		}
+		if tok.kind == .Semicolon && (tok.text == "\n" || tok.text == "\r\n") {
+			continue
+		}
+		if tok.kind == .Comment {
+			continue
+		}
+		if tok.kind == .Comma {
+			continue
+		}
+		last_non_comma_end = tok.pos.offset + len(tok.text)
+	}
+	if last_non_comma_end == 0 {
+		return ""
+	}
+	return strings.trim_space(s[:last_non_comma_end])
+}
+
 parse_body :: proc(
 	p: ^Parser,
 	container: ^[dynamic]Node,
@@ -1062,7 +1391,7 @@ parse_body :: proc(
 				open_pos.col + 1,
 			) or_return
 
-		case .Output_Close, .Process_Close, .Illegal, .If, .End, .For, .Else, .ElseIf, .Switch, .Partial_Switch, .Case, .Let, .Embed_With, .Embed_Path, .Embed, .Extends, .Block, .Super:
+		case .Output_Close, .Process_Close, .Illegal, .If, .End, .For, .Else, .ElseIf, .Switch, .Partial_Switch, .Case, .Let, .Embed_With, .Embed_Path, .Embed, .Extends, .Block, .Super, .Macro, .Call:
 			fallthrough
 
 		case:
@@ -1076,6 +1405,7 @@ parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 
 	t = new(Node_Embed, p.allocator)
 	t.derived = t
+	t.props.allocator = p.allocator
 
 	t.open  = process
 	t.embed = process_type
@@ -1090,34 +1420,168 @@ parse_embed :: proc(p: ^Parser, process: Token, process_type: Token) -> (t: ^Nod
 	}
 
 	next := lexer_next(&p.lexer)
-	#partial switch next.type {
-	case .Embed_With:
+	if next.type == .Embed_With {
 		with := new(Node_Embed_With, p.allocator)
-
 		with.with = next
+
 		with.expr = lexer_next(&p.lexer)
 		if with.expr.type != .Text {
 			error(p, with.expr.pos, "invalid token after \"with\", expected an expression, got: %q", with.expr.value) or_return
 		}
 
-		validate_embed_with_expr(p, with.expr) or_return
-
-		t.with = with
+		trimmed_with := strings.trim_space(with.expr.value)
+		if strings.has_prefix(trimmed_with, "(") && strings.has_suffix(trimmed_with, ")") {
+			// Support `{% embed "card.html" with (title = this.title, active = true) %}`
+			if is_props, props_ok := try_parse_embed_props(p, with.expr, &t.props); is_props {
+				if !props_ok do return nil, false
+			} else {
+				validate_embed_with_expr(p, with.expr) or_return
+				t.with = with
+			}
+		} else {
+			validate_embed_with_expr(p, with.expr) or_return
+			t.with = with
+		}
 
 		t.close = lexer_next(&p.lexer)
 		if t.close.type != .Process_Close {
 			error(p, t.close.pos, "invalid token after with expression, expected \"%%}\", got: %q", t.close.value) or_return
 		}
+	} else if next.type == .Text {
+		// Support direct call-style `{% embed "card.html"(title = this.title, active = true) %}`
+		trimmed := strings.trim_space(next.value)
+		if !strings.has_prefix(trimmed, "(") {
+			error(p, next.pos, "invalid token after embed path, expected \"with\", \"(props...)\", or \"%%}\", got: %q", next.value) or_return
+		}
+		parse_embed_props_expr(p, next, &t.props) or_return
 
-	case .Process_Close:
+		t.close = lexer_next(&p.lexer)
+		if t.close.type != .Process_Close {
+			error(p, t.close.pos, "invalid token after embed props, expected \"%%}\", got: %q", t.close.value) or_return
+		}
+	} else if next.type == .Process_Close {
 		t.close = next
-
-	case:
-		error(p, next.pos, "invalid token after embed path, expected \"with\" or \"%%}\", got: %q", next.value) or_return
+	} else {
+		error(p, next.pos, "invalid token after embed path, expected \"with\", \"(props...)\", or \"%%}\", got: %q", next.value) or_return
 	}
 
 	ok = true
 	return
+}
+
+@(private = "file")
+try_parse_embed_props :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embed_Prop) -> (is_props: bool, ok: bool) {
+	raw_src := strings.trim_right_space(tok.value)
+	context.allocator = p.allocator
+
+	prefix :: "__component"
+	synthetic := strings.concatenate({prefix, raw_src}, p.allocator)
+
+	op: odin_parser.Parser
+	file: ast.File
+	init_odin_snippet_parser(&op, &file, synthetic, false)
+
+	expr := odin_parser.parse_expr(&op, false)
+	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 || op.curr_tok.kind != .EOF {
+		return false, false
+	}
+	call, is_call := expr.derived_expr.(^ast.Call_Expr)
+	if !is_call {
+		return false, false
+	}
+	// Distinguish `(a + b)` (a parenthesized single binary expr) from `(a = 1, b = 2)`
+	if len(call.args) == 1 {
+		if _, is_fv := call.args[0].derived_expr.(^ast.Field_Value); !is_fv {
+			return false, false
+		}
+	}
+	return true, parse_embed_props_expr(p, tok, out_props)
+}
+
+@(private = "file")
+parse_embed_props_expr :: proc(p: ^Parser, tok: Token, out_props: ^[dynamic]Embed_Prop) -> bool {
+	raw_src := strings.trim_right_space(tok.value)
+	context.allocator = p.allocator
+
+	prefix :: "__component"
+	synthetic := strings.concatenate({prefix, raw_src}, p.allocator)
+
+	op: odin_parser.Parser
+	file: ast.File
+	init_odin_snippet_parser(&op, &file, synthetic, false)
+
+	expr := odin_parser.parse_expr(&op, false)
+	if tl_odin_diag.has_err || expr == nil || op.error_count > 0 {
+		rel_offset := max(tl_odin_diag.pos.offset - len(prefix), 0)
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+		msg := tl_odin_diag.msg if len(tl_odin_diag.msg) > 0 else "invalid component props"
+		return error(p, err_pos, "invalid embed props: %s", msg)
+	}
+
+	if op.curr_tok.kind != .EOF {
+		rel_offset := max(op.curr_tok.pos.offset - len(prefix), 0)
+		err_pos := advance_pos_by_offset(tok.pos, raw_src, rel_offset)
+		return error(p, err_pos, "unexpected trailing token %q after embed props", op.curr_tok.text)
+	}
+
+	call, is_call := expr.derived_expr.(^ast.Call_Expr)
+	if !is_call || len(call.args) == 0 {
+		return error(p, tok.pos, "embed props list cannot be empty; pass at least one prop or omit parentheses")
+	}
+
+	seen_names := make(map[string]bool, p.allocator)
+
+	for arg, i in call.args {
+		arg_limit := call.args[i + 1].pos.offset if i + 1 < len(call.args) else call.close.offset
+		rel_arg_offset := max(arg.pos.offset - len(prefix), 0)
+		arg_pos := advance_pos_by_offset(tok.pos, raw_src, rel_arg_offset)
+
+		prop_name: string
+		val_str: string
+
+		#partial switch a in arg.derived_expr {
+		case ^ast.Field_Value:
+			ident, is_ident := a.field.derived_expr.(^ast.Ident)
+			if !is_ident {
+				return error(p, arg_pos, "invalid embed prop name: expected an identifier on left-hand side of '='")
+			}
+			prop_name = ident.name
+			val_str = strip_trailing_comma_and_comments(synthetic[a.value.pos.offset : arg_limit])
+
+		case ^ast.Ident:
+			// Shorthand punning: `{% embed "card.html"(title) %}` -> `title = title`
+			prop_name = a.name
+			val_str = a.name
+
+		case ^ast.Selector_Expr:
+			// Shorthand punning: `{% embed "card.html"(this.title) %}` -> `title = this.title`
+			if a.field == nil {
+				return error(p, arg_pos, "invalid selector shorthand in embed props")
+			}
+			prop_name = a.field.name
+			val_str = strip_trailing_comma_and_comments(synthetic[arg.pos.offset : arg_limit])
+
+		case:
+			return error(
+				p,
+				arg_pos,
+				"invalid embed prop: expected 'name = expr' or shorthand 'this.field'",
+			)
+		}
+
+		if seen_names[prop_name] {
+			return error(p, arg_pos, "duplicate prop %q in embed tag", prop_name)
+		}
+		seen_names[prop_name] = true
+
+		append(out_props, Embed_Prop{
+			name     = prop_name,
+			val_expr = val_str,
+			pos      = arg_pos,
+		})
+	}
+
+	return true
 }
 
 is_valid_block_ident :: proc(s: string) -> bool {
@@ -1236,7 +1700,157 @@ validate_and_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output) -> (is
 	node.write_kind = .Escaped_String
 	node.inner_expr = trimmed
 
-	// Inspect top-level AST node for pseudo-casts: super(), raw(...), byte(...), rune(...), int(...), len(...), etc.
+	return classify_output_ast(p, node, raw_src, expr)
+}
+
+@(private = "file")
+classify_output_ast :: proc(
+	p: ^Parser,
+	node: ^Node_Output,
+	raw_src: string,
+	expr: ^ast.Expr,
+) -> (
+	is_super: bool,
+	ok: bool,
+) {
+	// 1. Pipe filter syntax: `lhs | filter` or `lhs | filter(arg)`
+	// Check BEFORE `ast.unparen_expr(expr)` so parenthesized bitwise-OR expressions
+	// like `{{ (this.flags | 0x01) | int }}` are preserved as Odin bitwise-OR on the LHS.
+	if bin, is_bin := expr.derived_expr.(^ast.Binary_Expr); is_bin && bin.op.kind == .Or {
+		lhs_str := strings.trim_space(raw_src[bin.left.pos.offset : bin.op.pos.offset])
+		node.inner_expr = lhs_str
+		lhs_is_super, lhs_ok := classify_output_ast(p, node, raw_src, bin.left)
+		if !lhs_ok do return false, false
+		if lhs_is_super {
+			return false, error(
+				p,
+				advance_pos_by_offset(node.expression.pos, raw_src, bin.op.pos.offset),
+				"\"super()\" cannot be used with pipe filters",
+			)
+		}
+		effective_lhs := node.inner_expr
+
+		rhs := ast.unparen_expr(bin.right)
+
+		// Once a terminal writer kind is selected on the LHS, only `fmt(...) | raw` or numeric/`len` -> `fmt(...)` is valid
+		if node.write_kind != .Escaped_String {
+			is_raw_ident := false
+			if ident, is_ident := rhs.derived_expr.(^ast.Ident); is_ident && ident.name == "raw" {
+				is_raw_ident = true
+			}
+			is_fmt_call := false
+			if call, is_call := rhs.derived_expr.(^ast.Call_Expr); is_call {
+				if ident, is_ident := call.expr.derived_expr.(^ast.Ident); is_ident && ident.name == "fmt" {
+					is_fmt_call = true
+				}
+			}
+			allowed_chain := (node.write_kind == .Fmt_Escaped && is_raw_ident) ||
+				(is_fmt_call &&
+					node.write_kind != .Raw_String &&
+					node.write_kind != .Magic_String &&
+					node.write_kind != .Url_String &&
+					node.write_kind != .Url_Param_String &&
+					node.write_kind != .Js_String &&
+					node.write_kind != .Fmt_Escaped &&
+					node.write_kind != .Fmt_Raw)
+			if !allowed_chain {
+				return false, error(
+					p,
+					advance_pos_by_offset(node.expression.pos, raw_src, rhs.pos.offset),
+					"cannot pipe additional filters after terminal output modifier",
+				)
+			}
+		}
+
+		// Bare identifier filter: `{{ this.html | raw }}`, `{{ this.title | magic }}`, `{{ this.link | url }}`, `{{ this.q | url_param }}`, `{{ this.payload | js }}`, `{{ this.items | len }}`
+		if ident, is_ident := rhs.derived_expr.(^ast.Ident); is_ident {
+			switch ident.name {
+			case "raw":
+				node.write_kind = .Fmt_Raw if node.write_kind == .Fmt_Escaped else .Raw_String
+				node.inner_expr = effective_lhs
+				return false, true
+			case "magic":
+				node.write_kind = .Magic_String
+				node.inner_expr = effective_lhs
+				return false, true
+			case "url":
+				node.write_kind = .Url_String
+				node.inner_expr = effective_lhs
+				return false, true
+			case "url_param":
+				node.write_kind = .Url_Param_String
+				node.inner_expr = effective_lhs
+				return false, true
+			case "js", "json":
+				node.write_kind = .Js_String
+				node.inner_expr = effective_lhs
+				return false, true
+			case "len":
+				node.write_kind = .Int
+				node.inner_expr = fmt.aprintf("len(%s)", effective_lhs, allocator = p.allocator)
+				return false, true
+			case "int", "uint", "i64", "u64", "i128", "u128", "f32", "f64", "byte", "rune":
+				node.write_kind = cast_name_to_write_kind(ident.name)
+				node.inner_expr = fmt.aprintf("%s(%s)", ident.name, effective_lhs, allocator = p.allocator)
+				return false, true
+			}
+		}
+
+		// Parameterized pipe filter: `{{ this.price | fmt("%.2f") }}` or `{{ this.name | default("Guest") }}`
+		if call, is_call := rhs.derived_expr.(^ast.Call_Expr); is_call {
+			if ident, is_ident := call.expr.derived_expr.(^ast.Ident); is_ident {
+				switch ident.name {
+				case "fmt":
+					if len(call.args) != 1 {
+						return false, error(
+							p,
+							advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
+							"pipe filter \"fmt()\" expects 1 format string argument, got %i",
+							len(call.args),
+						)
+					}
+					node.write_kind = .Fmt_Escaped
+					node.fmt_str = strip_trailing_comma_and_comments(raw_src[call.open.offset + 1 : call.close.offset])
+					node.inner_expr = effective_lhs
+					return false, true
+				case "default":
+					if len(call.args) != 1 {
+						return false, error(
+							p,
+							advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
+							"pipe filter \"default()\" expects 1 fallback argument, got %i",
+							len(call.args),
+						)
+					}
+					fallback_str := strip_trailing_comma_and_comments(raw_src[call.open.offset + 1 : call.close.offset])
+					node.inner_expr = fmt.aprintf(
+						"__temple_default(%s, %s)",
+						effective_lhs,
+						fallback_str,
+						allocator = p.allocator,
+					)
+					return false, true
+				}
+			}
+		}
+
+		rhs_end := rhs.end.offset
+		if call, is_call := rhs.derived_expr.(^ast.Call_Expr); is_call {
+			rhs_end = max(rhs_end, call.close.offset + 1)
+		}
+		rhs_end = min(rhs_end, len(raw_src))
+
+		return false, error(
+			p,
+			advance_pos_by_offset(node.expression.pos, raw_src, rhs.pos.offset),
+			"unknown output pipe filter %q",
+			strings.trim_space(raw_src[rhs.pos.offset : rhs_end]),
+		)
+	}
+
+	expr := ast.unparen_expr(expr)
+
+	// 2. Call syntax: `super()`, `raw(...)`, `magic(...)`, `fmt(format, ...args)`, `default(val, fallback)`, casts
 	if call, is_call := expr.derived_expr.(^ast.Call_Expr); is_call {
 		if ident, is_ident := call.expr.derived_expr.(^ast.Ident); is_ident {
 			switch ident.name {
@@ -1250,85 +1864,117 @@ validate_and_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output) -> (is
 					)
 				}
 				return true, true
-			case "raw":
+			case "raw", "magic", "url", "url_param", "js", "json":
 				if len(call.args) != 1 {
 					return false, error(
 						p,
 						advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
-						"\"raw()\" expects exactly 1 argument, got %i",
+						"\"%s()\" expects exactly 1 argument, got %i",
+						ident.name,
 						len(call.args),
 					)
 				}
-				node.write_kind = .Raw_String
-				node.inner_expr = strings.trim_space(raw_src[call.open.offset + 1 : call.close.offset])
+				target_kind: Output_Write_Kind
+				switch ident.name {
+				case "raw":        target_kind = .Raw_String
+				case "magic":      target_kind = .Magic_String
+				case "url":        target_kind = .Url_String
+				case "url_param":  target_kind = .Url_Param_String
+				case "js", "json": target_kind = .Js_String
+				}
+				arg_expr := call.args[0]
+				node.inner_expr = strip_trailing_comma_and_comments(raw_src[call.open.offset + 1 : call.close.offset])
+				arg_is_super, arg_ok := classify_output_ast(p, node, raw_src, arg_expr)
+				if !arg_ok do return false, false
+				if arg_is_super {
+					return false, error(
+						p,
+						advance_pos_by_offset(node.expression.pos, raw_src, arg_expr.pos.offset),
+						"\"super()\" cannot be used inside \"%s()\"",
+						ident.name,
+					)
+				}
+				if target_kind == .Raw_String && node.write_kind == .Fmt_Escaped {
+					node.write_kind = .Fmt_Raw
+				} else if node.write_kind != .Escaped_String {
+					return false, error(
+						p,
+						advance_pos_by_offset(node.expression.pos, raw_src, arg_expr.pos.offset),
+						"cannot wrap terminal output modifier inside \"%s()\"",
+						ident.name,
+					)
+				} else {
+					node.write_kind = target_kind
+				}
 				return false, true
-			case "magic":
+			case "fmt":
+				if len(call.args) < 2 {
+					return false, error(
+						p,
+						advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
+						"\"fmt()\" expects a format string and at least 1 value, got %i argument(s)",
+						len(call.args),
+					)
+				}
+				first_arg := call.args[0]
+				second_arg := call.args[1]
+				node.write_kind = .Fmt_Escaped
+				node.fmt_str = strip_trailing_comma_and_comments(raw_src[first_arg.pos.offset : second_arg.pos.offset])
+				node.inner_expr = strip_trailing_comma_and_comments(raw_src[second_arg.pos.offset : call.close.offset])
+				return false, true
+			case "default":
+				if len(call.args) != 2 {
+					return false, error(
+						p,
+						advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
+						"\"default()\" expects 2 arguments (value, fallback), got %i",
+						len(call.args),
+					)
+				}
+				first_arg := call.args[0]
+				second_arg := call.args[1]
+				val_str := strip_trailing_comma_and_comments(raw_src[first_arg.pos.offset : second_arg.pos.offset])
+				fallback_str := strip_trailing_comma_and_comments(raw_src[second_arg.pos.offset : call.close.offset])
+				node.inner_expr = fmt.aprintf(
+					"__temple_default(%s, %s)",
+					val_str,
+					fallback_str,
+					allocator = p.allocator,
+				)
+				return false, true
+			case "byte", "rune", "int", "len", "uint", "i128", "u128", "u64", "i64", "f32", "f64":
 				if len(call.args) != 1 {
 					return false, error(
 						p,
 						advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset),
-						"\"magic()\" expects exactly 1 argument, got %i",
+						"\"%s()\" expects 1 argument, got %i",
+						ident.name,
 						len(call.args),
 					)
 				}
-				node.write_kind = .Magic_String
-				node.inner_expr = strings.trim_space(raw_src[call.open.offset + 1 : call.close.offset])
-				return false, true
-			case "byte":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"byte()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .Byte
-			case "rune":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"rune()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .Rune
-			case "int", "len":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"%s()\" expects 1 argument, got %i", ident.name, len(call.args))
-				}
-				node.write_kind = .Int
-			case "uint":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"uint()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .Uint
-			case "i128":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"i128()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .I128
-			case "u128":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"u128()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .U128
-			case "u64":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"u64()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .U64
-			case "i64":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"i64()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .I64
-			case "f32":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"f32()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .F32
-			case "f64":
-				if len(call.args) != 1 {
-					return false, error(p, advance_pos_by_offset(node.expression.pos, raw_src, call.pos.offset), "\"f64()\" expects 1 argument, got %i", len(call.args))
-				}
-				node.write_kind = .F64
+				node.write_kind = cast_name_to_write_kind(ident.name)
 			}
 		}
 	}
 
 	return false, true
+}
+
+@(private = "file")
+cast_name_to_write_kind :: proc(name: string) -> Output_Write_Kind {
+	switch name {
+	case "byte":       return .Byte
+	case "rune":       return .Rune
+	case "int", "len": return .Int
+	case "uint":       return .Uint
+	case "i128":       return .I128
+	case "u128":       return .U128
+	case "u64":        return .U64
+	case "i64":        return .I64
+	case "f32":        return .F32
+	case "f64":        return .F64
+	}
+	return .Escaped_String
 }
 
 @(private = "file")

@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Decoupled External Package Codegen & Shared Collection Support (`-out`, `-pkg`, `-temple-import`) (`cli/main.odin`, `cli/transpiler.odin`):**
+  - Added `-out:<file>` / `--out=<file>`, `-pkg:<package>` / `--pkg=<package>` (with automatic package name inference from `.odin` files in the output directory), and `-temple-import:<path>` / `--temple-import=<path>` (defaulting to `"shared:temple"`) while maintaining full backwards compatibility with legacy 2-argument `<project_dir> <temple_dir>` invocations.
+  - Emitted `import __temple "<import_path>"` and qualified `__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_fmt_escaped`, `__temple.__temple_write_fmt_raw`, and `__temple.__temple_default` when generating outside `package temple`.
+  - Updated `collect_compile_calls` to discover unqualified same-package `compiled` / `compiled_inline` calls alongside imported `temple.compiled` / aliased package calls, and skipped generated template files regardless of filename.
+- **AST-Powered Pipe Filter DSL (`|`), `fmt(...)`, and `default(...)` (`cli/parser.odin`, `cli/transpiler.odin`, `runtime.odin`):**
+  - Added pipe filter syntax (`|`) inside `{{ ... }}` output tags for `raw`, `magic`, `len`, numeric/rune casts (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`), `fmt(...)`, and `default(...)`.
+  - Added stack-buffered formatted output via `{{ fmt(format, ...args) }}`, `{{ expr | fmt(format) }}` (`__temple_write_fmt_escaped`), and `{{ expr | fmt(format) | raw }}` (`__temple_write_fmt_raw`) with multi-byte UTF-8 boundary fallback to `fmt.tprintf`.
+  - Added default fallback expressions via `{{ default(val, fallback) }}` and `{{ val | default(fallback) }}`.
+  - Added compile-time diagnostics for unknown pipe filters, piped `super()`, and invalid filter chains after terminal modifiers.
+- **Component-Style Named Props on `embed` (`cli/parser.odin`, `cli/transpiler.odin`):**
+  - Added `{% embed "path.html"(name = expr, ...) %}` (and `with (name = expr, ...)`) with field-punning shorthand (`this.field` -> `field = this.field` and `ident` -> `ident = ident`) and duplicate-prop diagnostics.
+  - Transpiled component props to temporary local bindings (`__temple_prop_i`) and an inline anonymous `struct` typed via `type_of(__temple_prop_i)`.
+- **Parameterized Template Macros (`{% macro %}` & `{% call %}`) (`cli/lexer.odin`, `cli/parser.odin`, `cli/transpiler.odin`, `cli/main.odin`):**
+  - Added `{% macro name(params...) %}...{% end %}` with `core:odin/parser` signature validation (supporting typed parameters, default values, and zero-argument macros) and `{% call name(args...) %}`.
+  - Transpiled macros into local Odin procedures `__temple_macro_<name> :: proc(__temple_w: __temple_io.Writer, <params>) -> (__temple_n: int, __temple_err: __temple_io.Error)` and supported macro inheritance and overrides across `{% extends %}` layouts.
+- **4-Layer ATDD Executable Specification Suite (`cli/temple_spec_test.odin`, `cli/spec_dsl_test.odin`, `cli/spec_driver_test.odin`):**
+  - Added declarative executable specifications, a domain-specific test language, and an in-memory protocol driver that automatically verifies every compiled template parses as valid Odin AST via `core:odin/parser`.
+
 ## [0.2.0] - 2026-11-01
 
 ### Added

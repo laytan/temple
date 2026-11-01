@@ -3,7 +3,7 @@
 ## Guiding Principles
 
 1. **The Plan is the Source of Truth:** All work must be tracked in `plan.md`.
-2. **Test-Driven Development:** Write failing unit/regression tests before or alongside implementing features, and verify zero memory leaks under `odin test`'s tracking allocator.
+2. **4-Layer ATDD & Test-Driven Development:** Write executable specifications in `cli/temple_spec_test.odin` (backed by the domain DSL in `cli/spec_dsl_test.odin` and protocol driver in `cli/spec_driver_test.odin`) before or alongside implementing features, and verify zero memory leaks under `odin test`'s tracking allocator.
 3. **Atomic Commits:** Use Conventional Commits (`feat`, `fix`, `refactor`, `test`, `docs`, `chore`).
 4. **Non-Interactive CI Readiness:** All test commands (`odin test cli`, `odin test .`, `odin test tests`) must run headlessly and deterministically.
 

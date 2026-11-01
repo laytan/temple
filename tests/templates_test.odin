@@ -3,6 +3,7 @@ package temple_tests
 import "core:strings"
 import "core:testing"
 import temple "../"
+import external_views "./external_views"
 
 Status :: enum {
 	Idle,
@@ -148,4 +149,99 @@ test_batched_escaped_string :: proc(t: ^testing.T) {
 	expected_magic := ` <span class="magic-text__word">a</span>  <span class="magic-text__word">&lt;b&gt;</span> `
 	testing.expect_value(t, n_magic, len(expected_magic))
 	testing.expect_value(t, strings.to_string(sb), expected_magic)
+}
+
+@(test)
+test_macros_pipes_fmt_and_default_e2e :: proc(t: ^testing.T) {
+	context.allocator = context.temp_allocator
+
+	tmpl := temple.compiled_inline(
+		`{%- macro badge(label: string, active := false) -%}` +
+		`<span class="{% if active %}active{% else %}inactive{% end %}">{{ label | default("Untitled") }}</span>` +
+		`{%- end -%}` +
+		`{%- macro sep() -%}|{%- end -%}` +
+		`{%- call badge(this.title, true) -%}` +
+		`{%- call sep() -%}` +
+		`{%- call badge("Draft") -%}` +
+		`{%- call sep() -%}` +
+		`{{ len(this.items) | fmt("items=%i") }}`,
+		Page_Ctx,
+	)
+
+	sb := strings.builder_make(0, tmpl.approx_bytes)
+	_, err := tmpl.with(strings.to_writer(&sb), Page_Ctx{
+		title = "",
+		items = {"x", "y"},
+	})
+	testing.expect_value(t, err, nil)
+	testing.expect_value(
+		t,
+		strings.to_string(sb),
+		`<span class="active">Untitled</span>|<span class="inactive">Draft</span>|items=2`,
+	)
+}
+
+@(test)
+test_decoupled_external_package_codegen_e2e :: proc(t: ^testing.T) {
+	context.allocator = context.temp_allocator
+
+	rendered, ok := external_views.render_card({
+		title    = "",
+		subtitle = "fast & safe",
+		price    = 19.5,
+	})
+	testing.expect(t, ok)
+	testing.expect_value(
+		t,
+		rendered,
+		`<article><h2>Untitled</h2><p><span class="magic-text__word">fast</span> <span class="magic-text__word">&amp;</span> <span class="magic-text__word">safe</span></p><span>$19.50</span></article>`,
+	)
+}
+
+Escaping_Ctx :: struct {
+	href:       string,
+	search:     string,
+	js_payload: string,
+}
+
+@(test)
+test_context_aware_escaping_url_url_param_and_js_e2e :: proc(t: ^testing.T) {
+	context.allocator = context.temp_allocator
+
+	tmpl := temple.compiled_inline(
+		`<a href="{{ this.href | default("/home") | url }}?q={{ url_param(this.search) }}">Link</a><script>const msg = "{{ this.js_payload | js }}";</script>`,
+		Escaping_Ctx,
+	)
+
+	// 1. Valid https URL + reserved query characters + </script> breakout attempt
+	{
+		sb := strings.builder_make(0, tmpl.approx_bytes)
+		_, err := tmpl.with(strings.to_writer(&sb), Escaping_Ctx{
+			href       = "https://example.com/go",
+			search     = "hello & world=1",
+			js_payload = `</script><script>alert("xss" & '1')</script>`,
+		})
+		testing.expect_value(t, err, nil)
+		testing.expect_value(
+			t,
+			strings.to_string(sb),
+			`<a href="https://example.com/go?q=hello%20%26%20world%3D1">Link</a><script>const msg = "\u003c\/script\u003e\u003cscript\u003ealert(\"xss\" \u0026 \'1\')\u003c\/script\u003e";</script>`,
+		)
+	}
+
+	// 2. Dangerous obfuscated javascript: URL neutralized to #ZgotmplZ + Unicode line separator in JS
+	{
+		sb := strings.builder_make(0, tmpl.approx_bytes)
+		_, err := tmpl.with(strings.to_writer(&sb), Escaping_Ctx{
+			href       = "   JaVaScRiPt:alert(1)",
+			search     = "Odin 1.0",
+			js_payload = "line1\nline2\u2028sep",
+		})
+		testing.expect_value(t, err, nil)
+		testing.expect_value(
+			t,
+			strings.to_string(sb),
+			`<a href="#ZgotmplZ?q=Odin%201.0">Link</a><script>const msg = "line1\nline2\u2028sep";</script>`,
+		)
+	}
 }

@@ -6,17 +6,19 @@ A fast, compile-time templating engine for Odin that transpiles Twig/Mustache-in
 
 * Similar syntax to Twig / Mustache templating engines
 * Zero runtime overhead — templates are transpiled into regular Odin procedures
-* Safe for HTML output by default (batched XSS escaping) with explicit opt-out (`{{ raw(...) }}`) and word-span wrapping (`{{ magic(...) }}`)
+* Safe for HTML output by default (batched XSS escaping) with context-aware escaping for URLs (`{{ url(...) }}` / `{{ ... | url }}`), URL query parameters (`{{ url_param(...) }}` / `{{ ... | url_param }}`), JavaScript/JSON string literals (`{{ js(...) }}` / `{{ ... | js }}`), explicit raw opt-out (`{{ raw(...) }}` / `{{ ... | raw }}`), and word-span wrapping (`{{ magic(...) }}` / `{{ ... | magic }}`)
+* AST-powered pipe filter DSL (`|`), stack-buffered `fmt(...)` formatting (`{{ this.price | fmt("$%.2f") }}`, `{{ fmt("%s (%i)", this.name, this.count) }}`), and `default(...)` fallbacks (`{{ this.name | default("Anonymous") }}`)
 * Full Odin expressions inside templates, validated at compile time by `core:odin/parser`
     * `{{ this.name.? or_else "no name" }}`
     * `{{ this.welcome if this.user.new else "" }}`
-* Explicit type-cast writers (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`, `len`), e.g. `{{ int(this.count + 5) }}`
+* Explicit type-cast writers (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`, `len`), via call syntax (`{{ int(this.count + 5) }}`) or pipe syntax (`{{ this.items | len }}`)
 * Local variable bindings via `{% let x = expr %}`, `{% let x := expr %}`, or `{% let x: int = expr %}`
 * Conditionals (`{% if ... %}`, `{% elseif ... %}` / `{% else if ... %}`, `{% else %}`, `{% end %}`)
 * Pattern matching & enum/union switches (`{% switch ... %}`, `{% #partial switch ... %}`, `{% case ... %}`, `{% case %}`)
 * Odin's expressive looping syntax (`{% for name in this.names %} {{ name }} {% end %}`)
 * Layout inheritance (`{% extends "base.html" %}`, `{% block name %}...{% end %}`, and `{{ super() }}` / `{% super %}`)
-* Sub-template embedding (`{% embed "card.html" %}` and `{% embed "card.html" with this.card %}`)
+* Sub-template embedding (`{% embed "card.html" %}`, `{% embed "card.html" with this.card %}`, and component-style named props `{% embed "card.html"(this.title, count = len(this.items), active = true) %}`)
+* Reusable parameterized in-file macros (`{% macro badge(label: string, active := false) %}...{% end %}` and `{% call badge(this.title, true) %}`), including across layout inheritance
 * Template comments (`{# ... #}`) and whitespace trimming markers (`{{-`, `-}}`, `{%-`, `-%}`, `{#-`, `-#}`)
 * Precomputed `approx_bytes` output size estimation (including branch-aware `switch` estimation) so buffers can be pre-sized before rendering
 * Parallel multi-threaded CLI compilation with Rust/Odin-style diagnostics and full `Call_Site -> Extends -> Embed` trace stacks
@@ -25,7 +27,22 @@ A fast, compile-time templating engine for Odin that transpiles Twig/Mustache-in
 
 ## Usage:
 
-Temple has 2 parts: the compiler (`cli/`) and the runtime (`runtime.odin`). The compiler scans your Odin project for `temple.compiled` and `temple.compiled_inline` calls (including package/local string constants and procedure aliases) and generates `templates.odin`.
+Temple has 2 parts: the compiler (`cli/`) and the runtime (`runtime.odin`). The compiler scans your Odin project for `compiled` and `compiled_inline` calls (including package/local string constants and procedure aliases) and generates the compiled Odin procedures.
+
+### Option A: Shared Collection / External Package Mode (`-out` / `-pkg`)
+
+You can install `temple` once into Odin's `shared:` collection (or as a read-only dependency) and generate template procedures directly into your own package:
+
+1. Build the compiler CLI: `odin build temple/cli -o:speed -out:temple_cli`
+2. Generate templates into your package before building:
+   ```sh
+   ./temple_cli src -out:src/views/templates_gen.odin -pkg:views
+   ```
+   * `-out:<file>` (or `--out=<file>`): destination `.odin` file to generate
+   * `-pkg:<package>` (or `--pkg=<package>`): target package name (if omitted, automatically inferred from existing `.odin` files in the output directory)
+   * `-temple-import:<path>` (or `--temple-import=<path>`): import path for the `temple` runtime library (defaults to `"shared:temple"` when generating outside `package temple`)
+
+### Option B: Vendored Submodule Mode
 
 1. Clone into project: `git submodule add https://github.com/laytan/temple`
 2. Build the compiler CLI: `odin build temple/cli -o:speed -out:temple_cli`
@@ -106,7 +123,7 @@ compiled :: proc "contextless" ($path: string, $T: typeid) -> Compiled(T) {
 }
 ```
 
-### Output (`{{ ... }}`, `raw`, `magic`, and Type Casts)
+### Output (`{{ ... }}`, Pipe Filters `|`, `url`, `url_param`, `js`, `fmt`, `default`, `raw`, `magic`, and Type Casts)
 
 ```odin
 // Output is denoted by an opening {{ and closing }} and is HTML-escaped by default:
@@ -118,14 +135,34 @@ t := temple.compiled_inline(`{{ this.name }}`, struct{ name: string })
 // Any valid Odin expression works:
 t := temple.compiled_inline(`{{ this.name.? or_else this.last_name }}`, struct{ name: Maybe(string), last_name: string })
 
-// Use `raw(...)` to write trusted HTML without escaping:
+// Use `url(...)` or `| url` to sanitize URL schemes (allowing http, https, mailto, tel, safe data:image/*, and relative paths; replacing unsafe schemes like javascript: with `#ZgotmplZ`) and HTML-escape the result:
+t := temple.compiled_inline(`<a href="{{ this.link | url }}">Link</a>`, struct{ link: string })
+
+// Use `url_param(...)` or `| url_param` to RFC 3986 percent-encode query parameter values:
+t := temple.compiled_inline(`<a href="/search?q={{ this.query | url_param }}">Search</a>`, struct{ query: string })
+
+// Use `js(...)` / `| js` (or `json(...)` / `| json`) to safely escape strings inside JavaScript/JSON string literals and inline `<script>` blocks (preventing `</script>` and quote breakout):
+t := temple.compiled_inline(`<script>const msg = "{{ this.payload | js }}";</script>`, struct{ payload: string })
+
+// Use `raw(...)` or `| raw` to write trusted HTML without escaping:
 t := temple.compiled_inline(`{{ raw(this.trusted_html) }}`, struct{ trusted_html: string })
+t := temple.compiled_inline(`{{ this.trusted_html | raw }}`, struct{ trusted_html: string })
 
-// Use `magic(...)` to wrap each space-separated word in `<span class="magic-text__word">...</span>`:
-t := temple.compiled_inline(`{{ magic(this.headline) }}`, struct{ headline: string })
+// Use `magic(...)` or `| magic` to wrap each space-separated word in `<span class="magic-text__word">...</span>`:
+t := temple.compiled_inline(`{{ this.headline | magic }}`, struct{ headline: string })
 
-// Wrap non-string values in a type cast (`int()`, `uint()`, `i64()`, `u64()`, `i128()`, `u128()`, `f32()`, `f64()`, `byte()`, `rune()`, `len()`):
+// Use `fmt(format, ...args)` or `| fmt(format)` for stack-buffered formatting (HTML-escaped by default, or chain `| raw`):
+t := temple.compiled_inline(`{{ this.price | fmt("$%.2f") }}`, struct{ price: f64 })
+t := temple.compiled_inline(`{{ fmt("%s (%i)", this.name, this.count) }}`, struct{ name: string, count: int })
+t := temple.compiled_inline(`{{ this.price | fmt("<b>$%.2f</b>") | raw }}`, struct{ price: f64 })
+
+// Use `default(val, fallback)` or `| default(fallback)` to provide a fallback when a string/slice is empty (`len(val) == 0`):
+t := temple.compiled_inline(`{{ this.nickname | default("Anonymous") }}`, struct{ nickname: string })
+t := temple.compiled_inline(`{{ this.bio_html | default("<i>None</i>") | raw }}`, struct{ bio_html: string })
+
+// Wrap or pipe non-string values in a type cast (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`, `len`):
 t := temple.compiled_inline(`{{ int(this.count) }}`, struct{ count: int })
+t := temple.compiled_inline(`{{ this.items | len }}`, struct{ items: []string })
 ```
 
 ### If / Else If / Else
@@ -206,7 +243,7 @@ t := temple.compiled_inline(`{% for book, idx in this.books %} {{ int(idx) }}: {
 {% end %}
 ```
 
-### Embed
+### Embed & Component Props
 
 ```odin
 // Embed another template relative to the current template file:
@@ -214,6 +251,28 @@ t := temple.compiled_inline(`{% embed "header.temple.twig" %}`, struct{})
 
 // Narrow or replace `this` for the embedded template with `with`:
 t := temple.compiled_inline(`{% embed "header.temple.twig" with this.header %}`, struct{ header: Header_Data })
+
+// Or pass component-style named props (constructing an inline anonymous struct for `this` via `type_of(...)`).
+// Supports field-punning shorthand (`this.title` -> `title = this.title`):
+t := temple.compiled_inline(`
+{% embed "components/card.html"(
+    this.title,
+    count = len(this.items),
+    theme = "dark",
+) %}
+`, Page_Ctx)
+```
+
+### Parameterized Macros (`macro` & `call`)
+
+```twig
+{# Define reusable typed Odin macros inside a template or parent layout #}
+{% macro badge(label: string, active := false) %}
+  <span class="badge {% if active %}badge--active{% end %}">{{ label }}</span>
+{% end %}
+
+{% call badge(this.title, true) %}
+{% call badge("Draft") %}
 ```
 
 ### Comments & Whitespace Trimming

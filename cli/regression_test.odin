@@ -601,3 +601,162 @@ test_switch_approx_bytes_calculation :: proc(t: ^testing.T) {
 
 	testing.expect(t, strings.contains(code, "approx_bytes = 35,"), code)
 }
+
+@(test)
+test_cli_options_parsing_and_package_inference :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	alloc := mem.dynamic_arena_allocator(&arena)
+
+	// 1. Version flags
+	{
+		opts, _, ok := parse_cli_args({"temple_cli", "--version"}, alloc)
+		testing.expect(t, ok)
+		testing.expect(t, opts.show_version)
+
+		opts_short, _, ok_short := parse_cli_args({"temple_cli", "-v"}, alloc)
+		testing.expect(t, ok_short)
+		testing.expect(t, opts_short.show_version)
+	}
+
+	// 2. Legacy 2-argument positional mode
+	{
+		opts, err_msg, ok := parse_cli_args({"temple_cli", "app", "vendor/temple"}, alloc)
+		testing.expect(t, ok, err_msg)
+		testing.expect_value(t, opts.project_dir, "app")
+		testing.expect_value(t, opts.temple_dir, "vendor/temple")
+		testing.expect_value(t, opts.out_file, "vendor/temple/templates.odin")
+		testing.expect_value(t, opts.pkg_name, "temple")
+		testing.expect_value(t, opts.temple_import, "")
+	}
+
+	// 3. Odin-style flags (`-out:`, `-pkg:`, `-temple-import:`) with default `"shared:temple"` import
+	{
+		opts, err_msg, ok := parse_cli_args({"temple_cli", "src", "-out:views/templates_gen.odin", "-pkg:views"}, alloc)
+		testing.expect(t, ok, err_msg)
+		testing.expect_value(t, opts.project_dir, "src")
+		testing.expect_value(t, opts.out_file, "views/templates_gen.odin")
+		testing.expect_value(t, opts.pkg_name, "views")
+		testing.expect_value(t, opts.temple_import, "shared:temple")
+	}
+
+	// 4. GNU-style flags (`--out=`, `--pkg=`, `--temple-import=`) before positional arg
+	{
+		opts, err_msg, ok := parse_cli_args(
+			{"temple_cli", "--out=ui/templates_gen.odin", "--pkg=ui", "--temple-import=../temple", "src"},
+			alloc,
+		)
+		testing.expect(t, ok, err_msg)
+		testing.expect_value(t, opts.project_dir, "src")
+		testing.expect_value(t, opts.out_file, "ui/templates_gen.odin")
+		testing.expect_value(t, opts.pkg_name, "ui")
+		testing.expect_value(t, opts.temple_import, "../temple")
+	}
+
+	// 5. Automatic package inference from existing `.odin` files in output directory (`tests/` -> `package temple_tests`)
+	{
+		opts, err_msg, ok := parse_cli_args({"temple_cli", "tests", "-out:tests/templates_gen.odin"}, alloc)
+		testing.expect(t, ok, err_msg)
+		testing.expect_value(t, opts.pkg_name, "temple_tests")
+		testing.expect_value(t, opts.temple_import, "shared:temple")
+	}
+
+	// 6. Automatic package inference fallback to directory basename when directory has no `.odin` files yet
+	{
+		opts, err_msg, ok := parse_cli_args({"temple_cli", "src", "-out:nonexistent_views_dir/templates_gen.odin"}, alloc)
+		testing.expect(t, ok, err_msg)
+		testing.expect_value(t, opts.pkg_name, "nonexistent_views_dir")
+		testing.expect_value(t, opts.temple_import, "shared:temple")
+	}
+
+	// 7. Invalid invocations must fail cleanly
+	{
+		_, _, ok_empty := parse_cli_args({"temple_cli"}, alloc)
+		testing.expect(t, !ok_empty)
+
+		_, _, ok_missing_out := parse_cli_args({"temple_cli", "src"}, alloc)
+		testing.expect(t, !ok_missing_out)
+
+		_, _, ok_unknown_flag := parse_cli_args({"temple_cli", "src", "temple", "-bogus:123"}, alloc)
+		testing.expect(t, !ok_unknown_flag)
+
+		_, _, ok_empty_val := parse_cli_args({"temple_cli", "src", "-out:"}, alloc)
+		testing.expect(t, !ok_empty_val)
+	}
+}
+
+@(test)
+test_same_package_and_aliased_compile_call_discovery :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	alloc := mem.dynamic_arena_allocator(&arena)
+	context.allocator = alloc
+	context.temp_allocator = alloc
+
+	// 1. Unqualified same-package `compiled` / `compiled_inline` and local aliases without importing `temple`
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package views
+
+Page_Ctx :: struct { title: string }
+
+HOME_TPL :: "home.temple.twig"
+local_inline :: compiled_inline
+
+home_view := compiled(HOME_TPL, Page_Ctx)
+badge_view := local_inline("<span>{{ this.title }}</span>", Page_Ctx)
+`)
+
+		then_collected_templates_are(s, {
+			"home.temple.twig",
+			"<span>{{ this.title }}</span>",
+		})
+	}
+
+	// 2. Imported external views package (`import v "../views"`) alongside `import "shared:temple"`
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package app
+import "shared:temple"
+import v "../views"
+
+Ctx :: struct { name: string }
+
+a := temple.compiled("a.html", Ctx)
+b := v.compiled("b.html", Ctx)
+c := v.compiled_inline("<p>{{ this.name }}</p>", Ctx)
+`)
+
+		then_collected_templates_are(s, {
+			"a.html",
+			"b.html",
+			"<p>{{ this.name }}</p>",
+		})
+	}
+
+	// 3. User-defined unrelated `compiled :: proc(...)` shadows default unqualified `compiled` without false errors
+	{
+		s := scenario_begin(t)
+		defer scenario_end(s)
+
+		upon_scanning_odin_source(s, `package custom
+
+compiled :: proc(x: int) -> int {
+	return x + 1
+}
+
+main :: proc() {
+	_ = compiled(42)
+}
+`)
+
+		then_collected_templates_are(s, {})
+		testing.expect_value(t, len(s.collect_errors), 0)
+	}
+}

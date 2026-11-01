@@ -4,17 +4,17 @@ This file tracks all major tracks for the project toward the `1.0.0` release. Ea
 
 ---
 
-- [ ] **Track: Decouple Generated Code for Shared Collection Support (`-out` / `-pkg`)**
+- [x] **Track: Decouple Generated Code for Shared Collection Support (`-out` / `-pkg`)**
   *Link: [./tracks/decoupled_codegen_20261101/](./tracks/decoupled_codegen_20261101/)*
 
 ---
 
-- [ ] **Track: Context-Aware Auto-Escaping & Safe Writers (`url`, `url_param`, `js`)**
+- [x] **Track: Context-Aware Auto-Escaping & Safe Writers (`url`, `url_param`, `js`)**
   *Link: [./tracks/context_escaping_20261101/](./tracks/context_escaping_20261101/)*
 
 ---
 
-- [ ] **Track: Parameterized Macros (`{% macro %}`) & Format Helper (`{{ fmt(...) }}`)**
+- [x] **Track: AST Pipe DSL (`|`, `fmt`, `default`), Component `embed` Props & Parameterized Macros (`{% macro %}`)**
   *Link: [./tracks/macros_and_fmt_20261101/](./tracks/macros_and_fmt_20261101/)*
 
 ---
