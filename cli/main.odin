@@ -85,7 +85,14 @@ Transpiled_Template :: struct {
 	ok:          bool,
 }
 
+VERSION :: "0.2.0"
+
 main :: proc() {
+	if len(os.args) == 2 && (os.args[1] == "--version" || os.args[1] == "-v") {
+		fmt.printf("temple %s\n", VERSION)
+		return
+	}
+
 	if len(os.args) < 3 {
 		error(nil, "You need to pass a path and the path to temple")
 	}

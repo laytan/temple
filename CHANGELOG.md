@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-01
+
 ### Added
 - **Layout Inheritance (`extends`, `block`, `super`):**
   - Added Twig-style layout inheritance via `{% extends "layout.html" %}`, `{% block name %}...{% end %}`, and parent block rendering with `{{ super() }}` or `{% super %}`.
@@ -62,3 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Sub-template embedding (`{% embed "path" %}` and `{% embed "path" with expr %}`) (`190d31e`).
 - Source-location comments (`/* line:col in template */`) on generated Odin statements and `approx_bytes` output size estimation (`fbec568`).
 - MIT License (`6cc7417`).
+
+[Unreleased]: https://github.com/boxxxie/temple/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/boxxxie/temple/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/boxxxie/temple/releases/tag/v0.1.0
