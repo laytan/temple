@@ -3,7 +3,7 @@ package temple
 import "core:fmt"
 import "core:io"
 
-VERSION :: "0.2.0"
+VERSION :: "1.0.0"
 
 /*
 A compiled template, the `with` proc will render the template into the writer using the given `this`.

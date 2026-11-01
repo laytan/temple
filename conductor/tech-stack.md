@@ -15,6 +15,6 @@
   - `main.odin`: Odin AST call collector (`temple.compiled` / `temple.compiled_inline`), multi-level layout inheritance resolver, parallel worker pool, and diagnostic reporter.
 
 ## Testing
-- `odin test cli` — Unit, regression, and deterministic fuzzing suite (`cli/cli_test.odin`, `cli/regression_test.odin`)
+- `odin test cli` — 4-layer ATDD executable specifications, unit, regression, and deterministic fuzzing suite (`cli/temple_spec_test.odin`, `cli/spec_dsl_test.odin`, `cli/spec_driver_test.odin`, `cli/cli_test.odin`, `cli/regression_test.odin`)
 - `odin test .` — Runtime unit suite (`runtime_test.odin`)
-- `odin test tests` — End-to-end compiled template integration suite (`tests/templates_test.odin`)
+- `odin test tests` — End-to-end compiled template integration suite (`tests/templates_test.odin`, `tests/external_views/`)

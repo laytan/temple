@@ -7,7 +7,7 @@ A fast, compile-time templating engine for Odin that transpiles Twig/Mustache-in
 * Similar syntax to Twig / Mustache templating engines
 * Zero runtime overhead — templates are transpiled into regular Odin procedures
 * Safe for HTML output by default (batched XSS escaping) with context-aware escaping for URLs (`{{ url(...) }}` / `{{ ... | url }}`), URL query parameters (`{{ url_param(...) }}` / `{{ ... | url_param }}`), JavaScript/JSON string literals (`{{ js(...) }}` / `{{ ... | js }}`), explicit raw opt-out (`{{ raw(...) }}` / `{{ ... | raw }}`), and word-span wrapping (`{{ magic(...) }}` / `{{ ... | magic }}`)
-* AST-powered pipe filter DSL (`|`), stack-buffered `fmt(...)` formatting (`{{ this.price | fmt("$%.2f") }}`, `{{ fmt("%s (%i)", this.name, this.count) }}`), and `default(...)` fallbacks (`{{ this.name | default("Anonymous") }}`)
+* AST-powered pipe filter DSL (`|`), zero-allocation streaming `fmt(...)` formatting (`{{ this.price | fmt("$%.2f") }}`, `{{ fmt("%s (%i)", this.name, this.count) }}`), and `default(...)` fallbacks (`{{ this.name | default("Anonymous") }}`)
 * Full Odin expressions inside templates, validated at compile time by `core:odin/parser`
     * `{{ this.name.? or_else "no name" }}`
     * `{{ this.welcome if this.user.new else "" }}`
@@ -154,7 +154,7 @@ t := temple.compiled_inline(`{{ this.trusted_html | raw }}`, struct{ trusted_htm
 // Use `magic(...)` or `| magic` to wrap each space-separated word in `<span class="magic-text__word">...</span>`:
 t := temple.compiled_inline(`{{ this.headline | magic }}`, struct{ headline: string })
 
-// Use `fmt(format, ...args)` or `| fmt(format)` for stack-buffered formatting (HTML-escaped by default, or chain `| raw`):
+// Use `fmt(format, ...args)` or `| fmt(format)` for zero-allocation streaming formatted output (HTML-escaped by default, or chain `| raw`):
 t := temple.compiled_inline(`{{ this.price | fmt("$%.2f") }}`, struct{ price: f64 })
 t := temple.compiled_inline(`{{ fmt("%s (%i)", this.name, this.count) }}`, struct{ name: string, count: int })
 t := temple.compiled_inline(`{{ this.price | fmt("<b>$%.2f</b>") | raw }}`, struct{ price: f64 })

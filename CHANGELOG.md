@@ -6,35 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-01
+
 ### Added
 - **Decoupled External Package Codegen & Shared Collection Support (`-out`, `-pkg`, `-temple-import`) (`cli/main.odin`, `cli/transpiler.odin`):**
-  - Added `-out:<file>` / `--out=<file>`, `-pkg:<package>` / `--pkg=<package>` (with automatic package name inference from `.odin` files in the output directory), and `-temple-import:<path>` / `--temple-import=<path>` (defaulting to `"shared:temple"`) while maintaining full backwards compatibility with legacy 2-argument `<project_dir> <temple_dir>` invocations.
-  - Emitted `import __temple "<import_path>"` and qualified `__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_safe_url`, `__temple.__temple_write_url_param`, `__temple.__temple_write_js_string`, `__temple.__temple_write_fmt_escaped`, `__temple.__temple_write_fmt_raw`, and `__temple.__temple_default` when generating outside `package temple`.
+  - Added `-out:<file>` / `--out=<file>`, `-pkg:<package>` / `--pkg=<package>` (with automatic package name inference from `.odin` files in the output directory and identifier sanitization for directory basenames), and `-temple-import:<path>` / `--temple-import=<path>` (defaulting to `"shared:temple"`) while maintaining full backwards compatibility with legacy 2-argument `<project_dir> <temple_dir>` invocations.
+  - Emitted `import __temple "<import_path>"`, file-private `__temple_default :: __temple.__temple_default` alias, and qualified `__temple.Compiled(T)`, `__temple.__temple_write_escaped_string`, `__temple.__temple_write_magic_string`, `__temple.__temple_write_safe_url`, `__temple.__temple_write_url_param`, `__temple.__temple_write_js_string`, `__temple.__temple_write_fmt_escaped`, and `__temple.__temple_write_fmt_raw` when generating outside `package temple`.
   - Updated `collect_compile_calls` to discover unqualified same-package `compiled` / `compiled_inline` calls alongside imported `temple.compiled` / aliased package calls, avoided false-positive constant diagnostics on unrelated third-party `pkg.compiled(...)` calls, and skipped generated template files regardless of filename.
 - **Context-Aware Escaping (`url`, `url_param`, `js` / `json`) (`runtime.odin`, `cli/parser.odin`, `cli/transpiler.odin`):**
   - Added `{{ url(expr) }}` / `{{ expr | url }}` (`__temple_write_safe_url`) to validate URL schemes against an explicit safe allowlist (`http`, `https`, `mailto`, `tel`, non-SVG `data:image/*`, and relative URLs), neutralize dangerous or control-char-obfuscated schemes (`javascript:`, `vbscript:`, `data:text/html`, `data:image/svg+xml`) to `#ZgotmplZ`, and HTML-escape the result.
   - Added `{{ url_param(expr) }}` / `{{ expr | url_param }}` (`__temple_write_url_param`) for RFC 3986 percent-encoding of query parameters and URI components.
   - Added `{{ js(expr) }}` / `{{ expr | js }}` and `{{ json(expr) }}` / `{{ expr | json }}` (`__temple_write_js_string`) to escape JavaScript/JSON string contents, control characters, line/paragraph separators (`\u2028`, `\u2029`), and `<`/`>`/`&`/`/` (`\u003c`, `\u003e`, `\u0026`, `\/`) to prevent `</script>` breakout inside inline script blocks.
-- **AST-Powered Pipe Filter DSL (`|`), `fmt(...)`, and `default(...)` (`cli/parser.odin`, `cli/transpiler.odin`, `runtime.odin`):**
+- **AST-Powered Pipe Filter DSL (`|`), Streaming `fmt(...)`, and `default(...)` (`cli/parser.odin`, `cli/transpiler.odin`, `runtime.odin`):**
   - Added pipe filter syntax (`|`) inside `{{ ... }}` output tags for `raw`, `magic`, `url`, `url_param`, `js`, `json`, `len`, numeric/rune casts (`int`, `uint`, `i64`, `u64`, `i128`, `u128`, `f32`, `f64`, `byte`, `rune`), `fmt(...)`, and `default(...)`.
-  - Added stack-buffered formatted output via `{{ fmt(format, ...args) }}`, `{{ expr | fmt(format) }}` (`__temple_write_fmt_escaped`), and `{{ expr | fmt(format) | raw }}` (`__temple_write_fmt_raw`) with multi-byte UTF-8 boundary fallback to `fmt.tprintf`.
+  - Added zero-allocation streaming formatted output via `{{ fmt(format, ...args) }}`, `{{ expr | fmt(format) }}` (`__temple_write_fmt_escaped`), and `{{ expr | fmt(format) | raw }}` (`__temple_write_fmt_raw`), wrapping the destination `io.Writer` in a stack-allocated `__Temple_Fmt_Writer` stream adapter (`fmt.wprintf`) without `context.temp_allocator` fallback.
   - Added overloaded default fallback expressions via `{{ default(val, fallback) }}` and `{{ val | default(fallback) }}` (`__temple_default` proc group supporting `string`, `$S/[]$E` slices, and `Maybe($T)`).
   - Added compile-time diagnostics for unknown pipe filters, piped `super()`, and invalid filter chains after terminal modifiers.
 - **Component-Style Named Props on `embed` (`cli/parser.odin`, `cli/transpiler.odin`):**
   - Added `{% embed "path.html"(name = expr, ...) %}` (and `with (name = expr, ...)`) with field-punning shorthand (`this.field` -> `field = this.field` and `ident` -> `ident = ident`) and duplicate-prop diagnostics.
   - Transpiled component props to temporary local bindings (`__temple_prop_i`) and an inline anonymous `struct` typed via `type_of(__temple_prop_i)`.
 - **Parameterized Template Macros (`{% macro %}` & `{% call %}`) (`cli/lexer.odin`, `cli/parser.odin`, `cli/transpiler.odin`, `cli/main.odin`):**
-  - Added `{% macro name(params...) %}...{% end %}` with `core:odin/parser` signature validation (supporting typed parameters, default values, and zero-argument macros) and `{% call name(args...) %}`.
-  - Transpiled macros into local Odin procedures `__temple_macro_<name> :: proc(__temple_w: __temple_io.Writer, <params>) -> (__temple_n: int, __temple_err: __temple_io.Error)` and supported macro inheritance and overrides across `{% extends %}` layouts.
+  - Added `{% macro name(params...) %}...{% end %}` with `core:odin/parser` signature validation (supporting typed parameters, default values, variadic parameters, and zero-argument macros) and `{% call name(args...) %}`.
+  - Transpiled macros into hoisted local Odin procedures `__temple_macro_<name> :: proc(__temple_w: __temple_io.Writer, <params>) -> (__temple_n: int, __temple_err: __temple_io.Error)`, supported macro inheritance and overrides across `{% extends %}` layouts, validated call target existence/arity/named arguments at compile time, and scoped `macro_approx` byte estimates across `embed` boundaries.
 - **Developer Experience & CLI Modes (`--check`, `--warn-unused`, `--watch`) (`cli/main.odin`):**
   - Added `--check` mode for CI pipelines to verify that all templates compile cleanly and the generated `.odin` file on disk matches the freshly transpiled output byte-for-byte without writing to disk.
   - Added `--warn-unused` to scan the project directory and report unreferenced `.temple.twig`, `.temple.html`, and `.twig` template files.
-  - Added `--watch` polling mode with resilient non-fatal error recovery across both `.odin` call collection and template transpilation.
+  - Added `--watch` polling mode with resilient non-fatal error recovery across `.odin` call collection and template transpilation, external layout tracking, and automatic skipping of `.`-prefixed, `vendor`, `node_modules`, `build`, `bin`, and `dist` directories.
 - **Cross-Platform Path Normalization & GitHub Actions CI (`cli/main.odin`, `.github/workflows/ci.yml`):**
   - Added `normalize_slash_path` to normalize Windows backslash separators (`\`) to canonical forward slashes (`/`) across call collection, relative `extends`/`embed` resolution, unused template detection, and generated `when path == "..."` clauses.
   - Added multi-OS GitHub Actions CI workflow (`.github/workflows/ci.yml`) running unit, ATDD specification, CLI `--check` / `--warn-unused`, and end-to-end integration suites across `ubuntu-latest`, `macos-latest`, and `windows-latest`.
 - **4-Layer ATDD Executable Specification Suite (`cli/temple_spec_test.odin`, `cli/spec_dsl_test.odin`, `cli/spec_driver_test.odin`):**
   - Added declarative executable specifications, a domain-specific test language, and an in-memory protocol driver that automatically verifies every compiled template parses as valid Odin AST via `core:odin/parser`.
+
+### Changed
+- Coalesced adjacent `Node_Text` AST nodes after layout inheritance (`splice_nodes` and `substitute_super_nodes`) to emit single combined `io.write_string` calls.
 
 ## [0.2.0] - 2026-11-01
 
@@ -95,6 +100,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Source-location comments (`/* line:col in template */`) on generated Odin statements and `approx_bytes` output size estimation (`fbec568`).
 - MIT License (`6cc7417`).
 
-[Unreleased]: https://github.com/boxxxie/temple/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/boxxxie/temple/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/boxxxie/temple/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/boxxxie/temple/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/boxxxie/temple/releases/tag/v0.1.0

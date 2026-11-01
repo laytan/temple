@@ -87,7 +87,7 @@ Transpiled_Template :: struct {
 	ok:          bool,
 }
 
-VERSION :: "0.2.0"
+VERSION :: "1.0.0"
 
 Cli_Options :: struct {
 	project_dir:   string,
