@@ -1,5 +1,10 @@
 # Temple
 
+[![CI](https://github.com/boxxxie/temple/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/temple/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](CHANGELOG.md)
+[![Odin](https://img.shields.io/badge/Odin-dev--2026--09%2B-3882D2.svg)](https://odin-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A fast, zero-overhead, compile-time HTML templating engine for [Odin](https://odin-lang.org) that transpiles Twig/Mustache-inspired templates directly into native Odin procedures.
 
 ## Features
