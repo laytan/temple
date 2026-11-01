@@ -21,7 +21,7 @@ A fast, compile-time templating engine for Odin that transpiles Twig/Mustache-in
 * Reusable parameterized in-file macros (`{% macro badge(label: string, active := false) %}...{% end %}` and `{% call badge(this.title, true) %}`), including across layout inheritance
 * Template comments (`{# ... #}`) and whitespace trimming markers (`{{-`, `-}}`, `{%-`, `-%}`, `{#-`, `-#}`)
 * Precomputed `approx_bytes` output size estimation (including branch-aware `switch` estimation) so buffers can be pre-sized before rendering
-* Parallel multi-threaded CLI compilation with Rust/Odin-style diagnostics and full `Call_Site -> Extends -> Embed` trace stacks
+* Parallel multi-threaded CLI compilation with Rust/Odin-style diagnostics, full `Call_Site -> Extends -> Embed` trace stacks, CI verification mode (`--check`), orphan template detection (`--warn-unused`), and incremental file watch mode (`--watch`)
 * `"contextless"` template descriptors so `temple.compiled` and `temple.compiled_inline` work in global/file-scope declarations
 * Single self-contained binary at runtime — no template files needed after compilation
 
@@ -41,6 +41,9 @@ You can install `temple` once into Odin's `shared:` collection (or as a read-onl
    * `-out:<file>` (or `--out=<file>`): destination `.odin` file to generate
    * `-pkg:<package>` (or `--pkg=<package>`): target package name (if omitted, automatically inferred from existing `.odin` files in the output directory)
    * `-temple-import:<path>` (or `--temple-import=<path>`): import path for the `temple` runtime library (defaults to `"shared:temple"` when generating outside `package temple`)
+   * `--check`: verify that all templates compile cleanly and the generated `.odin` file on disk is up-to-date without modifying disk (exits `1` if missing or stale)
+   * `--warn-unused`: emit warnings for any `.temple.twig`, `.temple.html`, or `.twig` files in the project directory never referenced by `compiled`, `extends`, or `embed`
+   * `--watch`: poll `.odin` and template files for changes and incrementally re-run compilation during development
 
 ### Option B: Vendored Submodule Mode
 

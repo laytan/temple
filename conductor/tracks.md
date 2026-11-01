@@ -19,7 +19,7 @@ This file tracks all major tracks for the project toward the `1.0.0` release. Ea
 
 ---
 
-- [ ] **Track: Developer Experience & CLI Modes (`--check`, `--warn-unused`, `--watch`)**
+- [x] **Track: Developer Experience & CLI Modes (`--check`, `--warn-unused`, `--watch`)**
   *Link: [./tracks/cli_dx_tooling_20261101/](./tracks/cli_dx_tooling_20261101/)*
 
 ---

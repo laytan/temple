@@ -73,6 +73,7 @@ Compile_Context :: struct {
 	stack:        [dynamic]Trace_Frame,
 	diagnostics:  [dynamic]Diagnostic,
 	raw_cache:    map[string]Cached_Template,
+	used_files:   map[string]bool,
 	allocator:    mem.Allocator,
 	inline_file:  string,
 	inline_pos:   tokenizer.Pos,
@@ -94,6 +95,9 @@ Cli_Options :: struct {
 	out_file:      string,
 	pkg_name:      string,
 	temple_import: string,
+	check_only:    bool,
+	warn_unused:   bool,
+	watch:         bool,
 	show_version:  bool,
 }
 
@@ -222,12 +226,31 @@ parse_cli_args :: proc(
 					return opts, "flag `-temple-import` requires a non-empty import path (e.g. `-temple-import:shared:temple`)", false
 				}
 				opts.temple_import = val
+			case "check":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--check` does not take a value", false
+				}
+				opts.check_only = !has_val || val == "true"
+			case "warn-unused":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--warn-unused` does not take a value", false
+				}
+				opts.warn_unused = !has_val || val == "true"
+			case "watch":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--watch` does not take a value", false
+				}
+				opts.watch = !has_val || val == "true"
 			case:
 				return opts, fmt.aprintf("unknown CLI flag %q", arg, allocator = allocator), false
 			}
 		} else {
 			append(&positionals, arg)
 		}
+	}
+
+	if opts.check_only && opts.watch {
+		return opts, "flags `--check` and `--watch` cannot be used together", false
 	}
 
 	if len(positionals) == 0 {
@@ -266,6 +289,14 @@ parse_cli_args :: proc(
 	return opts, "", true
 }
 
+run_cli_once :: proc(opts: Cli_Options) -> bool {
+	calls := collect_compile_calls(opts.project_dir)
+	free_all(context.temp_allocator)
+	defer delete(calls)
+
+	return transpile_calls(opts.temple_dir, calls[:], opts)
+}
+
 main :: proc() {
 	opts, err_msg, ok := parse_cli_args(os.args, context.allocator)
 	if !ok {
@@ -276,10 +307,14 @@ main :: proc() {
 		return
 	}
 
-	calls := collect_compile_calls(opts.project_dir)
-	free_all(context.temp_allocator)
+	if opts.watch {
+		watch_workspace(opts)
+		return
+	}
 
-	transpile_calls(opts.temple_dir, calls[:], opts)
+	if !run_cli_once(opts) {
+		os.exit(1)
+	}
 }
 
 warn :: proc(pos: Maybe(tokenizer.Pos), msg: string, args: ..any) {
@@ -1152,12 +1187,13 @@ visit_odin_node :: proc(visitor: ^ast.Visitor, node: ^ast.Node) -> ^ast.Visitor 
 Worker_Batch :: struct {
 	calls:        []Compile_Call,
 	results:      []Transpiled_Template,
+	used_files:   ^map[string]bool,
 	heap_alloc:   mem.Allocator,
 	heap_mutex:   ^sync.Mutex,
 	external_pkg: bool,
 }
 
-transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Options = {}) {
+transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Options = {}) -> bool {
 	pkg_name := opts.pkg_name if len(opts.pkg_name) > 0 else "temple"
 	external_pkg := pkg_name != "temple"
 
@@ -1167,6 +1203,31 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 	})
 
 	results := make([]Transpiled_Template, len(calls))
+	defer {
+		for res in results {
+			delete(res.code)
+			for d in res.diagnostics {
+				delete(d.pos.file)
+				delete(d.message)
+				delete(d.snippet)
+				for f in d.trace {
+					delete(f.pos.file)
+					delete(f.file)
+					delete(f.snippet)
+				}
+				delete(d.trace)
+			}
+			delete(res.diagnostics)
+		}
+		delete(results)
+	}
+	used_files := make(map[string]bool)
+	defer {
+		for k in used_files {
+			delete(k)
+		}
+		delete(used_files)
+	}
 
 	if len(calls) > 0 {
 		heap_mutex: sync.Mutex
@@ -1178,6 +1239,7 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 			batch := Worker_Batch{
 				calls        = calls,
 				results      = results,
+				used_files   = &used_files,
 				heap_alloc   = heap_alloc,
 				heap_mutex   = &heap_mutex,
 				external_pkg = external_pkg,
@@ -1198,6 +1260,7 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 				b := new(Worker_Batch)
 				b.calls = calls[start:end]
 				b.results = results[start:end]
+				b.used_files = &used_files
 				b.heap_alloc = heap_alloc
 				b.heap_mutex = &heap_mutex
 				b.external_pkg = external_pkg
@@ -1241,7 +1304,23 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 			len(calls) - good_calls,
 			total_errors,
 		)
-		os.exit(1)
+		return false
+	}
+
+	if opts.warn_unused && len(opts.project_dir) > 0 {
+		candidates := discover_project_template_files(opts.project_dir, context.temp_allocator)
+		normalized_used := make(map[string]bool, len(used_files), context.temp_allocator)
+		for k, v in used_files {
+			if !v do continue
+			normalized_used[k] = true
+			if ap, err := os.get_absolute_path(k, context.temp_allocator); err == nil {
+				normalized_used[ap] = true
+			}
+		}
+		unused := filter_unused_templates(candidates[:], normalized_used, context.temp_allocator)
+		for orphan in unused {
+			warn(nil, "unused template file %q is never referenced by `compiled`, `extends`, or `embed`", orphan)
+		}
 	}
 
 	// Stage 3: Emit to in-memory buffer and compare with existing output file
@@ -1272,12 +1351,31 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 	write_generated_file_footer(bw, written > 0)
 	new_body := strings.to_string(body_builder)
 
+	if opts.check_only {
+		existing_bytes, rerr := os.read_entire_file(compiled_path, context.temp_allocator)
+		if rerr != nil {
+			fmt.eprintf(
+				"\x1b[1;31mTemple Error:\x1b[0m generated file %q does not exist; run temple_cli without `--check` to generate\n",
+				compiled_path,
+			)
+			return false
+		}
+		if !is_generated_output_up_to_date(string(existing_bytes), new_body) {
+			fmt.eprintf(
+				"\x1b[1;31mTemple Error:\x1b[0m %q is out-of-date; run temple_cli without `--check` to regenerate\n",
+				compiled_path,
+			)
+			return false
+		}
+		fmt.printf("check passed: %q is up-to-date (%i compile calls)\n", compiled_path, good_calls)
+		return true
+	}
+
 	// Skip disk write if existing `templates.odin` has identical body content
 	if existing_bytes, rerr := os.read_entire_file(compiled_path, context.temp_allocator); rerr == nil {
-		existing_body := strip_generated_timestamp_header(string(existing_bytes))
-		if existing_body == new_body {
+		if is_generated_output_up_to_date(string(existing_bytes), new_body) {
 			fmt.printf("found %i compile calls of which %i were up-to-date (skipped writing unchanged templates.odin)\n", len(calls), good_calls)
-			return
+			return true
 		}
 	}
 
@@ -1309,6 +1407,153 @@ transpile_calls :: proc(temple_path: string, calls: []Compile_Call, opts: Cli_Op
 	}
 
 	fmt.printf("found %i compile calls of which %i were successfully compiled\n", len(calls), good_calls)
+	return true
+}
+
+is_generated_output_up_to_date :: proc(existing_content: string, new_body: string) -> bool {
+	return strip_generated_timestamp_header(existing_content) == strip_generated_timestamp_header(new_body)
+}
+
+is_template_candidate_file :: proc(path: string) -> bool {
+	return strings.has_suffix(path, ".temple.twig") ||
+		strings.has_suffix(path, ".temple.html") ||
+		strings.has_suffix(path, ".twig")
+}
+
+filter_unused_templates :: proc(
+	candidate_files: []string,
+	used_files: map[string]bool,
+	allocator := context.allocator,
+) -> [dynamic]string {
+	unused := make([dynamic]string, 0, len(candidate_files), allocator)
+	for f in candidate_files {
+		if !is_template_candidate_file(f) {
+			continue
+		}
+		if !used_files[f] {
+			append(&unused, strings.clone(f, allocator))
+		}
+	}
+	slice.sort(unused[:])
+	return unused
+}
+
+discover_project_template_files :: proc(root_dir: string, allocator := context.allocator) -> [dynamic]string {
+	files := make([dynamic]string, allocator)
+	w := filepath.walker_create(root_dir)
+	defer filepath.walker_destroy(&w)
+
+	for info in filepath.walker_walk(&w) {
+		if _, err := filepath.walker_error(&w); err != nil {
+			continue
+		}
+		if info.type == .Directory {
+			if info.fullpath != root_dir && strings.has_prefix(info.name, ".") {
+				filepath.walker_skip_dir(&w)
+			}
+			continue
+		}
+		if !is_template_candidate_file(info.name) {
+			continue
+		}
+		if ap, err := os.get_absolute_path(info.fullpath, allocator); err == nil {
+			append(&files, ap)
+		} else {
+			append(&files, strings.clone(info.fullpath, allocator))
+		}
+	}
+	slice.sort(files[:])
+	return files
+}
+
+Workspace_Snapshot :: map[string]i64
+
+is_watched_workspace_file :: proc(name: string) -> bool {
+	return strings.has_suffix(name, ".odin") ||
+		strings.has_suffix(name, ".twig") ||
+		strings.has_suffix(name, ".html")
+}
+
+capture_workspace_snapshot :: proc(
+	root_dir: string,
+	exclude_out_file := "",
+	allocator := context.allocator,
+) -> Workspace_Snapshot {
+	snap := make(Workspace_Snapshot, allocator)
+	abs_exclude := ""
+	if len(exclude_out_file) > 0 {
+		if ap, err := os.get_absolute_path(exclude_out_file, context.temp_allocator); err == nil {
+			abs_exclude = ap
+		} else {
+			abs_exclude = exclude_out_file
+		}
+	}
+
+	w := filepath.walker_create(root_dir)
+	defer filepath.walker_destroy(&w)
+
+	for info in filepath.walker_walk(&w) {
+		if _, err := filepath.walker_error(&w); err != nil {
+			continue
+		}
+		if info.type == .Directory {
+			if info.fullpath != root_dir && strings.has_prefix(info.name, ".") {
+				filepath.walker_skip_dir(&w)
+			}
+			continue
+		}
+		if !is_watched_workspace_file(info.name) || info.name == "templates.odin" {
+			continue
+		}
+		abs_path := info.fullpath
+		if ap, err := os.get_absolute_path(info.fullpath, context.temp_allocator); err == nil {
+			abs_path = ap
+		}
+		if len(abs_exclude) > 0 && abs_path == abs_exclude {
+			continue
+		}
+		snap[strings.clone(abs_path, allocator)] = info.modification_time._nsec + info.size
+	}
+	return snap
+}
+
+has_workspace_snapshot_changed :: proc(prev, curr: Workspace_Snapshot) -> bool {
+	if len(prev) != len(curr) {
+		return true
+	}
+	for k, curr_val in curr {
+		prev_val, found := prev[k]
+		if !found || prev_val != curr_val {
+			return true
+		}
+	}
+	return false
+}
+
+watch_workspace :: proc(opts: Cli_Options, max_iterations := 0, poll_interval := 250 * time.Millisecond) {
+	fmt.printf("watching %q for template and Odin file changes...\n", opts.project_dir)
+	_ = run_cli_once(opts)
+
+	snapshot_arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&snapshot_arena)
+	defer mem.dynamic_arena_destroy(&snapshot_arena)
+	snap_alloc := mem.dynamic_arena_allocator(&snapshot_arena)
+
+	prev_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc)
+	free_all(context.temp_allocator)
+
+	for iter := 0; max_iterations <= 0 || iter < max_iterations; iter += 1 {
+		time.sleep(poll_interval)
+
+		curr_snap := capture_workspace_snapshot(opts.project_dir, opts.out_file, context.temp_allocator)
+		if has_workspace_snapshot_changed(prev_snap, curr_snap) {
+			fmt.println("change detected; recompiling templates...")
+			_ = run_cli_once(opts)
+			mem.dynamic_arena_reset(&snapshot_arena)
+			prev_snap = capture_workspace_snapshot(opts.project_dir, opts.out_file, snap_alloc)
+		}
+		free_all(context.temp_allocator)
+	}
 }
 
 strip_generated_timestamp_header :: proc(content: string) -> string {
@@ -1341,6 +1586,7 @@ compile_batch_worker :: proc(batch: ^Worker_Batch) {
 	ctx.allocator = arena_alloc
 	ctx.stack = make([dynamic]Trace_Frame, arena_alloc)
 	ctx.raw_cache = make(map[string]Cached_Template, arena_alloc)
+	ctx.used_files = make(map[string]bool, arena_alloc)
 	ctx.external_pkg = batch.external_pkg
 
 	for call, i in batch.calls {
@@ -1350,6 +1596,13 @@ compile_batch_worker :: proc(batch: ^Worker_Batch) {
 		code, ok := compile_single_call(&ctx, call)
 
 		sync.guard(batch.heap_mutex)
+		if batch.used_files != nil {
+			for k, v in ctx.used_files {
+				if v && !batch.used_files^[k] {
+					batch.used_files^[strings.clone(k, batch.heap_alloc)] = true
+				}
+			}
+		}
 		cloned_diags := make([dynamic]Diagnostic, 0, len(ctx.diagnostics), batch.heap_alloc)
 		for d in ctx.diagnostics {
 			cd := d
@@ -1498,6 +1751,9 @@ load_raw_template :: proc(
 	source: []byte,
 	ok: bool,
 ) {
+	if ctx.used_files.allocator.procedure != nil && !ctx.used_files[fullpath] {
+		ctx.used_files[strings.clone(fullpath, ctx.allocator)] = true
+	}
 	if cached, found := ctx.raw_cache[fullpath]; found {
 		if err, has_err := cached.template.err.?; has_err {
 			pos := tokenizer.Pos{

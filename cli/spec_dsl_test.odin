@@ -2,6 +2,7 @@ package temple_cli
 
 import "core:fmt"
 import "core:io"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 
@@ -32,6 +33,11 @@ given_target_package :: proc(d: ^Spec_Driver, pkg_name: string, temple_import :=
 	d.pkg_name = pkg_name
 	d.temple_import = temple_import
 	d.ctx.external_pkg = len(pkg_name) > 0 && pkg_name != "temple"
+}
+
+given_existing_generated_file :: proc(d: ^Spec_Driver, content: string) {
+	d.disk_gen_file = strings.clone(content, d.alloc)
+	d.has_disk_gen = true
 }
 
 // --- UPON steps ---
@@ -194,4 +200,34 @@ then_collection_error_contains :: proc(d: ^Spec_Driver, substr: string) {
 			substr,
 		)
 	}
+}
+
+then_used_templates_are :: proc(d: ^Spec_Driver, expected_paths: []string) {
+	then_compilation_succeeds(d)
+	actual := make([dynamic]string, 0, len(d.ctx.used_files), d.alloc)
+	for k, v in d.ctx.used_files {
+		if v do append(&actual, k)
+	}
+	slice.sort(actual[:])
+	testing.expect_value(d.t, len(actual), len(expected_paths))
+	for exp, i in expected_paths {
+		if i >= len(actual) do break
+		testing.expect_value(d.t, actual[i], exp)
+	}
+}
+
+then_unused_templates_are :: proc(d: ^Spec_Driver, expected_unused: []string) {
+	then_compilation_succeeds(d)
+	unused := filter_unused_templates(d.seeded_files[:], d.ctx.used_files, d.alloc)
+	testing.expect_value(d.t, len(unused), len(expected_unused))
+	for exp, i in expected_unused {
+		if i >= len(unused) do break
+		testing.expect_value(d.t, unused[i], exp)
+	}
+}
+
+then_check_mode_matches_existing_file :: proc(d: ^Spec_Driver, expected_match: bool) {
+	then_compilation_succeeds(d)
+	actual_match := d.has_disk_gen && is_generated_output_up_to_date(d.disk_gen_file, d.generated_file)
+	testing.expect_value(d.t, actual_match, expected_match)
 }

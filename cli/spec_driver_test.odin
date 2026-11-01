@@ -15,6 +15,9 @@ Spec_Driver :: struct {
 	ctx:            Compile_Context,
 	pkg_name:       string,
 	temple_import:  string,
+	seeded_files:   [dynamic]string,
+	disk_gen_file:  string,
+	has_disk_gen:   bool,
 	collected:      [dynamic]Compile_Call,
 	collect_errors: [dynamic]string,
 	transpiled:     string,
@@ -32,7 +35,9 @@ driver_init :: proc(t: ^testing.T) -> ^Spec_Driver {
 	d.ctx.allocator = d.alloc
 	d.ctx.stack = make([dynamic]Trace_Frame, d.alloc)
 	d.ctx.raw_cache = make(map[string]Cached_Template, d.alloc)
+	d.ctx.used_files = make(map[string]bool, d.alloc)
 	d.ctx.diagnostics = make([dynamic]Diagnostic, d.alloc)
+	d.seeded_files = make([dynamic]string, d.alloc)
 	d.collected = make([dynamic]Compile_Call, d.alloc)
 	d.collect_errors = make([dynamic]string, d.alloc)
 	return d
@@ -47,10 +52,12 @@ driver_seed_template :: proc(d: ^Spec_Driver, fullpath: string, content: string)
 	p: Parser
 	parser_init(&p, raw, d.alloc)
 	parsed := parse(&p)
-	d.ctx.raw_cache[strings.clone(fullpath, d.alloc)] = Cached_Template{
+	cloned_path := strings.clone(fullpath, d.alloc)
+	d.ctx.raw_cache[cloned_path] = Cached_Template{
 		source   = raw,
 		template = parsed,
 	}
+	append(&d.seeded_files, cloned_path)
 }
 
 driver_compile_path :: proc(d: ^Spec_Driver, fullpath, relpath, odin_file: string, line, col: int) {
