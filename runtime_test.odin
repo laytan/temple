@@ -135,6 +135,7 @@ test_write_safe_url_allows_safe_schemes_and_relative_paths :: proc(t: ^testing.T
 		{input = "/wiki/Category:Odin",                       expected = "/wiki/Category:Odin"},
 		{input = "page.html",                                 expected = "page.html"},
 		{input = "  https://example.com/padded?a=1&b=2",      expected = "  https://example.com/padded?a=1&amp;b=2"},
+		{input = "\n\thttps://example.com/padded?a=1&b=2",    expected = "\n\thttps://example.com/padded?a=1&amp;b=2"},
 		{input = "data:image/png;base64,iVBORw0KGgo=",        expected = "data:image/png;base64,iVBORw0KGgo="},
 		{input = "DATA:IMAGE/WEBP;base64,UklGRg==",           expected = "DATA:IMAGE/WEBP;base64,UklGRg=="},
 	}
@@ -165,6 +166,9 @@ test_write_safe_url_neutralizes_dangerous_and_obfuscated_schemes :: proc(t: ^tes
 		"data:image/svg+xml;base64,PHN2Zz4=",
 		"file:///etc/passwd",
 		"ftp://files.example.com/pub",
+		`\\evil.com/payload`,
+		`/\evil.com/payload`,
+		`  \\evil.com/payload`,
 	}
 
 	for u in unsafe_urls {
@@ -252,4 +256,34 @@ test_default_overloads_for_string_slice_and_maybe :: proc(t: ^testing.T) {
 	some_int: Maybe(int) = 99
 	testing.expect_value(t, __temple_default(none_int, 42), 42)
 	testing.expect_value(t, __temple_default(some_int, 42), 99)
+}
+
+@(test)
+test_write_int_extremes_including_min_int :: proc(t: ^testing.T) {
+	Int_Case :: struct {
+		val:      int,
+		expected: string,
+	}
+
+	cases := []Int_Case{
+		{val = 0,                   expected = "0"},
+		{val = 9,                   expected = "9"},
+		{val = 10,                  expected = "10"},
+		{val = 99,                  expected = "99"},
+		{val = 100,                 expected = "100"},
+		{val = -1,                  expected = "-1"},
+		{val = -10,                 expected = "-10"},
+		{val = -99,                 expected = "-99"},
+		{val = -100,                expected = "-100"},
+		{val = max(int),            expected = "9223372036854775807" if size_of(int) == 8 else "2147483647"},
+		{val = min(int),            expected = "-9223372036854775808" if size_of(int) == 8 else "-2147483648"},
+	}
+
+	for c in cases {
+		sb := strings.builder_make(context.temp_allocator)
+		n, err := __temple_write_int(strings.to_writer(&sb), c.val)
+		testing.expect_value(t, err, nil)
+		testing.expect_value(t, strings.to_string(sb), c.expected)
+		testing.expect_value(t, n, len(c.expected))
+	}
 }
