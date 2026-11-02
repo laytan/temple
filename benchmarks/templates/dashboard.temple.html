@@ -1,0 +1,36 @@
+{% extends "layout.temple.html" %}
+
+{% block title %}{{ super() }} - {{ this.page_title | default("Dashboard") }}{% end %}
+
+{% block heading %}{{ this.page_title }} ({{ this.rows | len }} hosts){% end %}
+
+{% block content %}
+  {%- let total_rows = len(this.rows) -%}
+  <section data-total="{{ int(total_rows) }}">
+    <table>
+      <thead>
+        <tr><th>#</th><th>Host</th><th>Region</th><th>Latency</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {%- for row, idx in this.rows -%}
+        <tr>
+          <td>{{ int(idx + 1) }}</td>
+          <td><a href="{{ row.endpoint | url }}?host={{ row.host | url_param }}">{{ row.host }}</a></td>
+          <td>{{ row.region | default("global") }}</td>
+          <td>{{ row.latency_ms | fmt("%.2f ms") }}</td>
+          <td>
+            {%- #partial switch row.state -%}
+              {%- case .Healthy -%}
+                {%- call badge("Healthy", "ok") -%}
+              {%- case .Degraded -%}
+                {%- call badge("Degraded", "warn") -%}
+              {%- case -%}
+                {%- call badge("Offline", "err") -%}
+            {%- end -%}
+          </td>
+        </tr>
+        {%- end -%}
+      </tbody>
+    </table>
+  </section>
+{% end %}

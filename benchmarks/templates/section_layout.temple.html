@@ -1,0 +1,11 @@
+{% extends "layout.temple.html" %}
+
+{% block title %}{{ super() }} | Fleet Section{% end %}
+
+{% block heading %}[{{ this.env }}] {{ super() }}{% end %}
+
+{% block content %}
+<div class="fleet-section">
+  {{ super() }}
+</div>
+{% end %}

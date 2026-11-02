@@ -1,0 +1,8 @@
+{
+  "track_id": "macros_and_fmt_20261101",
+  "type": "feature",
+  "status": "completed",
+  "created_at": "2026-11-01T14:46:30Z",
+  "updated_at": "2026-11-01T20:46:00Z",
+  "description": "Add AST pipe filter DSL (|, fmt, default), component-style embed named props, 4-layer ATDD suite, and parameterized template macros ({% macro %})"
+}

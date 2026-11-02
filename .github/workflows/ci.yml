@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run CLI & ATDD specification suite
+        run: odin test cli -all-packages
+
+      - name: Run runtime unit tests
+        run: odin test .
+
+      - name: Verify generated templates (--check & --warn-unused)
+        run: |
+          odin run cli -- --check --warn-unused tests .
+          odin run cli -- --check --warn-unused tests/external_views --out=tests/external_views/templates_gen.odin --temple-import=../../
+          odin run cli -- --check --warn-unused benchmarks --out=benchmarks/templates_gen.odin --pkg=benchmarks --temple-import=..
+
+      - name: Run end-to-end integration tests
+        run: odin test tests

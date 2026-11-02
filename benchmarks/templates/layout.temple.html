@@ -1,0 +1,21 @@
+{# Base layout for benchmark dashboard #}
+{%- macro badge(label: string, status_class := "ok") -%}
+<span class="badge badge--{{ status_class }}">{{ label | default("N/A") }}</span>
+{%- end -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Temple Benchmarks{% end %}</title>
+  <script>window.__BOOT_TOKEN = "{{ this.boot_token | js }}";</script>
+</head>
+<body>
+  <header>
+    <h1>{% block heading %}System Overview{% end %}</h1>
+    <a href="{{ this.docs_url | default("/docs") | url }}?env={{ this.env | url_param }}">Documentation</a>
+  </header>
+  <main>
+    {% block content %}{% end %}
+  </main>
+</body>
+</html>
