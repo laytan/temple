@@ -26,3 +26,8 @@ This file tracks all major tracks for the project toward the `1.0.0` release. Ea
 
 - [x] **Track: Cross-Platform Path Normalization & GitHub Actions CI Pipeline**
   *Link: [./tracks/cross_platform_ci_20261101/](./tracks/cross_platform_ci_20261101/)*
+
+---
+
+- [ ] **Track: HEEx-Style Component Tags (`<.component>`), Named Slots (`<:slot>` / `{% slot %}`), and Inline Directives (`:for`, `:if`)**
+  *Link: [./tracks/heex_components_20261102/](./tracks/heex_components_20261102/)*
