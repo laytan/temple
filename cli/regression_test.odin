@@ -637,7 +637,8 @@ test_cli_options_parsing_and_package_inference :: proc(t: ^testing.T) {
 		testing.expect_value(t, opts.temple_import, "shared:temple")
 	}
 
-	// 4. GNU-style flags (`--out=`, `--pkg=`, `--temple-import=`) before positional arg
+	// 4. GNU-style flags (`--out=`, `--pkg=`, `--temple-import=`) before positional arg,
+	// plus PowerShell-split `-out:` `<val>` / `-pkg:` `<val>` / `-temple-import:` `<val>` arguments
 	{
 		opts, err_msg, ok := parse_cli_args(
 			{"temple_cli", "--out=ui/templates_gen.odin", "--pkg=ui", "--temple-import=../temple", "src"},
@@ -648,6 +649,16 @@ test_cli_options_parsing_and_package_inference :: proc(t: ^testing.T) {
 		testing.expect_value(t, opts.out_file, "ui/templates_gen.odin")
 		testing.expect_value(t, opts.pkg_name, "ui")
 		testing.expect_value(t, opts.temple_import, "../temple")
+
+		opts_pwsh, err_pwsh, ok_pwsh := parse_cli_args(
+			{"temple_cli", "benchmarks", "-out:", "benchmarks/templates_gen.odin", "-pkg:", "benchmarks", "-temple-import:", ".."},
+			alloc,
+		)
+		testing.expect(t, ok_pwsh, err_pwsh)
+		testing.expect_value(t, opts_pwsh.project_dir, "benchmarks")
+		testing.expect_value(t, opts_pwsh.out_file, "benchmarks/templates_gen.odin")
+		testing.expect_value(t, opts_pwsh.pkg_name, "benchmarks")
+		testing.expect_value(t, opts_pwsh.temple_import, "..")
 	}
 
 	// 5. Automatic package inference from existing `.odin` files in output directory (`tests/` -> `package temple_tests`)

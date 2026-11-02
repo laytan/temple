@@ -517,7 +517,11 @@ parse_cli_args :: proc(
 
 	positionals := make([dynamic]string, 0, 2, allocator)
 
-	for arg in args[1:] {
+	idx := 1
+	for idx < len(args) {
+		arg := args[idx]
+		idx += 1
+
 		if arg == "--version" || arg == "-v" {
 			opts.show_version = true
 			return opts, "", true
@@ -525,6 +529,15 @@ parse_cli_args :: proc(
 
 		key, val, is_flag, has_val := parse_cli_flag_kv(arg)
 		if is_flag {
+			// Support PowerShell / space-separated flag values when `-out:` is split into `-out:` `<val>` or `-out` `<val>`
+			if (!has_val || len(val) == 0) && (key == "out" || key == "pkg" || key == "temple-import") {
+				if idx < len(args) && !strings.has_prefix(args[idx], "-") {
+					val = args[idx]
+					has_val = true
+					idx += 1
+				}
+			}
+
 			switch key {
 			case "out":
 				if !has_val || len(val) == 0 {
@@ -1336,7 +1349,11 @@ unquote_odin_string :: proc(lit: string) -> (string, bool) {
 		return "", false
 	}
 	if lit[0] == '`' && lit[len(lit)-1] == '`' {
-		return lit[1 : len(lit)-1], true
+		raw := lit[1 : len(lit)-1]
+		if strings.index_byte(raw, '\r') != -1 {
+			return normalize_line_endings_lf(raw, context.temp_allocator), true
+		}
+		return raw, true
 	}
 	if lit[0] == '"' && lit[len(lit)-1] == '"' {
 		if strings.index_byte(lit[1 : len(lit)-1], '\\') == -1 {
@@ -1989,8 +2006,18 @@ transpile_calls :: proc(
 	return true
 }
 
+normalize_line_endings_lf :: proc(s: string, allocator := context.temp_allocator) -> string {
+	if strings.index_byte(s, '\r') == -1 {
+		return s
+	}
+	res, _ := strings.replace_all(s, "\r\n", "\n", allocator)
+	return res
+}
+
 is_generated_output_up_to_date :: proc(existing_content: string, new_body: string) -> bool {
-	return strip_generated_timestamp_header(existing_content) == strip_generated_timestamp_header(new_body)
+	existing_stripped := normalize_line_endings_lf(strip_generated_timestamp_header(existing_content), context.temp_allocator)
+	new_stripped := normalize_line_endings_lf(strip_generated_timestamp_header(new_body), context.temp_allocator)
+	return existing_stripped == new_stripped
 }
 
 // Intentional distinction from `is_watched_workspace_file`: `--warn-unused` only checks

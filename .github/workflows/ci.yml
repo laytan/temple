@@ -32,8 +32,8 @@ jobs:
       - name: Verify generated templates (--check & --warn-unused)
         run: |
           odin run cli -- --check --warn-unused tests .
-          odin run cli -- --check --warn-unused tests/external_views -out:tests/external_views/templates_gen.odin -temple-import:../../
-          odin run cli -- --check --warn-unused benchmarks -out:benchmarks/templates_gen.odin -pkg:benchmarks -temple-import:..
+          odin run cli -- --check --warn-unused tests/external_views --out=tests/external_views/templates_gen.odin --temple-import=../../
+          odin run cli -- --check --warn-unused benchmarks --out=benchmarks/templates_gen.odin --pkg=benchmarks --temple-import=..
 
       - name: Run end-to-end integration tests
         run: odin test tests
