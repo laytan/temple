@@ -19,50 +19,12 @@ Transpiler :: struct {
 	indent:       string,
 	indented:     int,
 	approx_bytes: int,
-	macro_names:  [8]string,
-	macro_bytes:  [8]int,
-	macro_count:  int,
-	macro_approx: map[string]int,
+	macro_approx: Small_Map(8, string, int),
 	external_pkg: bool,
 	emit_loc:     bool,
 
 	embed_parser: Embed_Parser,
 	embed_data:   rawptr,
-}
-
-@(private = "file")
-set_macro_approx :: proc(t: ^Transpiler, name: string, bytes: int) {
-	for i in 0 ..< t.macro_count {
-		if t.macro_names[i] == name {
-			t.macro_bytes[i] = bytes
-			return
-		}
-	}
-	if t.macro_count < len(t.macro_names) {
-		t.macro_names[t.macro_count] = name
-		t.macro_bytes[t.macro_count] = bytes
-		t.macro_count += 1
-		return
-	}
-	if t.macro_approx.allocator.procedure == nil {
-		t.macro_approx = make(map[string]int, t.allocator)
-	}
-	t.macro_approx[name] = bytes
-}
-
-@(private = "file")
-get_macro_approx :: proc(t: ^Transpiler, name: string) -> (int, bool) {
-	for i in 0 ..< t.macro_count {
-		if t.macro_names[i] == name {
-			return t.macro_bytes[i], true
-		}
-	}
-	if t.macro_approx.allocator.procedure != nil {
-		if b, found := t.macro_approx[name]; found {
-			return b, true
-		}
-	}
-	return 0, false
 }
 
 Embed_Parser :: #type proc(t: ^Transpiler, embed: ^Node_Embed, user_data: rawptr) -> bool
@@ -275,6 +237,21 @@ for_loop_approx_multiplier :: proc(loop_body_bytes: int) -> int {
 }
 
 @(private = "file")
+estimate_template_approx :: proc(t: ^Transpiler, nodes: []Node, macro_count: int) -> int {
+	if macro_count > 0 {
+		passes := 2 if macro_count > 1 else 1
+		for _ in 0 ..< passes {
+			for node in nodes {
+				if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+					small_map_set(&t.macro_approx, mac.name, estimate_nodes_approx(t, mac.body[:]), t.allocator)
+				}
+			}
+		}
+	}
+	return estimate_nodes_approx(t, nodes)
+}
+
+@(private = "file")
 estimate_nodes_approx :: proc(t: ^Transpiler, nodes: []Node) -> int {
 	total := 0
 	for node in nodes {
@@ -282,7 +259,7 @@ estimate_nodes_approx :: proc(t: ^Transpiler, nodes: []Node) -> int {
 		case ^Node_Text:
 			total += len(d.text.value)
 		case ^Node_Output:
-			total += estimate_output_approx(d)
+			total += 10
 		case ^Node_If:
 			max_b := estimate_nodes_approx(t, d._if.body[:])
 			for ef in d.elseifs {
@@ -303,13 +280,15 @@ estimate_nodes_approx :: proc(t: ^Transpiler, nodes: []Node) -> int {
 			total += max_c
 		case ^Node_Block:
 			total += estimate_nodes_approx(t, d.body[:])
+		case ^Node_Embed:
+			total += d.approx_bytes
 		case ^Node_Call:
-			if mb, found := get_macro_approx(t, d.name); found {
+			if mb, found := small_map_get(&t.macro_approx, d.name); found {
 				total += mb
 			} else {
 				total += 10
 			}
-		case ^Node_Let, ^Node_Embed, ^Node_Macro, ^Node_Extends, ^Node_Super:
+		case ^Node_Let, ^Node_Macro, ^Node_Extends, ^Node_Super:
 		}
 	}
 	return total
@@ -448,131 +427,10 @@ has_top_level_comma :: proc(expr_src: string) -> bool {
 	return false
 }
 
-@(private = "file")
-estimate_output_approx :: proc(node: ^Node_Output) -> int {
-	if node.write_kind == .Fmt_Escaped || node.write_kind == .Fmt_Raw {
-		v := node.inner_expr if len(node.inner_expr) > 0 else strings.trim_space(node.expression.value)
-		if len(node.default_arg) > 0 || !has_top_level_comma(v) {
-			if spec := try_parse_simple_fmt_literal(node.fmt_str); spec.is_simple {
-				is_raw := node.write_kind == .Fmt_Raw
-				pre_len := len(spec.prefix) if is_raw else len(escape_html_literal_at_compile_time(spec.prefix))
-				suf_len := len(spec.suffix) if is_raw else len(escape_html_literal_at_compile_time(spec.suffix))
-				return pre_len + 10 + suf_len
-			}
-		}
-	}
-	return 10
-}
-
-@(private = "file")
-transpile_slice_needs_flatten :: proc(nodes: []Node) -> bool {
-	prev_was_text := false
-	for node in nodes {
-		#partial switch d in node.derived {
-		case ^Node_Text:
-			if len(d.text.value) == 0 || prev_was_text {
-				return true
-			}
-			prev_was_text = true
-		case ^Node_Output:
-			if d.write_kind == .Fmt_Escaped || d.write_kind == .Fmt_Raw {
-				return true
-			}
-			prev_was_text = false
-		case:
-			prev_was_text = false
-		}
-	}
-	return false
-}
-
-@(private = "file")
-flatten_and_coalesce_nodes :: proc(t: ^Transpiler, nodes: []Node) -> []Node {
-	if !transpile_slice_needs_flatten(nodes) {
-		return nodes
-	}
-	out := make([dynamic]Node, 0, len(nodes), t.allocator)
-	append_flattened_nodes(t, &out, nodes)
-	return out[:]
-}
-
-@(private = "file")
-append_coalesced_text :: proc(t: ^Transpiler, out: ^[dynamic]Node, txt_tok: Token, existing_node: Maybe(^Node_Text) = nil) {
-	if len(txt_tok.value) == 0 {
-		return
-	}
-	if len(out^) > 0 {
-		if prev_txt, is_prev := out^[len(out^) - 1].derived.(^Node_Text); is_prev {
-			merged := new(Node_Text, t.allocator)
-			merged.derived = merged
-			merged.text = prev_txt.text
-			merged.text.value = strings.concatenate({prev_txt.text.value, txt_tok.value}, t.allocator)
-			out^[len(out^) - 1] = merged
-			return
-		}
-	}
-	if ex, has_ex := existing_node.?; has_ex {
-		append(out, ex)
-		return
-	}
-	nt := new(Node_Text, t.allocator)
-	nt.derived = nt
-	nt.text = txt_tok
-	append(out, nt)
-}
-
-@(private = "file")
-append_flattened_nodes :: proc(t: ^Transpiler, out: ^[dynamic]Node, nodes: []Node) {
-	for node in nodes {
-		#partial switch d in node.derived {
-		case ^Node_Text:
-			append_coalesced_text(t, out, d.text, d)
-		case ^Node_Output:
-			v := d.inner_expr if len(d.inner_expr) > 0 else strings.trim_space(d.expression.value)
-			if (d.write_kind == .Fmt_Escaped || d.write_kind == .Fmt_Raw) && !has_top_level_comma(v) {
-				if spec := try_parse_simple_fmt_literal(d.fmt_str, t.allocator); spec.is_simple {
-					is_raw := d.write_kind == .Fmt_Raw
-					if len(spec.prefix) > 0 {
-						pre_val := spec.prefix if is_raw else escape_html_literal_at_compile_time(spec.prefix, t.allocator)
-						append_coalesced_text(t, out, Token{type = .Text, value = pre_val, pos = d.open.pos})
-					}
-					mid := new(Node_Output, t.allocator)
-					mid^ = d^
-					mid.derived = mid
-					switch spec.verb {
-					case 's':
-						mid.write_kind = .Raw_String if is_raw else .Escaped_String
-						mid.inner_expr = v
-					case 'i', 'd':
-						mid.write_kind = .Int
-						mid.inner_expr = v
-						mid.wrap_call = "int" if len(d.wrap_call) == 0 else d.wrap_call
-					case 'f':
-						mid.write_kind = .F64_Prec
-						mid.float_prec = spec.float_prec
-						mid.inner_expr = v
-						mid.wrap_call = "f64" if len(d.wrap_call) == 0 else d.wrap_call
-					}
-					append(out, mid)
-					if len(spec.suffix) > 0 {
-						suf_val := spec.suffix if is_raw else escape_html_literal_at_compile_time(spec.suffix, t.allocator)
-						append_coalesced_text(t, out, Token{type = .Text, value = suf_val, pos = d.open.pos})
-					}
-					continue
-				}
-			}
-			append(out, node)
-		case:
-			append(out, node)
-		}
-	}
-}
-
 transpile_node_sequence :: proc(t: ^Transpiler, nodes: []Node, trailing_newline: bool) {
-	flat := flatten_and_coalesce_nodes(t, nodes)
-	for n, i in flat {
+	for n, i in nodes {
 		transpile_node(t, n)
-		if trailing_newline || i != len(flat) - 1 {
+		if trailing_newline || i != len(nodes) - 1 {
 			write_newline(t)
 		}
 	}
@@ -592,44 +450,41 @@ transpile_template_nodes :: proc(t: ^Transpiler, nodes: []Node) {
 			seen_non_macro = true
 		}
 	}
+
 	if macro_count == 0 {
 		transpile_node_sequence(t, nodes, true)
-		return
-	}
-
-	// Pre-seed macro approx_bytes so even forward macro-to-macro calls resolve accurately.
-	passes := 2 if macro_count > 1 else 1
-	for _ in 0 ..< passes {
-		for node in nodes {
-			if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-				set_macro_approx(t, mac.name, estimate_nodes_approx(t, mac.body[:]))
-			}
-		}
-	}
-
-	if all_macros_at_front {
+	} else if all_macros_at_front {
 		for i in 0 ..< macro_count {
 			transpile_macro(t, nodes[i].derived.(^Node_Macro))
 			write_newline(t)
 		}
 		transpile_node_sequence(t, nodes[macro_count:], true)
-		return
-	}
-
-	// Pass 1: Hoist all `Node_Macro` declarations before body nodes so `t.macro_approx`
-	// is populated (including any embedded templates inside macros) before `transpile_call` runs.
-	body_only := make([dynamic]Node, 0, len(nodes) - macro_count, t.allocator)
-	for node in nodes {
-		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-			transpile_macro(t, mac)
-			write_newline(t)
-		} else {
-			append(&body_only, node)
+	} else {
+		// Hoist all `Node_Macro` declarations before body nodes, coalescing any `Node_Text` nodes
+		// that become adjacent once the macro definitions are hoisted out.
+		body_only := make([dynamic]Node, 0, len(nodes) - macro_count, t.allocator)
+		for node in nodes {
+			if mac, is_mac := node.derived.(^Node_Macro); is_mac {
+				transpile_macro(t, mac)
+				write_newline(t)
+			} else if txt, is_txt := node.derived.(^Node_Text); is_txt && len(body_only) > 0 {
+				if prev_txt, is_prev := body_only[len(body_only) - 1].derived.(^Node_Text); is_prev {
+					merged := new(Node_Text, t.allocator)
+					merged.derived = merged
+					merged.text = prev_txt.text
+					merged.text.value = strings.concatenate({prev_txt.text.value, txt.text.value}, t.allocator)
+					body_only[len(body_only) - 1] = merged
+					continue
+				}
+				append(&body_only, node)
+			} else {
+				append(&body_only, node)
+			}
 		}
+		transpile_node_sequence(t, body_only[:], true)
 	}
 
-	// Pass 2: Flatten `Node_Block` wrappers, coalesce adjacent `Node_Text` (and strength-reduced `fmt` literals), and emit.
-	transpile_node_sequence(t, body_only[:], true)
+	t.approx_bytes = estimate_template_approx(t, nodes, macro_count)
 }
 
 transpile_node :: proc(t: ^Transpiler, node: Node) {
@@ -679,10 +534,7 @@ transpile_macro :: proc(t: ^Transpiler, node: ^Node_Macro) {
 	indent(t)
 	write_newline(t)
 
-	approx_start := t.approx_bytes
 	transpile_node_sequence(t, node.body[:], true)
-	set_macro_approx(t, node.name, t.approx_bytes - approx_start)
-	t.approx_bytes = approx_start
 
 	ws(t.w, "return")
 	dedent(t)
@@ -691,11 +543,6 @@ transpile_macro :: proc(t: ^Transpiler, node: ^Node_Macro) {
 }
 
 transpile_call :: proc(t: ^Transpiler, node: ^Node_Call) {
-	if macro_bytes, found := get_macro_approx(t, node.name); found {
-		t.approx_bytes += macro_bytes
-	} else {
-		t.approx_bytes += 10
-	}
 	ws(t.w, RET_N + " += __temple_macro_")
 	ws(t.w, node.name)
 	if len(node.args_src) > 0 {
@@ -751,9 +598,6 @@ transpile_switch :: proc(t: ^Transpiler, node: ^Node_Switch) {
 	transpile_loc(t, node.open.pos)
 	write_newline(t)
 
-	approx_start := t.approx_bytes
-	max_case_bytes: int
-
 	for c in node.cases {
 		if expr, has_expr := c.expression.?; has_expr {
 			ws(t.w, "case ")
@@ -765,26 +609,18 @@ transpile_switch :: proc(t: ^Transpiler, node: ^Node_Switch) {
 		transpile_loc(t, c.open.pos)
 
 		indent(t)
-		flat_case := flatten_and_coalesce_nodes(t, c.body[:])
-		for child in flat_case {
+		for child in c.body {
 			write_newline(t)
 			transpile_node(t, child)
 		}
 		dedent(t)
 		write_newline(t)
-
-		case_bytes := t.approx_bytes - approx_start
-		t.approx_bytes = approx_start
-		max_case_bytes = max(max_case_bytes, case_bytes)
 	}
 
 	ws(t.w, "}")
-	t.approx_bytes += max_case_bytes
 }
 
 transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
-	t.approx_bytes += len(node.text.value)
-
 	ws(t.w, RET_N + " += " + PKG_IO + ".write_string(" + ARG_W + ", ")
 	write_quoted_fast(t.w, node.text.value)
 	ws(t.w, ") or_return")
@@ -792,10 +628,9 @@ transpile_text :: proc(t: ^Transpiler, node: ^Node_Text) {
 }
 
 @(private = "file")
-write_output_expr :: proc(w: io.Writer, node: ^Node_Output, v: string, force_wrap := "") {
-	wrap := force_wrap if len(force_wrap) > 0 else node.wrap_call
-	if len(wrap) > 0 {
-		ws(w, wrap)
+write_output_expr :: proc(w: io.Writer, node: ^Node_Output, v: string) {
+	if len(node.wrap_call) > 0 {
+		ws(w, node.wrap_call)
 		ws(w, "(")
 	}
 	if len(node.default_arg) > 0 {
@@ -807,7 +642,7 @@ write_output_expr :: proc(w: io.Writer, node: ^Node_Output, v: string, force_wra
 	} else {
 		ws(w, v)
 	}
-	if len(wrap) > 0 {
+	if len(node.wrap_call) > 0 {
 		ws(w, ")")
 	}
 }
@@ -815,64 +650,6 @@ write_output_expr :: proc(w: io.Writer, node: ^Node_Output, v: string, force_wra
 transpile_output :: proc(t: ^Transpiler, node: ^Node_Output) {
 	v := node.inner_expr if len(node.inner_expr) > 0 else strings.trim_space(node.expression.value)
 	ext := t.external_pkg
-
-	// Compile-time strength reduction for single-argument `fmt("...", expr)` with `%s`, `%i`, or `%d`:
-	// emits direct static writes + `write_escaped_string` / `write_string` / `write_int` instead of `fmt.wprintf`.
-	if (node.write_kind == .Fmt_Escaped || node.write_kind == .Fmt_Raw) && (len(node.default_arg) > 0 || !has_top_level_comma(v)) {
-		if spec := try_parse_simple_fmt_literal(node.fmt_str, t.allocator); spec.is_simple {
-			is_raw := node.write_kind == .Fmt_Raw
-			has_emitted := false
-
-			if len(spec.prefix) > 0 {
-				escaped_pre := spec.prefix if is_raw else escape_html_literal_at_compile_time(spec.prefix, t.allocator)
-				t.approx_bytes += len(escaped_pre)
-				ws(t.w, RET_N + " += " + PKG_IO + ".write_string(" + ARG_W + ", ")
-				write_quoted_fast(t.w, escaped_pre)
-				ws(t.w, ") or_return")
-				transpile_loc(t, node.open.pos)
-				has_emitted = true
-			}
-
-			if has_emitted {
-				write_newline(t)
-			}
-			t.approx_bytes += 10
-			switch spec.verb {
-			case 's':
-				if is_raw {
-					ws(t.w, RET_N + " += " + PKG_IO + ".write_string(" + ARG_W + ", ")
-				} else {
-					ws(t.w, RET_N + " += __temple.__temple_write_escaped_string(" + ARG_W + ", " if ext else RET_N + " += __temple_write_escaped_string(" + ARG_W + ", ")
-				}
-				write_output_expr(t.w, node, v)
-				ws(t.w, ") or_return")
-			case 'i', 'd':
-				ws(t.w, RET_N + " += __temple.__temple_write_int(" + ARG_W + ", " if ext else RET_N + " += __temple_write_int(" + ARG_W + ", ")
-				write_output_expr(t.w, node, v, "int")
-				ws(t.w, ") or_return")
-			case 'f':
-				ws(t.w, RET_N + " += __temple.__temple_write_f64_prec(" + ARG_W + ", " if ext else RET_N + " += __temple_write_f64_prec(" + ARG_W + ", ")
-				write_output_expr(t.w, node, v, "f64")
-				ws(t.w, ", ")
-				write_fast_uint(t.w, spec.float_prec)
-				ws(t.w, ") or_return")
-			}
-			transpile_loc(t, node.open.pos)
-
-			if len(spec.suffix) > 0 {
-				write_newline(t)
-				escaped_suf := spec.suffix if is_raw else escape_html_literal_at_compile_time(spec.suffix, t.allocator)
-				t.approx_bytes += len(escaped_suf)
-				ws(t.w, RET_N + " += " + PKG_IO + ".write_string(" + ARG_W + ", ")
-				write_quoted_fast(t.w, escaped_suf)
-				ws(t.w, ") or_return")
-				transpile_loc(t, node.open.pos)
-			}
-			return
-		}
-	}
-
-	t.approx_bytes += 10
 
 	switch node.write_kind {
 	case .Fmt_Escaped:
@@ -947,13 +724,7 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 	indent(t)
 	write_newline(t)
 
-	approx_start := t.approx_bytes
-	max_approx_bytes: int
-
 	transpile_node_sequence(t, node._if.body[:], false)
-
-	max_approx_bytes = t.approx_bytes - approx_start
-	t.approx_bytes = approx_start
 
 	dedent(t)
 	write_newline(t)
@@ -972,11 +743,6 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 		dedent(t)
 		write_newline(t)
 		ws(t.w, "}")
-
-		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
-		approx_elseif := t.approx_bytes - approx_start
-		t.approx_bytes = approx_start
-		max_approx_bytes = max(max_approx_bytes, approx_elseif)
 	}
 
 	if els, ok := node._else.?; ok {
@@ -988,17 +754,10 @@ transpile_if :: proc(t: ^Transpiler, node: ^Node_If) {
 
 		transpile_node_sequence(t, els.body[:], false)
 
-		// Check if this is the biggest branch in the if statement, and set max approx accordingly.
-		approx_else := t.approx_bytes - approx_start
-		t.approx_bytes = approx_start
-		max_approx_bytes = max(max_approx_bytes, approx_else)
-
 		dedent(t)
 		write_newline(t)
 		ws(t.w, "}")
 	}
-
-	t.approx_bytes += max_approx_bytes
 }
 
 @(private = "package")
@@ -1043,10 +802,7 @@ transpile_for :: proc(t: ^Transpiler, node: ^Node_For) {
 	indent(t)
 	write_newline(t)
 
-	approx_start := t.approx_bytes
 	transpile_node_sequence(t, node.body[:], false)
-	loop_body_bytes := t.approx_bytes - approx_start
-	t.approx_bytes = approx_start + loop_body_bytes * for_loop_approx_multiplier(loop_body_bytes)
 
 	dedent(t)
 	write_newline(t)
@@ -1082,7 +838,8 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 			ws(t.w, prop.name)
 			ws(t.w, ": type_of(__temple_prop_")
 			write_fast_uint(t.w, i)
-			ws(t.w, ")")
+			write_string_closing_paren :: ")"
+			ws(t.w, write_string_closing_paren)
 		}
 		ws(t.w, " }{ ")
 		for prop, i in node.props {
@@ -1100,20 +857,18 @@ transpile_embed :: proc(t: ^Transpiler, node: ^Node_Embed) {
 	}
 
 	if t.embed_parser != nil {
-		prev_macro_names := t.macro_names
-		prev_macro_bytes := t.macro_bytes
-		prev_macro_count := t.macro_count
 		prev_macro_approx := t.macro_approx
-		t.macro_count = 0
+		prev_approx_bytes := t.approx_bytes
 		t.macro_approx = {}
+		t.approx_bytes = 0
 		defer {
-			t.macro_names = prev_macro_names
-			t.macro_bytes = prev_macro_bytes
-			t.macro_count = prev_macro_count
 			t.macro_approx = prev_macro_approx
+			t.approx_bytes = prev_approx_bytes
 		}
 
-		_ = t.embed_parser(t, node, t.embed_data)
+		if t.embed_parser(t, node, t.embed_data) {
+			node.approx_bytes = t.approx_bytes
+		}
 	}
 
 	dedent(t)

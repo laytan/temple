@@ -291,9 +291,7 @@ test_layout_extends_block_and_super :: proc(t: ^testing.T) {
 	{
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		call := Compile_Call{
 			identifier = "page.html",
@@ -314,9 +312,7 @@ test_layout_extends_block_and_super :: proc(t: ^testing.T) {
 	{
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		call := Compile_Call{
 			identifier = "bad_block.html",
@@ -358,9 +354,7 @@ test_embed_error_trace_and_cycle_detection :: proc(t: ^testing.T) {
 	{
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		call := Compile_Call{
 			identifier = "root.html",
@@ -388,9 +382,7 @@ test_embed_error_trace_and_cycle_detection :: proc(t: ^testing.T) {
 	{
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		call := Compile_Call{
 			identifier = "cycle_a.html",
@@ -494,9 +486,7 @@ test_review_regressions :: proc(t: ^testing.T) {
 
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		_, ok_super := compile_single_call(&ctx, Compile_Call{
 			identifier = "child.html",
@@ -507,7 +497,7 @@ test_review_regressions :: proc(t: ^testing.T) {
 
 		// 4. Missing embed diagnostic caret length matches token `"missing.html"` (14 chars), not absolute path,
 		// and subsequent calls in the same worker batch still emit diagnostics (raw_cache does not cache failures).
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		_, ok_b1 := compile_single_call(&ctx, Compile_Call{
 			identifier = "broken1.html",
@@ -519,7 +509,7 @@ test_review_regressions :: proc(t: ^testing.T) {
 			testing.expect_value(t, ctx.diagnostics[0].col_len, len(`"missing.html"`))
 		}
 
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		_, ok_b2 := compile_single_call(&ctx, Compile_Call{
 			identifier = "broken2.html",
@@ -533,9 +523,7 @@ test_review_regressions :: proc(t: ^testing.T) {
 	{
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		call := Compile_Call{
 			pos        = {file = "routes.odin", line = 42, column = 15},
@@ -552,7 +540,7 @@ test_review_regressions :: proc(t: ^testing.T) {
 		}
 
 		// Multiline inline template failing on line 2 (`err.pos.line == 1`)
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		multiline_src := "<div>\n  <span>{{ }}</span>\n</div>"
 		call_ml := Compile_Call{
@@ -675,9 +663,7 @@ test_review_round_two_fixes :: proc(t: ^testing.T) {
 
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		code, ok := compile_single_call(&ctx, Compile_Call{
 			identifier = "child.html",
@@ -690,7 +676,7 @@ test_review_round_two_fixes :: proc(t: ^testing.T) {
 		testing.expect(t, first_idx != -1 && first_idx == last_idx, "expected Default+Extra to be spliced and coalesced exactly once")
 
 		// 2. Broken embed inside parent layout reports parent layout file and snippet, not child file
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		_, ok_err := compile_single_call(&ctx, Compile_Call{
 			identifier = "err_child.html",
@@ -706,7 +692,7 @@ test_review_round_two_fixes :: proc(t: ^testing.T) {
 		}
 
 		// 3. Duplicate block in non-extending base template is caught
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		_, ok_dup := compile_single_call(&ctx, Compile_Call{
 			identifier = "dup_base.html",
@@ -898,9 +884,7 @@ test_review_round_three_fixes :: proc(t: ^testing.T) {
 
 		ctx: Compile_Context
 		ctx.allocator = context.temp_allocator
-		ctx.stack = make([dynamic]Trace_Frame, context.temp_allocator)
 		ctx.diagnostics = make([dynamic]Diagnostic, context.temp_allocator)
-		ctx.raw_cache = make(map[string]Cached_Template, context.temp_allocator)
 
 		_, ok_self := compile_single_call(&ctx, Compile_Call{
 			identifier = "self.html",
@@ -914,7 +898,7 @@ test_review_round_three_fixes :: proc(t: ^testing.T) {
 		}
 
 		// Inline template with orphan super() on line 2 of inline string reports call.pos.line + 1
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		inline_src := "<div>\n  {% block a %}{{ super() }}{% end %}\n</div>"
 		_, ok_inline_sup := compile_single_call(&ctx, Compile_Call{
@@ -932,7 +916,7 @@ test_review_round_three_fixes :: proc(t: ^testing.T) {
 		// Inline template embedding a broken external file adjusts intermediate Embed trace frame line/col
 		broken_ext_path, _ := filepath.join({tmp_dir, "broken_ext.html"}, context.temp_allocator)
 		_ = os.write_entire_file(broken_ext_path, transmute([]byte)string(`{{ }}`))
-		clear(&ctx.stack)
+		clear_trace_frames(&ctx)
 		clear(&ctx.diagnostics)
 		inline_embed_src := "<div>\n  {% embed \"broken_ext.html\" %}\n</div>"
 		routes_fake_path, _ := filepath.join({tmp_dir, "routes.odin"}, context.temp_allocator)

@@ -1309,3 +1309,73 @@ property_lexer_strictly_advances_and_parser_never_panics_on_arbitrary_inputs :: 
 		}
 	}
 }
+
+@(test)
+spec_multi_level_layout_inheritance_does_not_mutate_cached_blocks_or_poison_resolved_cache :: proc(t: ^testing.T) {
+	s := scenario_begin(t)
+	defer scenario_end(s)
+
+	given_template(
+		s,
+		"/app/layouts/base.html",
+		`<html>{% block body %}BASE{% end %}</html>`,
+	)
+	given_template(
+		s,
+		"/app/layouts/section.html",
+		`{% extends "base.html" %}{% block body %}[SECTION:{{ super() }}]{% end %}`,
+	)
+	given_template(
+		s,
+		"/app/views/page_a.html",
+		`{% extends "../layouts/section.html" %}{% block body %}(A:{{ super() }}){% end %}`,
+	)
+	given_template(
+		s,
+		"/app/views/page_b.html",
+		`{% extends "../layouts/section.html" %}{% block body %}(B:{{ super() }}){% end %}`,
+	)
+
+	// 1. Compile the intermediate layout as a standalone root template first
+	upon_compiling_template(s, "/app/layouts/section.html", relpath = "layouts/section.html")
+	then_static_literals_render_in_order(s, {
+		"<html>[SECTION:BASE]</html>",
+	})
+
+	// 2. Compile child template A extending `section.html` in the same Compile_Context
+	upon_compiling_template(s, "/app/views/page_a.html", relpath = "views/page_a.html")
+	then_static_literals_render_in_order(s, {
+		"<html>(A:[SECTION:BASE])</html>",
+	})
+
+	// 3. Compile child template B extending `section.html` in the same Compile_Context
+	//    (must not see mutated `section.html` block body from earlier compilations)
+	upon_compiling_template(s, "/app/views/page_b.html", relpath = "views/page_b.html")
+	then_static_literals_render_in_order(s, {
+		"<html>(B:[SECTION:BASE])</html>",
+	})
+}
+
+@(test)
+spec_collects_top_level_proc_aliases_to_imported_views_packages :: proc(t: ^testing.T) {
+	s := scenario_begin(t)
+	defer scenario_end(s)
+
+	upon_scanning_odin_source(s, `package controllers
+import v "../views"
+
+render_tpl    :: v.compiled
+render_inline :: v.compiled_inline
+
+main :: proc() {
+	_ = render_tpl("users/profile.temple.twig", int)
+	_ = render_inline("<p>{{ this }}</p>", int)
+}
+`)
+
+	then_collected_templates_are(s, {
+		"users/profile.temple.twig",
+		"<p>{{ this }}</p>",
+	})
+}
+

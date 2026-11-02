@@ -14,11 +14,9 @@ Parser :: struct {
 	last_txt_node:  Maybe(^Node_Text),
 	in_block:       int,
 	body_depth:     int,
-	seen_macros:    [16]string,
-	seen_macro_cnt: int,
+	seen_macros:    Small_Array(16, string),
 	dummy_odin_pkg: ast.Package,
-	slab:           []byte,
-	slab_off:       int,
+	slab:           Node_Slab,
 }
 
 Parser_Error :: struct {
@@ -132,6 +130,7 @@ Node_Embed :: struct {
 	origin_src:    []byte,
 	with:          Maybe(^Node_Embed_With),
 	props:         [dynamic]Embed_Prop, // Populated for `{% embed "x.html"(a = 1, b = 2) %}`
+	approx_bytes:  int,
 }
 
 Node_Embed_With :: struct {
@@ -220,27 +219,14 @@ parser_init_bytes :: proc(p: ^Parser, source: []byte, allocator := context.alloc
 	p.allocator = allocator
 	init_cap := clamp(len(source) / 64, 2, 16)
 	p.template.content = make([dynamic]Node, 0, init_cap, allocator)
-	p.seen_macro_cnt = 0
-	p.slab = nil
-	p.slab_off = 0
+	p.seen_macros = {}
+	p.slab = {}
 }
 
 @(private = "file")
 alloc_parser_node :: proc(p: ^Parser, $T: typeid) -> ^T {
-	align :: int(align_of(T))
-	size :: int(size_of(T))
-	off := (p.slab_off + (align - 1)) & ~(align - 1)
-	if off + size > len(p.slab) {
-		slab_bytes := clamp(len(p.lexer.source) * 2 + 512, 512, 4096)
-		if slab_bytes < size + align {
-			slab_bytes = size + align
-		}
-		p.slab = make([]byte, slab_bytes, p.allocator)
-		off = 0
-	}
-	res := cast(^T)&p.slab[off]
-	p.slab_off = off + size
-	return res
+	slab_bytes := clamp(len(p.lexer.source) * 2 + 512, 512, 4096)
+	return slab_alloc_node(&p.slab, T, p.allocator, slab_bytes)
 }
 
 @(private = "file")
@@ -1294,8 +1280,8 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		return error(p, name_pos, "invalid macro name %q, expected a valid identifier", name)
 	}
 
-	for i in 0 ..< p.seen_macro_cnt {
-		if p.seen_macros[i] == name {
+	for prev_name in small_array_slice(&p.seen_macros) {
+		if prev_name == name {
 			return error(p, name_pos, "duplicate macro definition %q in template", name)
 		}
 	}
@@ -1374,10 +1360,7 @@ validate_macro_signature :: proc(p: ^Parser, tok: Token, out_node: ^Node_Macro) 
 		}
 	}
 
-	if p.seen_macro_cnt < len(p.seen_macros) {
-		p.seen_macros[p.seen_macro_cnt] = name
-		p.seen_macro_cnt += 1
-	}
+	small_array_append(&p.seen_macros, name, p.allocator)
 	out_node.name = name
 	if proc_type.params != nil && len(proc_type.params.list) > 0 {
 		close_paren_off := proc_type.end.offset - 1
@@ -1627,29 +1610,19 @@ check_macro_call_node :: proc(
 	return {}, 0, "", true
 }
 
-@(private = "file")
-validate_standalone_macro_calls :: proc(p: ^Parser) {
-	inline_macros: [16]^Node_Macro
-	macro_count := 0
-	var_macros: [dynamic]^Node_Macro
-
-	for node in p.template.content {
+collect_top_level_macros :: proc(nodes: []Node, out: ^Small_Array(16, ^Node_Macro), allocator: mem.Allocator) -> []^Node_Macro {
+	for node in nodes {
 		if mac, is_mac := node.derived.(^Node_Macro); is_mac {
-			if macro_count < len(inline_macros) {
-				inline_macros[macro_count] = mac
-				macro_count += 1
-			} else {
-				if var_macros == nil {
-					var_macros = make([dynamic]^Node_Macro, 0, macro_count * 2, p.allocator)
-					for m in inline_macros {
-						append(&var_macros, m)
-					}
-				}
-				append(&var_macros, mac)
-			}
+			small_array_append(out, mac, allocator)
 		}
 	}
-	macros_slice := var_macros[:] if var_macros != nil else inline_macros[:macro_count]
+	return small_array_slice(out)
+}
+
+@(private = "file")
+validate_standalone_macro_calls :: proc(p: ^Parser) {
+	macros_arr: Small_Array(16, ^Node_Macro)
+	macros_slice := collect_top_level_macros(p.template.content[:], &macros_arr, p.allocator)
 	_ = validate_calls_in_parser_nodes(p, p.template.content[:], macros_slice)
 }
 
@@ -1659,31 +1632,26 @@ validate_calls_in_parser_nodes :: proc(
 	nodes: []Node,
 	macros: []^Node_Macro,
 ) -> bool {
+	Walk_State :: struct {
+		p:      ^Parser,
+		macros: []^Node_Macro,
+	}
+	state := Walk_State{p, macros}
+	visit_cb :: proc(body: []Node, user_data: rawptr) -> bool {
+		s := cast(^Walk_State)user_data
+		return validate_calls_in_parser_nodes(s.p, body, s.macros)
+	}
+
 	for node in nodes {
-		switch d in node.derived {
+		#partial switch d in node.derived {
 		case ^Node_Call:
 			if err_pos, _, err_msg, ok := check_macro_call_node(d, macros, p.allocator); !ok {
 				return error(p, err_pos, "%s", err_msg)
 			}
 		case ^Node_Block:
 			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
-		case ^Node_Macro:
-			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
-		case ^Node_If:
-			validate_calls_in_parser_nodes(p, d._if.body[:], macros) or_return
-			for ef in d.elseifs {
-				validate_calls_in_parser_nodes(p, ef.body[:], macros) or_return
-			}
-			if els, ok := d._else.?; ok {
-				validate_calls_in_parser_nodes(p, els.body[:], macros) or_return
-			}
-		case ^Node_For:
-			validate_calls_in_parser_nodes(p, d.body[:], macros) or_return
-		case ^Node_Switch:
-			for c in d.cases {
-				validate_calls_in_parser_nodes(p, c.body[:], macros) or_return
-			}
-		case ^Node_Text, ^Node_Output, ^Node_Let, ^Node_Embed, ^Node_Extends, ^Node_Super:
+		case:
+			walk_branch_children(node, &state, visit_cb) or_return
 		}
 	}
 	return true
@@ -2263,6 +2231,28 @@ is_simple_value_expr :: proc(s: string) -> bool {
 }
 
 @(private = "file")
+filter_name_to_write_kind :: proc(name: string) -> (kind: Output_Write_Kind, is_wrap: bool, ok: bool) {
+	switch name {
+	case "raw":        return .Raw_String, false, true
+	case "magic":      return .Magic_String, false, true
+	case "url":        return .Url_String, false, true
+	case "url_param":  return .Url_Param_String, false, true
+	case "js", "json": return .Js_String, false, true
+	case "byte":       return .Byte, true, true
+	case "rune":       return .Rune, true, true
+	case "int", "len": return .Int, true, true
+	case "uint":       return .Uint, true, true
+	case "i128":       return .I128, true, true
+	case "u128":       return .U128, true, true
+	case "u64":        return .U64, true, true
+	case "i64":        return .I64, true, true
+	case "f32":        return .F32, true, true
+	case "f64":        return .F64, true, true
+	}
+	return .Escaped_String, false, false
+}
+
+@(private = "file")
 try_fast_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output, trimmed: string) -> (matched: bool, is_super: bool) {
 	if trimmed == "super()" {
 		return true, true
@@ -2281,36 +2271,12 @@ try_fast_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output, trimmed: s
 			second_pipe := strings.index_byte(rhs, '|')
 			if second_pipe == -1 {
 				if is_valid_non_keyword_ident(rhs) {
-					switch rhs {
-					case "raw":
-						node.write_kind = .Raw_String
+					if kind, is_wrap, ok := filter_name_to_write_kind(rhs); ok {
+						node.write_kind = kind
 						node.inner_expr = lhs
-						return true, false
-					case "magic":
-						node.write_kind = .Magic_String
-						node.inner_expr = lhs
-						return true, false
-					case "url":
-						node.write_kind = .Url_String
-						node.inner_expr = lhs
-						return true, false
-					case "url_param":
-						node.write_kind = .Url_Param_String
-						node.inner_expr = lhs
-						return true, false
-					case "js", "json":
-						node.write_kind = .Js_String
-						node.inner_expr = lhs
-						return true, false
-					case "len":
-						node.write_kind = .Int
-						node.inner_expr = lhs
-						node.wrap_call = "len"
-						return true, false
-					case "int", "uint", "i64", "u64", "i128", "u128", "f32", "f64", "byte", "rune":
-						node.write_kind = cast_name_to_write_kind(rhs)
-						node.inner_expr = lhs
-						node.wrap_call = rhs
+						if is_wrap {
+							node.wrap_call = rhs
+						}
 						return true, false
 					}
 				} else if strings.has_prefix(rhs, "default(") && rhs[len(rhs) - 1] == ')' {
@@ -2338,37 +2304,13 @@ try_fast_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output, trimmed: s
 						def_arg := strings.trim_space(stage1[8 : len(stage1) - 1])
 						if is_simple_clean_string_literal(def_arg) || is_simple_selector_expr(def_arg) {
 							if is_valid_non_keyword_ident(stage2) {
-								switch stage2 {
-								case "raw":
-									node.write_kind = .Raw_String
+								if kind, is_wrap, ok := filter_name_to_write_kind(stage2); ok && (!is_wrap || stage2 == "len") {
+									node.write_kind = kind
 									node.inner_expr = lhs
 									node.default_arg = def_arg
-									return true, false
-								case "magic":
-									node.write_kind = .Magic_String
-									node.inner_expr = lhs
-									node.default_arg = def_arg
-									return true, false
-								case "url":
-									node.write_kind = .Url_String
-									node.inner_expr = lhs
-									node.default_arg = def_arg
-									return true, false
-								case "url_param":
-									node.write_kind = .Url_Param_String
-									node.inner_expr = lhs
-									node.default_arg = def_arg
-									return true, false
-								case "js", "json":
-									node.write_kind = .Js_String
-									node.inner_expr = lhs
-									node.default_arg = def_arg
-									return true, false
-								case "len":
-									node.write_kind = .Int
-									node.inner_expr = lhs
-									node.default_arg = def_arg
-									node.wrap_call = "len"
+									if is_wrap {
+										node.wrap_call = stage2
+									}
 									return true, false
 								}
 							}
@@ -2393,30 +2335,9 @@ try_fast_classify_output_expr :: proc(p: ^Parser, node: ^Node_Output, trimmed: s
 		fn_name := trimmed[:open_p]
 		arg := strings.trim_space(trimmed[open_p + 1 : len(trimmed) - 1])
 		if is_simple_value_expr(arg) {
-			switch fn_name {
-			case "byte", "rune", "int", "len", "uint", "i128", "u128", "u64", "i64", "f32", "f64":
-				node.write_kind = cast_name_to_write_kind(fn_name)
-				node.inner_expr = trimmed
-				return true, false
-			case "raw":
-				node.write_kind = .Raw_String
-				node.inner_expr = arg
-				return true, false
-			case "magic":
-				node.write_kind = .Magic_String
-				node.inner_expr = arg
-				return true, false
-			case "url":
-				node.write_kind = .Url_String
-				node.inner_expr = arg
-				return true, false
-			case "url_param":
-				node.write_kind = .Url_Param_String
-				node.inner_expr = arg
-				return true, false
-			case "js", "json":
-				node.write_kind = .Js_String
-				node.inner_expr = arg
+			if kind, is_wrap, ok := filter_name_to_write_kind(fn_name); ok {
+				node.write_kind = kind
+				node.inner_expr = trimmed if is_wrap else arg
 				return true, false
 			}
 		}
@@ -2535,34 +2456,16 @@ classify_output_ast :: proc(
 
 		// Bare identifier filter: `{{ this.html | raw }}`, `{{ this.title | magic }}`, `{{ this.link | url }}`, `{{ this.q | url_param }}`, `{{ this.payload | js }}`, `{{ this.items | len }}`
 		if ident, is_ident := rhs.derived_expr.(^ast.Ident); is_ident {
-			switch ident.name {
-			case "raw":
-				node.write_kind = .Fmt_Raw if node.write_kind == .Fmt_Escaped else .Raw_String
+			if kind, is_wrap, ok := filter_name_to_write_kind(ident.name); ok {
+				if kind == .Raw_String && node.write_kind == .Fmt_Escaped {
+					node.write_kind = .Fmt_Raw
+				} else {
+					node.write_kind = kind
+				}
 				node.inner_expr = effective_lhs
-				return false, true
-			case "magic":
-				node.write_kind = .Magic_String
-				node.inner_expr = effective_lhs
-				return false, true
-			case "url":
-				node.write_kind = .Url_String
-				node.inner_expr = effective_lhs
-				return false, true
-			case "url_param":
-				node.write_kind = .Url_Param_String
-				node.inner_expr = effective_lhs
-				return false, true
-			case "js", "json":
-				node.write_kind = .Js_String
-				node.inner_expr = effective_lhs
-				return false, true
-			case "len":
-				node.write_kind = .Int
-				node.inner_expr = fmt.aprintf("len(%s)", effective_lhs, allocator = p.allocator)
-				return false, true
-			case "int", "uint", "i64", "u64", "i128", "u128", "f32", "f64", "byte", "rune":
-				node.write_kind = cast_name_to_write_kind(ident.name)
-				node.inner_expr = fmt.aprintf("%s(%s)", ident.name, effective_lhs, allocator = p.allocator)
+				if is_wrap {
+					node.wrap_call = ident.name
+				}
 				return false, true
 			}
 		}
@@ -2594,12 +2497,17 @@ classify_output_ast :: proc(
 						)
 					}
 					fallback_str := strip_trailing_comma_and_comments(raw_src[call.open.offset + 1 : call.close.offset])
-					node.inner_expr = fmt.aprintf(
-						"__temple_default(%s, %s)",
-						effective_lhs,
-						fallback_str,
-						allocator = p.allocator,
-					)
+					if len(node.default_arg) == 0 && len(node.wrap_call) == 0 {
+						node.inner_expr = effective_lhs
+						node.default_arg = fallback_str
+					} else {
+						node.inner_expr = fmt.aprintf(
+							"__temple_default(%s, %s)",
+							effective_lhs,
+							fallback_str,
+							allocator = p.allocator,
+						)
+					}
 					return false, true
 				}
 			}
@@ -2645,14 +2553,7 @@ classify_output_ast :: proc(
 						len(call.args),
 					)
 				}
-				target_kind: Output_Write_Kind
-				switch ident.name {
-				case "raw":        target_kind = .Raw_String
-				case "magic":      target_kind = .Magic_String
-				case "url":        target_kind = .Url_String
-				case "url_param":  target_kind = .Url_Param_String
-				case "js", "json": target_kind = .Js_String
-				}
+				target_kind, _, _ := filter_name_to_write_kind(ident.name)
 				arg_expr := call.args[0]
 				node.inner_expr = strip_trailing_comma_and_comments(raw_src[call.open.offset + 1 : call.close.offset])
 				arg_is_super, arg_ok := classify_output_ast(p, node, raw_src, arg_expr)
@@ -2706,12 +2607,8 @@ classify_output_ast :: proc(
 				second_arg := call.args[1]
 				val_str := strip_trailing_comma_and_comments(raw_src[first_arg.pos.offset : second_arg.pos.offset])
 				fallback_str := strip_trailing_comma_and_comments(raw_src[second_arg.pos.offset : call.close.offset])
-				node.inner_expr = fmt.aprintf(
-					"__temple_default(%s, %s)",
-					val_str,
-					fallback_str,
-					allocator = p.allocator,
-				)
+				node.inner_expr = val_str
+				node.default_arg = fallback_str
 				return false, true
 			case "byte", "rune", "int", "len", "uint", "i128", "u128", "u64", "i64", "f32", "f64":
 				if len(call.args) != 1 {
@@ -2723,29 +2620,12 @@ classify_output_ast :: proc(
 						len(call.args),
 					)
 				}
-				node.write_kind = cast_name_to_write_kind(ident.name)
+				node.write_kind, _, _ = filter_name_to_write_kind(ident.name)
 			}
 		}
 	}
 
 	return false, true
-}
-
-@(private = "file")
-cast_name_to_write_kind :: proc(name: string) -> Output_Write_Kind {
-	switch name {
-	case "byte":       return .Byte
-	case "rune":       return .Rune
-	case "int", "len": return .Int
-	case "uint":       return .Uint
-	case "i128":       return .I128
-	case "u128":       return .U128
-	case "u64":        return .U64
-	case "i64":        return .I64
-	case "f32":        return .F32
-	case "f64":        return .F64
-	}
-	return .Escaped_String
 }
 
 @(private = "file")

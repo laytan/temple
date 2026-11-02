@@ -1,0 +1,460 @@
+package temple_cli
+
+import "core:fmt"
+import "core:mem"
+import "core:odin/tokenizer"
+import "core:os"
+import "core:path/filepath"
+import "core:slice"
+import "core:strings"
+
+VERSION :: "1.0.0"
+
+Cli_Options :: struct {
+	project_dir:   string,
+	temple_dir:    string,
+	out_file:      string,
+	pkg_name:      string,
+	temple_import: string,
+	check_only:    bool,
+	warn_unused:   bool,
+	watch:         bool,
+	show_version:  bool,
+}
+
+parse_cli_flag_kv :: proc(arg: string) -> (key: string, val: string, is_flag: bool, has_val: bool) {
+	if !strings.has_prefix(arg, "-") {
+		return "", "", false, false
+	}
+	trimmed := strings.trim_left(arg, "-")
+	for i in 0 ..< len(trimmed) {
+		if trimmed[i] == ':' || trimmed[i] == '=' {
+			return trimmed[:i], trimmed[i+1:], true, true
+		}
+	}
+	return trimmed, "", true, false
+}
+
+is_abs_slash_path :: proc(path: string) -> bool {
+	if strings.has_prefix(path, "/") || strings.has_prefix(path, "\\") {
+		return true
+	}
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\') {
+		return true
+	}
+	return filepath.is_abs(path)
+}
+
+slice_file_dir :: proc(file: string) -> string {
+	if slash_idx := strings.last_index_any(file, "/\\"); slash_idx != -1 {
+		if slash_idx == 0 {
+			return file[:1]
+		}
+		return file[:slash_idx]
+	}
+	return "."
+}
+
+clean_slash_path :: proc(path: string, allocator := context.temp_allocator) -> string {
+	norm := normalize_slash_path(path, allocator)
+	if len(norm) == 0 {
+		return "."
+	}
+	if !strings.contains(norm, "/.") && !strings.has_prefix(norm, "./") && !strings.has_prefix(norm, "../") && norm != "." && norm != ".." {
+		if len(norm) > 1 && norm[len(norm)-1] == '/' {
+			if !(len(norm) == 3 && norm[1] == ':' && norm[2] == '/') {
+				return norm[:len(norm)-1]
+			}
+		}
+		return norm
+	}
+
+	prefix := ""
+	rest := norm
+	if len(rest) >= 2 && rest[1] == ':' {
+		if len(rest) >= 3 && rest[2] == '/' {
+			prefix = rest[:3]
+			rest = rest[3:]
+		} else {
+			prefix = rest[:2]
+			rest = rest[2:]
+		}
+	} else if strings.has_prefix(rest, "/") {
+		prefix = "/"
+		rest = rest[1:]
+	}
+	rooted := strings.has_suffix(prefix, "/")
+
+	segs_arr: Small_Array(64, string)
+
+	start := 0
+	for i := 0; i <= len(rest); i += 1 {
+		if i == len(rest) || rest[i] == '/' {
+			part := rest[start:i]
+			start = i + 1
+			if len(part) == 0 || part == "." {
+				continue
+			}
+			if part == ".." {
+				cur := small_array_slice(&segs_arr)
+				if len(cur) > 0 && cur[len(cur) - 1] != ".." {
+					small_array_pop(&segs_arr)
+				} else if !rooted {
+					small_array_append(&segs_arr, "..", allocator)
+				}
+				continue
+			}
+			small_array_append(&segs_arr, part, allocator)
+		}
+	}
+
+	segs := small_array_slice(&segs_arr)
+	if len(segs) == 0 {
+		if len(prefix) > 0 {
+			return prefix
+		}
+		return "."
+	}
+
+	total_len := len(prefix) + len(segs) - 1
+	for s in segs {
+		total_len += len(s)
+	}
+	sb := strings.builder_make(0, total_len, allocator)
+	strings.write_string(&sb, prefix)
+	for s, idx in segs {
+		if idx > 0 {
+			strings.write_byte(&sb, '/')
+		}
+		strings.write_string(&sb, s)
+	}
+	return strings.to_string(sb)
+}
+
+join_relative_slash_path :: proc(origin_file, rel_path: string, allocator := context.temp_allocator) -> string {
+	if !strings.has_prefix(rel_path, ".") && !strings.contains(rel_path, "/.") && !strings.contains(rel_path, "\\") {
+		if slash_idx := strings.last_index_any(origin_file, "/\\"); slash_idx != -1 {
+			dir_prefix := origin_file[:slash_idx + 1]
+			return normalize_slash_path(strings.concatenate({dir_prefix, rel_path}, allocator), allocator)
+		}
+		return rel_path
+	}
+	base_dir := slice_file_dir(origin_file)
+	if base_dir == "." {
+		return clean_slash_path(rel_path, allocator)
+	}
+	if base_dir == "/" || base_dir == "\\" {
+		return clean_slash_path(strings.concatenate({"/", rel_path}, allocator), allocator)
+	}
+	return clean_slash_path(strings.concatenate({base_dir, "/", rel_path}, allocator), allocator)
+}
+
+normalize_slash_path :: proc(path: string, allocator := context.temp_allocator) -> string {
+	if len(path) == 0 {
+		return ""
+	}
+	needs_norm := false
+	for i in 0 ..< len(path) {
+		c := path[i]
+		if c == '\\' || (c == '/' && i + 1 < len(path) && path[i + 1] == '/') {
+			needs_norm = true
+			break
+		}
+	}
+	if !needs_norm {
+		return path
+	}
+	sb := strings.builder_make(0, len(path), allocator)
+	prev_slash := false
+	for i in 0 ..< len(path) {
+		c := path[i]
+		if c == '\\' {
+			c = '/'
+		}
+		if c == '/' {
+			if prev_slash {
+				continue
+			}
+			prev_slash = true
+		} else {
+			prev_slash = false
+		}
+		strings.write_byte(&sb, c)
+	}
+	return strings.to_string(sb)
+}
+
+normalize_line_endings_lf :: proc(s: string, allocator := context.temp_allocator) -> string {
+	if strings.index_byte(s, '\r') == -1 {
+		return s
+	}
+	res, _ := strings.replace_all(s, "\r\n", "\n", allocator)
+	return res
+}
+
+is_generated_temple_source :: proc(src: string) -> bool {
+	trimmed := strings.trim_left_space(src)
+	return strings.has_prefix(trimmed, "/* This file was generated by temple on ") ||
+		strings.has_prefix(trimmed, "/* This file is generated by temple - DO NOT EDIT! */")
+}
+
+infer_package_from_odin_source :: proc(src: string, allocator := context.temp_allocator) -> (string, bool) {
+	t: tokenizer.Tokenizer
+	tokenizer.init(&t, src, "infer.odin", odin_silent_err_handler)
+	tok := tokenizer.scan(&t)
+	if tok.kind != .Package {
+		return "", false
+	}
+	name_tok := tokenizer.scan(&t)
+	if name_tok.kind != .Ident || len(name_tok.text) == 0 {
+		return "", false
+	}
+	return strings.clone(name_tok.text, allocator), true
+}
+
+is_valid_odin_pkg_ident :: proc(s: string) -> bool {
+	return is_valid_block_ident(s) && s != "_"
+}
+
+sanitize_package_ident :: proc(raw: string, allocator := context.temp_allocator) -> (string, bool) {
+	trimmed := strings.trim_space(raw)
+	if len(trimmed) == 0 {
+		return "", false
+	}
+
+	sb := strings.builder_make(0, len(trimmed) + 1, allocator)
+	if trimmed[0] >= '0' && trimmed[0] <= '9' {
+		strings.write_byte(&sb, '_')
+	}
+
+	has_alnum := false
+	for i in 0 ..< len(trimmed) {
+		c := trimmed[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			has_alnum = true
+			strings.write_byte(&sb, c)
+		} else {
+			strings.write_byte(&sb, '_')
+		}
+	}
+
+	res := strings.to_string(sb)
+	if !has_alnum || !is_valid_odin_pkg_ident(res) {
+		return "", false
+	}
+	return res, true
+}
+
+should_skip_walk_dir :: proc(name: string) -> bool {
+	if strings.has_prefix(name, ".") {
+		return true
+	}
+	switch name {
+	case "vendor", "node_modules", "build", "bin", "dist":
+		return true
+	}
+	return false
+}
+
+walk_project_tree :: proc(
+	root_dir: string,
+	user_data: rawptr,
+	visit: proc(info: os.File_Info, user_data: rawptr),
+	warn_on_error := false,
+) {
+	w := filepath.walker_create(root_dir)
+	defer filepath.walker_destroy(&w)
+
+	for info in filepath.walker_walk(&w) {
+		if path, err := filepath.walker_error(&w); err != nil {
+			if warn_on_error {
+				warn(nil, "%q error: %v", path, err)
+			}
+			continue
+		}
+		if info.type == .Directory && info.fullpath != root_dir && should_skip_walk_dir(info.name) {
+			filepath.walker_skip_dir(&w)
+			continue
+		}
+		visit(info, user_data)
+	}
+
+	if warn_on_error {
+		if path, err := filepath.walker_error(&w); err != nil {
+			warn(nil, "%q error: %v", path, err)
+		}
+	}
+}
+
+infer_package_from_dir :: proc(
+	dir_path: string,
+	exclude_file := "",
+	allocator := context.temp_allocator,
+) -> (
+	string,
+	bool,
+) {
+	prev_alloc := context.allocator
+	context.allocator = allocator
+	defer context.allocator = prev_alloc
+
+	exclude_base := filepath.base(exclude_file) if len(exclude_file) > 0 else ""
+
+	if dir_handle, open_err := os.open(dir_path); open_err == nil {
+		entries, read_err := os.read_dir(dir_handle, -1, allocator)
+		os.close(dir_handle)
+		if read_err == nil && len(entries) > 0 {
+			matches := make([dynamic]string, 0, len(entries), allocator)
+			for entry in entries {
+				if entry.type != .Directory && strings.has_suffix(entry.name, ".odin") {
+					if entry.name == "templates.odin" || (len(exclude_base) > 0 && entry.name == exclude_base) {
+						continue
+					}
+					append(&matches, entry.fullpath)
+				}
+			}
+			slice.sort(matches[:])
+			for match in matches {
+				if data, rerr := os.read_entire_file(match, allocator); rerr == nil {
+					src := string(data)
+					if is_generated_temple_source(src) {
+						continue
+					}
+					if pkg_name, ok := infer_package_from_odin_source(src, allocator); ok {
+						return pkg_name, true
+					}
+				}
+			}
+		}
+	}
+
+	base := filepath.base(dir_path)
+	if len(base) > 0 && base != "." && base != ".." && base != "/" && base != "\\" {
+		return sanitize_package_ident(base, allocator)
+	}
+	return "", false
+}
+
+parse_cli_args :: proc(
+	args: []string,
+	allocator := context.temp_allocator,
+) -> (
+	opts: Cli_Options,
+	err_msg: string,
+	ok: bool,
+) {
+	prev_alloc := context.allocator
+	context.allocator = allocator
+	defer context.allocator = prev_alloc
+
+	if len(args) == 2 && (args[1] == "--version" || args[1] == "-v") {
+		opts.show_version = true
+		return opts, "", true
+	}
+
+	positionals := make([dynamic]string, 0, 2, allocator)
+
+	idx := 1
+	for idx < len(args) {
+		arg := args[idx]
+		idx += 1
+
+		if arg == "--version" || arg == "-v" {
+			opts.show_version = true
+			return opts, "", true
+		}
+
+		key, val, is_flag, has_val := parse_cli_flag_kv(arg)
+		if is_flag {
+			// Support PowerShell / space-separated flag values when `-out:` is split into `-out:` `<val>` or `-out` `<val>`
+			if (!has_val || len(val) == 0) && (key == "out" || key == "pkg" || key == "temple-import") {
+				if idx < len(args) && !strings.has_prefix(args[idx], "-") {
+					val = args[idx]
+					has_val = true
+					idx += 1
+				}
+			}
+
+			switch key {
+			case "out":
+				if !has_val || len(val) == 0 {
+					return opts, "flag `-out` requires a non-empty file path (e.g. `-out:views/templates.odin`)", false
+				}
+				opts.out_file = val
+			case "pkg":
+				if !has_val || len(val) == 0 {
+					return opts, "flag `-pkg` requires a non-empty package name (e.g. `-pkg:views`)", false
+				}
+				if !is_valid_odin_pkg_ident(val) {
+					return opts, fmt.aprintf("invalid package name %q for `-pkg`: must be a valid Odin identifier", val, allocator = allocator), false
+				}
+				opts.pkg_name = val
+			case "temple-import":
+				if !has_val || len(val) == 0 {
+					return opts, "flag `-temple-import` requires a non-empty import path (e.g. `-temple-import:shared:temple`)", false
+				}
+				opts.temple_import = val
+			case "check":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--check` does not take a value", false
+				}
+				opts.check_only = !has_val || val == "true"
+			case "warn-unused":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--warn-unused` does not take a value", false
+				}
+				opts.warn_unused = !has_val || val == "true"
+			case "watch":
+				if has_val && val != "true" && val != "false" {
+					return opts, "flag `--watch` does not take a value", false
+				}
+				opts.watch = !has_val || val == "true"
+			case:
+				return opts, fmt.aprintf("unknown CLI flag %q", arg, allocator = allocator), false
+			}
+		} else {
+			append(&positionals, arg)
+		}
+	}
+
+	if opts.check_only && opts.watch {
+		return opts, "flags `--check` and `--watch` cannot be used together", false
+	}
+
+	if len(positionals) == 0 {
+		return opts, "You need to pass a path and the path to temple (or `-out:<file>`)", false
+	}
+
+	opts.project_dir = positionals[0]
+	if len(positionals) >= 2 {
+		opts.temple_dir = positionals[1]
+	}
+
+	if len(opts.out_file) == 0 {
+		if len(opts.temple_dir) == 0 {
+			return opts, "You need to pass a path and the path to temple (or `-out:<file>`)", false
+		}
+		joined_out, _ := filepath.join({opts.temple_dir, "templates.odin"}, allocator)
+		opts.out_file = normalize_slash_path(joined_out, allocator)
+	}
+
+	if len(opts.pkg_name) == 0 {
+		default_temple_out := normalize_slash_path(fmt.aprintf("%s/templates.odin", opts.temple_dir, allocator = allocator), allocator)
+		if len(opts.temple_dir) > 0 && normalize_slash_path(opts.out_file, allocator) == default_temple_out {
+			opts.pkg_name = "temple"
+		} else {
+			out_dir := filepath.dir(opts.out_file)
+			if inferred, inf_ok := infer_package_from_dir(out_dir, opts.out_file, allocator); inf_ok {
+				opts.pkg_name = inferred
+			} else {
+				opts.pkg_name = "temple"
+			}
+		}
+	}
+
+	if opts.pkg_name != "temple" && len(opts.temple_import) == 0 {
+		opts.temple_import = "shared:temple"
+	}
+
+	return opts, "", true
+}

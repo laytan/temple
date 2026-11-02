@@ -33,9 +33,6 @@ driver_init :: proc(t: ^testing.T) -> ^Spec_Driver {
 
 	d.pkg_name = "temple"
 	d.ctx.allocator = d.alloc
-	d.ctx.stack = make([dynamic]Trace_Frame, d.alloc)
-	d.ctx.raw_cache = make(map[string]Cached_Template, d.alloc)
-	d.ctx.resolved_cache = make(map[string]Template, d.alloc)
 	d.ctx.used_files = make(map[string]bool, d.alloc)
 	d.ctx.diagnostics = make([dynamic]Diagnostic, d.alloc)
 	d.seeded_files = make([dynamic]string, d.alloc)
@@ -54,15 +51,15 @@ driver_seed_template :: proc(d: ^Spec_Driver, fullpath: string, content: string)
 	parser_init(&p, raw, d.alloc)
 	parsed := parse(&p)
 	cloned_path := strings.clone(fullpath, d.alloc)
-	d.ctx.raw_cache[cloned_path] = Cached_Template{
+	cache_raw_template(&d.ctx, cloned_path, Cached_Template{
 		source   = raw,
 		template = parsed,
-	}
+	})
 	append(&d.seeded_files, cloned_path)
 }
 
 driver_compile_path :: proc(d: ^Spec_Driver, fullpath, relpath, odin_file: string, line, col: int) {
-	clear(&d.ctx.stack)
+	clear_trace_frames(&d.ctx)
 	clear(&d.ctx.diagnostics)
 
 	call := Compile_Call{
@@ -77,7 +74,7 @@ driver_compile_path :: proc(d: ^Spec_Driver, fullpath, relpath, odin_file: strin
 }
 
 driver_compile_inline :: proc(d: ^Spec_Driver, inline_src, odin_file: string, line, col: int) {
-	clear(&d.ctx.stack)
+	clear_trace_frames(&d.ctx)
 	clear(&d.ctx.diagnostics)
 
 	call := Compile_Call{
