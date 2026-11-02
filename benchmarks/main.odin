@@ -534,12 +534,10 @@ main :: proc() {
 			dash_t := temple_cli.parse(&p_dash)
 			init_ctx: temple_cli.Compile_Context
 			init_ctx.allocator = context.allocator
-			init_ctx.stack = make([dynamic]temple_cli.Trace_Frame, context.allocator)
-			init_ctx.raw_cache = make(map[string]temple_cli.Cached_Template, context.allocator)
-			init_ctx.raw_cache[layout_path] = temple_cli.Cached_Template{
+			temple_cli.cache_raw_template(&init_ctx, layout_path, temple_cli.Cached_Template{
 				source   = layout_bytes,
 				template = g_cached_parent_templ,
-			}
+			})
 			g_cached_resolved_dash, _ = temple_cli.resolve_template_inheritance(&init_ctx, dash_t, dash_bytes, dash_path)
 		}
 
@@ -884,7 +882,6 @@ bench_cli_inheritance_resolve :: proc() -> int {
 
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_layout_path, temple_cli.Cached_Template{
 		source   = g_layout_bytes,
 		template = g_cached_parent_templ,
@@ -903,7 +900,6 @@ bench_cli_transpile :: proc() -> int {
 
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_layout_path, temple_cli.Cached_Template{
 		source   = g_layout_bytes,
 		template = g_cached_parent_templ,
@@ -924,7 +920,6 @@ bench_cli_3level_inheritance :: proc() -> int {
 
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_layout_path, temple_cli.Cached_Template{
 		source   = g_layout_bytes,
 		template = g_cached_parent_templ,
@@ -959,7 +954,6 @@ bench_cli_pure_transpile_loc_off :: proc() -> int {
 bench_cli_batch_compile_3 :: proc() -> int {
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_layout_path, temple_cli.Cached_Template{
 		source   = g_layout_bytes,
 		template = g_cached_parent_templ,
@@ -1001,7 +995,6 @@ bench_cli_embed_props_transpile :: proc() -> int {
 
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_badge_path, temple_cli.Cached_Template{
 		source   = g_badge_bytes,
 		template = g_cached_badge_templ,
@@ -1052,7 +1045,6 @@ bench_cli_parse_complex_ast :: proc() -> int {
 bench_cli_multiframe_diagnostic :: proc() -> int {
 	ctx: temple_cli.Compile_Context
 	ctx.allocator = context.temp_allocator
-	ctx.stack.allocator = context.temp_allocator
 	ctx.diagnostics.allocator = context.temp_allocator
 	temple_cli.cache_raw_template(&ctx, g_layout_path, temple_cli.Cached_Template{
 		source   = g_layout_bytes,

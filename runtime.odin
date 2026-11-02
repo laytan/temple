@@ -42,25 +42,20 @@ HTML_ESCAPE_ENTITIES := [6]string{
 }
 
 @(private = "file")
-__Temple_Escape_Buf :: struct {
-	buf: [256]byte,
-	len: int,
-}
-
-@(private = "file")
-__temple_escape_buf_init :: #force_inline proc(
-	eb: ^__Temple_Escape_Buf,
+__temple_escape_init_prefix :: #force_inline proc(
 	w: io.Writer,
+	buf: []byte,
 	str: string,
 	first_esc: int,
 ) -> (
+	buf_len: int,
 	n: int,
 	err: io.Error,
 ) {
 	if first_esc > 0 {
-		if first_esc <= len(eb.buf) / 2 {
-			copy(eb.buf[:], str[:first_esc])
-			eb.len = first_esc
+		if first_esc <= len(buf) / 2 {
+			copy(buf, str[:first_esc])
+			buf_len = first_esc
 		} else {
 			n = io.write_string(w, str[:first_esc]) or_return
 		}
@@ -69,57 +64,23 @@ __temple_escape_buf_init :: #force_inline proc(
 }
 
 @(private = "file")
-__temple_escape_buf_flush :: #force_inline proc(eb: ^__Temple_Escape_Buf, w: io.Writer, n: ^int) -> io.Error {
-	if eb.len > 0 {
-		written, err := io.write_string(w, string(eb.buf[:eb.len]))
-		n^ += written
-		eb.len = 0
-		return err
-	}
-	return nil
-}
-
-@(private = "file")
-__temple_escape_buf_append_str :: #force_inline proc(
-	eb: ^__Temple_Escape_Buf,
-	w: io.Writer,
-	n: ^int,
-	s: string,
-) -> io.Error {
-	if eb.len + len(s) > len(eb.buf) {
-		__temple_escape_buf_flush(eb, w, n) or_return
-	}
-	copy(eb.buf[eb.len:], s)
-	eb.len += len(s)
-	return nil
-}
-
-@(private = "file")
-__temple_escape_buf_append_byte :: #force_inline proc(
-	eb: ^__Temple_Escape_Buf,
-	w: io.Writer,
-	n: ^int,
-	b: byte,
-) -> io.Error {
-	if eb.len + 1 > len(eb.buf) {
-		__temple_escape_buf_flush(eb, w, n) or_return
-	}
-	eb.buf[eb.len] = b
-	eb.len += 1
-	return nil
-}
-
-@(private = "file")
 @(optimization_mode = "favor_size")
 __temple_write_escaped_string_slow :: proc(w: io.Writer, str: string, first_esc: int) -> (n: int, err: io.Error) {
-	eb: __Temple_Escape_Buf
-	n = __temple_escape_buf_init(&eb, w, str, first_esc) or_return
+	esc_buf: [256]byte
+	buf_len: int
+	buf_len, n = __temple_escape_init_prefix(w, esc_buf[:], str, first_esc) or_return
 
 	start := first_esc
 	for start < len(str) {
 		code := HTML_ESCAPE_TABLE[str[start]]
 		if code != 0 {
-			__temple_escape_buf_append_str(&eb, w, &n, HTML_ESCAPE_ENTITIES[code]) or_return
+			ent := HTML_ESCAPE_ENTITIES[code]
+			if buf_len + len(ent) > len(esc_buf) {
+				n += io.write_string(w, string(esc_buf[:buf_len])) or_return
+				buf_len = 0
+			}
+			copy(esc_buf[buf_len:], ent)
+			buf_len += len(ent)
 			start += 1
 			continue
 		}
@@ -129,20 +90,28 @@ __temple_write_escaped_string_slow :: proc(w: io.Writer, str: string, first_esc:
 			stop += 1
 		}
 		run := str[start:stop]
-		if len(run) <= len(eb.buf) - eb.len {
-			copy(eb.buf[eb.len:], run)
-			eb.len += len(run)
-		} else if len(run) <= len(eb.buf) / 2 {
-			__temple_escape_buf_flush(&eb, w, &n) or_return
-			copy(eb.buf[:], run)
-			eb.len = len(run)
+		if len(run) <= len(esc_buf) - buf_len {
+			copy(esc_buf[buf_len:], run)
+			buf_len += len(run)
+		} else if len(run) <= len(esc_buf) / 2 {
+			if buf_len > 0 {
+				n += io.write_string(w, string(esc_buf[:buf_len])) or_return
+				buf_len = 0
+			}
+			copy(esc_buf[:], run)
+			buf_len = len(run)
 		} else {
-			__temple_escape_buf_flush(&eb, w, &n) or_return
+			if buf_len > 0 {
+				n += io.write_string(w, string(esc_buf[:buf_len])) or_return
+				buf_len = 0
+			}
 			n += io.write_string(w, run) or_return
 		}
 		start = stop
 	}
-	__temple_escape_buf_flush(&eb, w, &n) or_return
+	if buf_len > 0 {
+		n += io.write_string(w, string(esc_buf[:buf_len])) or_return
+	}
 	return
 }
 
@@ -534,25 +503,14 @@ __temple_ascii_has_prefix_fold :: proc(s, prefix: string) -> bool {
 
 @(private = "file")
 __temple_is_safe_url :: proc(str: string) -> bool {
-	s := str
-	for len(s) > 0 {
-		switch s[0] {
-		case ' ', '\t', '\n', '\r', '\f':
-			s = s[1:]
-			continue
-		}
-		break
-	}
-	if len(s) >= 2 && s[0] == '/' && s[1] == '\\' {
-		return false
-	}
-
 	colon_idx := -1
-	for i in 0 ..< len(s) {
-		switch s[i] {
+	for i in 0 ..< len(str) {
+		switch str[i] {
 		case '\\':
 			return false
-		case '/', '?', '#':
+		case '/':
+			return !(i + 1 < len(str) && str[i + 1] == '\\')
+		case '?', '#':
 			return true
 		case ':':
 			colon_idx = i
@@ -564,7 +522,15 @@ __temple_is_safe_url :: proc(str: string) -> bool {
 		return true
 	}
 
-	scheme := s[:colon_idx]
+	scheme := str[:colon_idx]
+	for len(scheme) > 0 {
+		switch scheme[0] {
+		case ' ', '\t', '\n', '\r', '\f':
+			scheme = scheme[1:]
+			continue
+		}
+		break
+	}
 	if __temple_ascii_eq_fold(scheme, "http") ||
 	   __temple_ascii_eq_fold(scheme, "https") ||
 	   __temple_ascii_eq_fold(scheme, "mailto") ||
@@ -572,7 +538,7 @@ __temple_is_safe_url :: proc(str: string) -> bool {
 		return true
 	}
 	if __temple_ascii_eq_fold(scheme, "data") {
-		rest := s[colon_idx + 1:]
+		rest := str[colon_idx + 1:]
 		if __temple_ascii_has_prefix_fold(rest, "image/png;") ||
 		   __temple_ascii_has_prefix_fold(rest, "image/gif;") ||
 		   __temple_ascii_has_prefix_fold(rest, "image/jpeg;") ||
@@ -612,24 +578,33 @@ URL_UNRESERVED_TABLE := [256]bool{
 @(optimization_mode = "favor_size")
 __temple_write_url_param_slow :: proc(w: io.Writer, str: string, first_esc: int) -> (n: int, err: io.Error) {
 	hex := "0123456789ABCDEF"
-	eb: __Temple_Escape_Buf
-	n = __temple_escape_buf_init(&eb, w, str, first_esc) or_return
+	pct_buf: [256]byte
+	buf_len: int
+	buf_len, n = __temple_escape_init_prefix(w, pct_buf[:], str, first_esc) or_return
 
 	for i := first_esc; i < len(str); i += 1 {
 		b := str[i]
 		if URL_UNRESERVED_TABLE[b] {
-			__temple_escape_buf_append_byte(&eb, w, &n, b) or_return
-		} else {
-			if eb.len + 3 > len(eb.buf) {
-				__temple_escape_buf_flush(&eb, w, &n) or_return
+			if buf_len + 1 > len(pct_buf) {
+				n += io.write_string(w, string(pct_buf[:buf_len])) or_return
+				buf_len = 0
 			}
-			eb.buf[eb.len + 0] = '%'
-			eb.buf[eb.len + 1] = hex[b >> 4]
-			eb.buf[eb.len + 2] = hex[b & 0x0F]
-			eb.len += 3
+			pct_buf[buf_len] = b
+			buf_len += 1
+		} else {
+			if buf_len + 3 > len(pct_buf) {
+				n += io.write_string(w, string(pct_buf[:buf_len])) or_return
+				buf_len = 0
+			}
+			pct_buf[buf_len + 0] = '%'
+			pct_buf[buf_len + 1] = hex[b >> 4]
+			pct_buf[buf_len + 2] = hex[b & 0x0F]
+			buf_len += 3
 		}
 	}
-	__temple_escape_buf_flush(&eb, w, &n) or_return
+	if buf_len > 0 {
+		n += io.write_string(w, string(pct_buf[:buf_len])) or_return
+	}
 	return
 }
 
@@ -689,48 +664,73 @@ JS_ESCAPE_ENTITIES := [13]string{
 @(optimization_mode = "favor_size")
 __temple_write_js_string_slow :: proc(w: io.Writer, str: string, first_esc: int) -> (n: int, err: io.Error) {
 	hex_lower := "0123456789abcdef"
-	eb: __Temple_Escape_Buf
-	n = __temple_escape_buf_init(&eb, w, str, first_esc) or_return
+	js_buf: [256]byte
+	buf_len: int
+	buf_len, n = __temple_escape_init_prefix(w, js_buf[:], str, first_esc) or_return
 
 	i := first_esc
 	for i < len(str) {
 		c := str[i]
 		code := JS_ESCAPE_TABLE[c]
 		if code == 0 {
-			__temple_escape_buf_append_byte(&eb, w, &n, c) or_return
+			if buf_len + 1 > len(js_buf) {
+				n += io.write_string(w, string(js_buf[:buf_len])) or_return
+				buf_len = 0
+			}
+			js_buf[buf_len] = c
+			buf_len += 1
 			i += 1
 			continue
 		}
 		if code <= 12 {
-			__temple_escape_buf_append_str(&eb, w, &n, JS_ESCAPE_ENTITIES[code]) or_return
+			ent := JS_ESCAPE_ENTITIES[code]
+			if buf_len + len(ent) > len(js_buf) {
+				n += io.write_string(w, string(js_buf[:buf_len])) or_return
+				buf_len = 0
+			}
+			copy(js_buf[buf_len:], ent)
+			buf_len += len(ent)
 			i += 1
 			continue
 		}
 		if code == 13 {
-			if eb.len + 6 > len(eb.buf) {
-				__temple_escape_buf_flush(&eb, w, &n) or_return
+			if buf_len + 6 > len(js_buf) {
+				n += io.write_string(w, string(js_buf[:buf_len])) or_return
+				buf_len = 0
 			}
-			eb.buf[eb.len + 0] = '\\'
-			eb.buf[eb.len + 1] = 'u'
-			eb.buf[eb.len + 2] = '0'
-			eb.buf[eb.len + 3] = '0'
-			eb.buf[eb.len + 4] = hex_lower[c >> 4]
-			eb.buf[eb.len + 5] = hex_lower[c & 0x0F]
-			eb.len += 6
+			js_buf[buf_len + 0] = '\\'
+			js_buf[buf_len + 1] = 'u'
+			js_buf[buf_len + 2] = '0'
+			js_buf[buf_len + 3] = '0'
+			js_buf[buf_len + 4] = hex_lower[c >> 4]
+			js_buf[buf_len + 5] = hex_lower[c & 0x0F]
+			buf_len += 6
 			i += 1
 			continue
 		}
 		// code == 14 (0xE2): check for UTF-8 U+2028 (E2 80 A8) or U+2029 (E2 80 A9)
 		if i + 2 < len(str) && str[i + 1] == 0x80 && (str[i + 2] == 0xA8 || str[i + 2] == 0xA9) {
+			if buf_len + 6 > len(js_buf) {
+				n += io.write_string(w, string(js_buf[:buf_len])) or_return
+				buf_len = 0
+			}
 			rep := `\u2028` if str[i + 2] == 0xA8 else `\u2029`
-			__temple_escape_buf_append_str(&eb, w, &n, rep) or_return
+			copy(js_buf[buf_len:], rep)
+			buf_len += 6
 			i += 3
 			continue
 		}
-		__temple_escape_buf_append_byte(&eb, w, &n, c) or_return
+		if buf_len + 1 > len(js_buf) {
+			n += io.write_string(w, string(js_buf[:buf_len])) or_return
+			buf_len = 0
+		}
+		js_buf[buf_len] = c
+		buf_len += 1
 		i += 1
 	}
-	__temple_escape_buf_flush(&eb, w, &n) or_return
+	if buf_len > 0 {
+		n += io.write_string(w, string(js_buf[:buf_len])) or_return
+	}
 	return
 }
 

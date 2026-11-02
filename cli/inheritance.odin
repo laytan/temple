@@ -85,7 +85,13 @@ lookup_resolved_cache :: proc(ctx: ^Compile_Context, fullpath: string) -> (Templ
 
 @(private = "file")
 store_resolved_cache :: proc(ctx: ^Compile_Context, fullpath: string, resolved: Template) {
-	small_map_set_if_absent(&ctx.resolved_cache, strings.clone(fullpath, ctx.allocator), resolved, ctx.allocator)
+	small_map_set_if_absent(&ctx.resolved_cache, fullpath, resolved, ctx.allocator)
+}
+
+@(private = "file")
+is_extending_parent :: proc(ctx: ^Compile_Context) -> bool {
+	frames := get_trace_frames(ctx)
+	return len(frames) > 0 && frames[len(frames) - 1].kind == .Extends
 }
 
 load_and_resolve_template_file :: proc(
@@ -104,8 +110,8 @@ load_and_resolve_template_file :: proc(
 		return {}, nil, false
 	}
 
-	flatten_blocks := len(get_trace_frames(ctx)) <= 1
-	if !flatten_blocks {
+	parent_mode := is_extending_parent(ctx)
+	if parent_mode {
 		if cached_res, found := lookup_resolved_cache(ctx, fullpath); found {
 			return cached_res, raw_src, true
 		}
@@ -115,7 +121,7 @@ load_and_resolve_template_file :: proc(
 	if !res_ok {
 		return {}, nil, false
 	}
-	if !flatten_blocks {
+	if parent_mode {
 		store_resolved_cache(ctx, fullpath, resolved)
 	}
 	return resolved, raw_src, true
@@ -460,7 +466,7 @@ resolve_template_inheritance :: proc(
 	}
 
 	// Splice child blocks and macros into parent layout AST (handling `super()` recursively)
-	flatten_blocks := len(get_trace_frames(ctx)) <= 1
+	flatten_blocks := !is_extending_parent(ctx)
 	spliced_parent := splice_nodes(ctx, parent_templ.content[:], child_blocks, flatten_blocks)
 	spliced: Template
 	if len(child_macro_order) > 0 {
